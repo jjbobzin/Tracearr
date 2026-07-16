@@ -32,7 +32,13 @@ import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Skeleton } from '@/components/ui/skeleton';
-import { cn, formatLocationCompact, getCountryName, getMediaDisplay } from '@/lib/utils';
+import {
+  cn,
+  formatLocationCompact,
+  formatLocationDisplay,
+  getCountryName,
+  getMediaDisplay,
+} from '@/lib/utils';
 import { formatDuration } from '@/lib/formatters';
 import { getAvatarUrl } from '@/components/users/utils';
 import type { SessionWithDetails, SessionState, MediaType, EngagementTier } from '@tracearr/shared';
@@ -370,13 +376,14 @@ export const HistoryTableRow = memo(
           {/* Location */}
           {columnVisibility.location && (
             <TableCell className="w-[130px]">
-              {session.geoCity || session.geoCountry ? (
+              {session.geoLocationName || session.geoCity || session.geoCountry ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <div className="flex items-center gap-1.5">
                       <Globe className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
                       <span className="truncate text-sm">
-                        {formatLocationCompact(
+                        {formatLocationDisplay(
+                          session.geoLocationName,
                           session.geoCity,
                           session.geoRegion,
                           session.geoCountry
@@ -386,6 +393,7 @@ export const HistoryTableRow = memo(
                   </TooltipTrigger>
                   <TooltipContent>
                     <div className="space-y-1 text-xs">
+                      {session.geoLocationName && <div>Name: {session.geoLocationName}</div>}
                       {session.geoCity && <div>City: {session.geoCity}</div>}
                       {session.geoRegion && <div>Region: {session.geoRegion}</div>}
                       {session.geoCountry && (

@@ -349,6 +349,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           s.thumb_path,
           s.reference_id,
           s.ip_address,
+          s.geo_location_name,
           s.geo_city,
           s.geo_region,
           s.geo_country,
@@ -421,6 +422,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         thumb_path: string | null;
         reference_id: string | null;
         ip_address: string | null;
+        geo_location_name: string | null;
         geo_city: string | null;
         geo_region: string | null;
         geo_country: string | null;
@@ -490,6 +492,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       watched: row.watched,
       segmentCount: Number(row.segment_count),
       ipAddress: row.ip_address,
+      geoLocationName: row.geo_location_name,
       geoCity: row.geo_city,
       geoRegion: row.geo_region,
       geoCountry: row.geo_country,
@@ -682,6 +685,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
           s.thumb_path,
           s.reference_id,
           s.ip_address,
+          s.geo_location_name,
           s.geo_city,
           s.geo_region,
           s.geo_country,
@@ -784,6 +788,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         thumb_path: string | null;
         reference_id: string | null;
         ip_address: string | null;
+        geo_location_name: string | null;
         geo_city: string | null;
         geo_region: string | null;
         geo_country: string | null;
@@ -859,6 +864,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         pausedDurationMs: seg.paused_duration_ms != null ? Number(seg.paused_duration_ms) : 0,
       })),
       ipAddress: row.ip_address,
+      geoLocationName: row.geo_location_name,
       geoCity: row.geo_city,
       geoRegion: row.geo_region,
       geoCountry: row.geo_country,
@@ -1376,6 +1382,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         referenceId: sessions.referenceId,
         watched: sessions.watched,
         ipAddress: sessions.ipAddress,
+        geoLocationName: sessions.geoLocationName,
         geoCity: sessions.geoCity,
         geoRegion: sessions.geoRegion,
         geoCountry: sessions.geoCountry,
@@ -1462,6 +1469,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
       referenceId: row.referenceId,
       watched: row.watched,
       ipAddress: row.ipAddress,
+      geoLocationName: row.geoLocationName,
       geoCity: row.geoCity,
       geoRegion: row.geoRegion,
       geoCountry: row.geoCountry,

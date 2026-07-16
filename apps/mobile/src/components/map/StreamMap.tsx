@@ -99,7 +99,8 @@ export function StreamMap({ sessions, height = 300, serverColorMap }: StreamMapP
     const username = session.user?.username ?? 'Unknown';
     const displayName = session.user?.identityName ?? username;
     const location =
-      [session.geoCity, session.geoCountry].filter(Boolean).join(', ') || 'Unknown location';
+      session.geoLocationName ??
+      ([session.geoCity, session.geoCountry].filter(Boolean).join(', ') || 'Unknown location');
     const mediaTitle = session.mediaTitle || 'Unknown';
 
     // Truncate long media titles for snippet

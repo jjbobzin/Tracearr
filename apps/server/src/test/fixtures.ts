@@ -61,6 +61,7 @@ export function createMockSession(overrides: Partial<Session> = {}): Session {
     watched: false,
     // Network/device info
     ipAddress: '192.168.1.1',
+    geoLocationName: null,
     geoCity: 'New York',
     geoRegion: 'New York',
     geoCountry: 'US',
@@ -129,6 +130,7 @@ export function createMockActiveSession(overrides: Partial<ActiveSession> = {}):
     referenceId: overrides.referenceId ?? null,
     watched: overrides.watched ?? false,
     ipAddress: overrides.ipAddress ?? '192.168.1.100',
+    geoLocationName: overrides.geoLocationName ?? null,
     geoCity: overrides.geoCity ?? 'New York',
     geoRegion: overrides.geoRegion ?? 'NY',
     geoCountry: overrides.geoCountry ?? 'US',

@@ -44,13 +44,14 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
     const locationResult = await db.execute(sql`
       WITH plays AS (
         SELECT DISTINCT ON (COALESCE(reference_id, id))
-          geo_city, geo_region, geo_country, geo_lat, geo_lon,
+          geo_location_name, geo_city, geo_region, geo_country, geo_lat, geo_lon,
           ip_address, started_at
         FROM sessions
         WHERE ${serverUserIdAnyFragment(scoped.ids)}
         ORDER BY COALESCE(reference_id, id), started_at DESC
       )
       SELECT
+        geo_location_name AS location_name,
         geo_city AS city,
         geo_region AS region,
         geo_country AS country,
@@ -60,12 +61,13 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
         max(started_at) AS last_seen_at,
         array_agg(DISTINCT ip_address) AS ip_addresses
       FROM plays
-      GROUP BY geo_city, geo_region, geo_country, geo_lat, geo_lon
+      GROUP BY geo_location_name, geo_city, geo_region, geo_country, geo_lat, geo_lon
       ORDER BY max(started_at) DESC
     `);
 
     const locations: UserLocation[] = (
       locationResult.rows as {
+        location_name: string | null;
         city: string | null;
         region: string | null;
         country: string | null;
@@ -76,6 +78,7 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
         ip_addresses: string[];
       }[]
     ).map((loc) => ({
+      locationName: loc.location_name,
       city: loc.city,
       region: loc.region,
       country: loc.country,

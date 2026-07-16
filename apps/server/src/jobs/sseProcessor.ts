@@ -856,8 +856,12 @@ async function createNewSession(
   };
 
   // Get GeoIP location (uses Plex API if enabled, falls back to MaxMind)
-  const { usePlexGeoip } = await getGeoIPSettings();
-  const geo = await lookupGeoIP(processed.ipAddress, usePlexGeoip);
+  const geoIpSettings = await getGeoIPSettings();
+  const geo = await lookupGeoIP(
+    processed.ipAddress,
+    geoIpSettings.usePlexGeoip,
+    geoIpSettings
+  );
 
   if (!cacheService) {
     console.warn('[SSEProcessor] Cache service not available, skipping session creation');
@@ -985,8 +989,12 @@ async function handleMediaChange(
     return;
   }
 
-  const { usePlexGeoip } = await getGeoIPSettings();
-  const geo = await lookupGeoIP(processed.ipAddress, usePlexGeoip);
+  const geoIpSettings = await getGeoIPSettings();
+  const geo = await lookupGeoIP(
+    processed.ipAddress,
+    geoIpSettings.usePlexGeoip,
+    geoIpSettings
+  );
 
   if (!cacheService) {
     return;

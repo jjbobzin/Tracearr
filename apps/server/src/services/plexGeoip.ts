@@ -7,7 +7,7 @@
  */
 
 import { CACHE_TTL } from '@tracearr/shared';
-import { geoipService, type GeoLocation } from './geoip.js';
+import { geoipService, type GeoLocation, type LocalLocationConfig } from './geoip.js';
 import { geoasnService } from './geoasn.js';
 import { getCacheService } from './cache.js';
 
@@ -67,6 +67,7 @@ async function lookupPlex(ip: string): Promise<GeoLocation | null> {
     const coords = parseCoordinates(coordStr);
 
     return {
+      locationName: null,
       city,
       region,
       country,
@@ -139,15 +140,19 @@ function attachAsn(ip: string, location: GeoLocation): GeoLocation {
  *
  * When disabled, uses MaxMind only.
  */
-export async function lookupGeoIP(ip: string, usePlexGeoip: boolean): Promise<GeoLocation> {
+export async function lookupGeoIP(
+  ip: string,
+  usePlexGeoip: boolean,
+  localConfig?: LocalLocationConfig
+): Promise<GeoLocation> {
   // Always delegate private IP check to geoipService (returns LOCAL_LOCATION)
   if (geoipService.isPrivateIP(ip)) {
-    return attachAsn(ip, geoipService.lookup(ip));
+    return attachAsn(ip, geoipService.lookup(ip, localConfig));
   }
 
   // If Plex GeoIP is disabled, use MaxMind only
   if (!usePlexGeoip) {
-    return attachAsn(ip, geoipService.lookup(ip));
+    return attachAsn(ip, geoipService.lookup(ip, localConfig));
   }
 
   // Try Plex first
@@ -155,12 +160,12 @@ export async function lookupGeoIP(ip: string, usePlexGeoip: boolean): Promise<Ge
 
   // If Plex failed completely, use MaxMind
   if (!plexResult) {
-    return attachAsn(ip, geoipService.lookup(ip));
+    return attachAsn(ip, geoipService.lookup(ip, localConfig));
   }
 
   // If Plex returned data but missing city, also try MaxMind and compare
   if (!plexResult.city) {
-    const maxmindResult = geoipService.lookup(ip);
+    const maxmindResult = geoipService.lookup(ip, localConfig);
 
     // Return whichever has more data (prefer Plex on tie)
     const plexFields = countFields(plexResult);

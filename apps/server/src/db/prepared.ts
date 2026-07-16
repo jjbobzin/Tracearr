@@ -301,6 +301,7 @@ function createStatements() {
         stoppedAt: sessions.stoppedAt,
         ipAddress: sessions.ipAddress,
         deviceId: sessions.deviceId,
+        geoLocationName: sessions.geoLocationName,
         geoLat: sessions.geoLat,
         geoLon: sessions.geoLon,
         geoCity: sessions.geoCity,

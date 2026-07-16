@@ -226,6 +226,7 @@ export function ViolationDetail() {
         existing.count += 1;
       } else {
         locationMap.set(key, {
+          locationName: session.geoLocationName,
           city: session.geoCity,
           region: session.geoRegion,
           country: session.geoCountry,

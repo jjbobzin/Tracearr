@@ -166,6 +166,7 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
         WITH location_detail AS (
           SELECT
             s.geo_city,
+            s.geo_location_name,
             s.geo_region,
             s.geo_country,
             s.geo_lat,
@@ -178,11 +179,12 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
           FROM sessions s
           LEFT JOIN server_users su ON s.server_user_id = su.id
           ${whereClause}
-          GROUP BY s.geo_city, s.geo_region, s.geo_country, s.geo_lat, s.geo_lon
+          GROUP BY s.geo_location_name, s.geo_city, s.geo_region, s.geo_country, s.geo_lat, s.geo_lon
         ),
         per_server AS (
           SELECT
             s.geo_city,
+            s.geo_location_name,
             s.geo_region,
             s.geo_country,
             s.geo_lat,
@@ -191,11 +193,12 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
             COUNT(DISTINCT COALESCE(s.reference_id, s.id))::int AS server_count
           FROM sessions s
           ${whereClause}
-          GROUP BY s.geo_city, s.geo_region, s.geo_country, s.geo_lat, s.geo_lon, s.server_id
+          GROUP BY s.geo_location_name, s.geo_city, s.geo_region, s.geo_country, s.geo_lat, s.geo_lon, s.server_id
         ),
         server_agg AS (
           SELECT
             geo_city,
+            geo_location_name,
             geo_region,
             geo_country,
             geo_lat,
@@ -206,9 +209,10 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
               ORDER BY server_count DESC, server_id
             ) AS servers
           FROM per_server
-          GROUP BY geo_city, geo_region, geo_country, geo_lat, geo_lon
+          GROUP BY geo_location_name, geo_city, geo_region, geo_country, geo_lat, geo_lon
         )
         SELECT
+          ld.geo_location_name AS location_name,
           ld.geo_city AS city,
           ld.geo_region AS region,
           ld.geo_country AS country,
@@ -222,6 +226,7 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
           sa.servers
         FROM location_detail ld
         JOIN server_agg sa ON
+          ld.geo_location_name IS NOT DISTINCT FROM sa.geo_location_name AND
           ld.geo_city IS NOT DISTINCT FROM sa.geo_city AND
           ld.geo_region IS NOT DISTINCT FROM sa.geo_region AND
           ld.geo_country IS NOT DISTINCT FROM sa.geo_country AND
@@ -311,6 +316,7 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
     // Transform main query results
     const locationStats = (
       mainResult.rows as {
+        location_name: string | null;
         city: string | null;
         region: string | null;
         country: string | null;
@@ -324,6 +330,7 @@ export const locationsRoutes: FastifyPluginAsync = async (app) => {
         servers: { serverId: string; count: number }[] | null;
       }[]
     ).map((row) => ({
+      locationName: row.location_name,
       city: row.city,
       region: row.region,
       country: row.country,

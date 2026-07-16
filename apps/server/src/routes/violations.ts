@@ -111,6 +111,7 @@ interface ViolationRow {
   episodeNumber: number | null;
   year: number | null;
   ipAddress: string | null;
+  geoLocationName: string | null;
   geoCity: string | null;
   geoRegion: string | null;
   geoCountry: string | null;
@@ -207,6 +208,7 @@ async function enrichViolations(violationData: ViolationRow[]) {
                 ipAddress: sessions.ipAddress,
                 deviceId: sessions.deviceId,
                 device: sessions.device,
+                geoLocationName: sessions.geoLocationName,
                 geoCity: sessions.geoCity,
                 geoCountry: sessions.geoCountry,
                 startedAt: sessions.startedAt,
@@ -264,6 +266,7 @@ async function enrichViolations(violationData: ViolationRow[]) {
             episodeNumber: sessions.episodeNumber,
             year: sessions.year,
             ipAddress: sessions.ipAddress,
+            geoLocationName: sessions.geoLocationName,
             geoCity: sessions.geoCity,
             geoRegion: sessions.geoRegion,
             geoCountry: sessions.geoCountry,
@@ -371,6 +374,7 @@ async function enrichViolations(violationData: ViolationRow[]) {
                 episodeNumber: sessions.episodeNumber,
                 year: sessions.year,
                 ipAddress: sessions.ipAddress,
+                geoLocationName: sessions.geoLocationName,
                 geoCity: sessions.geoCity,
                 geoRegion: sessions.geoRegion,
                 geoCountry: sessions.geoCountry,
@@ -581,6 +585,7 @@ async function enrichViolations(violationData: ViolationRow[]) {
         episodeNumber: v.episodeNumber,
         year: v.year,
         ipAddress: v.ipAddress,
+        geoLocationName: v.geoLocationName,
         geoCity: v.geoCity,
         geoRegion: v.geoRegion,
         geoCountry: v.geoCountry,
@@ -736,6 +741,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
         episodeNumber: sessions.episodeNumber,
         year: sessions.year,
         ipAddress: sessions.ipAddress,
+        geoLocationName: sessions.geoLocationName,
         geoCity: sessions.geoCity,
         geoRegion: sessions.geoRegion,
         geoCountry: sessions.geoCountry,
@@ -867,6 +873,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
         episodeNumber: sessions.episodeNumber,
         year: sessions.year,
         ipAddress: sessions.ipAddress,
+        geoLocationName: sessions.geoLocationName,
         geoCity: sessions.geoCity,
         geoRegion: sessions.geoRegion,
         geoCountry: sessions.geoCountry,

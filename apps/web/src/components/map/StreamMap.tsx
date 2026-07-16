@@ -4,7 +4,7 @@ import { HeatmapLayer } from 'react-leaflet-heatmap-layer-v3';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import type { LocationStats } from '@tracearr/shared';
-import { cn } from '@/lib/utils';
+import { cn, formatLocationDisplay } from '@/lib/utils';
 import { useTheme } from '@/components/theme-provider';
 
 export type MapViewMode = 'heatmap' | 'circles';
@@ -188,8 +188,12 @@ function CircleMarkersLayer({
               <Popup>
                 <div className="text-sm">
                   <div className="font-semibold">
-                    {location.city ? `${location.city}, ` : ''}
-                    {location.country || 'Unknown'}
+                    {formatLocationDisplay(
+                      location.locationName,
+                      location.city,
+                      location.region,
+                      location.country
+                    ) ?? 'Unknown'}
                   </div>
                   <div className="text-muted-foreground">
                     {location.count.toLocaleString()} stream{location.count !== 1 ? 's' : ''}

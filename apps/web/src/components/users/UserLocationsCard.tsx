@@ -86,7 +86,11 @@ export function UserLocationsCard({
       <CardContent>
         <div className="space-y-3">
           {displayedLocations.map((location) => {
-            const locationKey = `${location.city ?? 'unknown'}-${location.country ?? 'unknown'}-${location.lat}-${location.lon}`;
+            const primaryLocation = location.locationName ?? location.city ?? 'Unknown City';
+            const secondaryLocation = location.locationName
+              ? [location.city, location.region, location.country].filter(Boolean).join(', ')
+              : (location.country ?? 'Unknown');
+            const locationKey = `${location.locationName ?? 'unknown'}-${location.city ?? 'unknown'}-${location.country ?? 'unknown'}-${location.lat}-${location.lon}`;
             const percentage =
               totalSessions > 0 ? Math.round((location.sessionCount / totalSessions) * 100) : 0;
 
@@ -101,13 +105,13 @@ export function UserLocationsCard({
                   </div>
                   <div>
                     <p className="font-medium">
-                      {location.city ?? 'Unknown City'}
-                      {location.region && (
+                      {primaryLocation}
+                      {!location.locationName && location.region && (
                         <span className="text-muted-foreground">, {location.region}</span>
                       )}
                     </p>
                     <div className="text-muted-foreground flex items-center gap-2 text-xs">
-                      <span>{location.country ?? 'Unknown'}</span>
+                      <span>{secondaryLocation || 'Unknown'}</span>
                       <span>·</span>
                       <span>
                         {location.sessionCount} session{location.sessionCount !== 1 ? 's' : ''}

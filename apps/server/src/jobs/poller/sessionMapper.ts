@@ -236,6 +236,7 @@ export function mapSessionRow(s: typeof sessions.$inferSelect): Session {
     referenceId: s.referenceId,
     watched: s.watched,
     ipAddress: s.ipAddress,
+    geoLocationName: s.geoLocationName,
     geoCity: s.geoCity,
     geoRegion: s.geoRegion,
     geoCountry: s.geoCountry,

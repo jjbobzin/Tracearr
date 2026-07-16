@@ -108,6 +108,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
         s.external_session_id,
         s.reference_id,
         s.ip_address,
+        s.geo_location_name,
         s.geo_city,
         s.geo_region,
         s.geo_country,
@@ -158,6 +159,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
         external_session_id: string | null;
         reference_id: string | null;
         ip_address: string | null;
+        geo_location_name: string | null;
         geo_city: string | null;
         geo_region: string | null;
         geo_country: string | null;
@@ -205,6 +207,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
       watched: row.watched,
       segmentCount: Number(row.segment_count),
       ipAddress: row.ip_address,
+      geoLocationName: row.geo_location_name,
       geoCity: row.geo_city,
       geoRegion: row.geo_region,
       geoCountry: row.geo_country,

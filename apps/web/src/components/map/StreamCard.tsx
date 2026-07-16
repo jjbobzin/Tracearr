@@ -4,7 +4,7 @@ import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { formatEpisodeLabel, type ActiveSession, type LocationStats } from '@tracearr/shared';
-import { cn, formatLocationCompact } from '@/lib/utils';
+import { cn, formatLocationCompact, formatLocationDisplay } from '@/lib/utils';
 import { ActiveSessionBadge } from '@/components/sessions/ActiveSessionBadge';
 import { ServerLegend } from '@/components/server';
 import { useTheme } from '@/components/theme-provider';
@@ -309,11 +309,12 @@ export function StreamCard({
 
                   {/* Meta info */}
                   <div className="text-muted-foreground mt-1 flex items-center gap-2 text-[11px]">
-                    {(session.geoCity || session.geoCountry) && (
+                    {(session.geoLocationName || session.geoCity || session.geoCountry) && (
                       <>
                         <MapPin className="h-3 w-3 flex-shrink-0" />
                         <span className="truncate">
-                          {formatLocationCompact(
+                          {formatLocationDisplay(
+                            session.geoLocationName,
                             session.geoCity,
                             session.geoRegion,
                             session.geoCountry
@@ -349,7 +350,14 @@ export function StreamCard({
                   <div className="flex items-center gap-2">
                     <MapPin className="h-4 w-4 text-blue-500" />
                     <div>
-                      <p className="font-semibold">{location.city || 'Unknown'}</p>
+                      <p className="font-semibold">
+                        {formatLocationDisplay(
+                          location.locationName,
+                          location.city,
+                          location.region,
+                          location.country
+                        ) ?? 'Unknown'}
+                      </p>
                       <p className="text-muted-foreground text-xs">{location.country}</p>
                     </div>
                   </div>

@@ -33,6 +33,15 @@ export function formatLocationCompact(
   return city ?? countryName ?? null;
 }
 
+export function formatLocationDisplay(
+  locationName: string | null | undefined,
+  city: string | null | undefined,
+  region: string | null | undefined,
+  country: string | null | undefined
+): string | null {
+  return locationName ?? formatLocationCompact(city, region, country);
+}
+
 /**
  * Media display fields interface for formatting media titles
  */

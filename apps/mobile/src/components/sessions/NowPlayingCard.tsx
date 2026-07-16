@@ -170,6 +170,9 @@ function getDeviceIcon(session: ActiveSession): IoniconsIconName {
  * Get location string from session
  */
 function getLocationString(session: ActiveSession): string | null {
+  if (session.geoLocationName) {
+    return session.geoLocationName;
+  }
   if (session.geoCity && session.geoCountry) {
     return `${session.geoCity}, ${session.geoCountry}`;
   }

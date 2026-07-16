@@ -774,6 +774,21 @@ export const updateSettingsSchema = z.object({
   pollerIntervalMs: z.number().int().min(5000).max(300000).optional(),
   // GeoIP settings
   usePlexGeoip: z.boolean().optional(),
+  localLocationName: nullableStringSchema(255).optional(),
+  localCity: nullableStringSchema(255).optional(),
+  localRegion: nullableStringSchema(255).optional(),
+  localCountry: nullableStringSchema(100).optional(),
+  localCountryCode: z.preprocess(
+    (val) => (val === '' ? null : val),
+    z
+      .string()
+      .regex(/^[A-Za-z]{2}$/, 'Country code must be a 2-letter ISO code')
+      .transform((value) => value.toUpperCase())
+      .nullable()
+      .optional()
+  ),
+  localLatitude: z.number().min(-90).max(90).nullable().optional(),
+  localLongitude: z.number().min(-180).max(180).nullable().optional(),
   // Tautulli integration
   tautulliUrl: nullableUrlSchema.optional(),
   tautulliApiKey: nullableStringSchema().optional(),

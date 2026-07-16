@@ -25,6 +25,13 @@ const PUBLIC_DEFAULTS: Settings = {
   pollerEnabled: true,
   pollerIntervalMs: 15000,
   usePlexGeoip: false,
+  localLocationName: null,
+  localCity: null,
+  localRegion: null,
+  localCountry: null,
+  localCountryCode: null,
+  localLatitude: null,
+  localLongitude: null,
   tautulliUrl: null,
   tautulliApiKey: null,
   externalUrl: null,
@@ -97,16 +104,32 @@ export async function getSetting<K extends SettingKey>(key: K): Promise<SettingT
 export async function getSettings<K extends SettingKey>(keys: K[]): Promise<Pick<SettingTypes, K>> {
   if (keys.length === 0) return {} as Pick<SettingTypes, K>;
 
-  const rows = await db
-    .select({ name: settings.name, value: settings.value })
-    .from(settings)
-    .where(inArray(settings.name, keys));
-
-  const found = new Map(rows.map((r) => [r.name, r.value]));
   const result = {} as Record<K, unknown>;
+  const now = Date.now();
+  const missingKeys: K[] = [];
 
   for (const key of keys) {
-    result[key] = found.has(key) ? found.get(key) : ALL_DEFAULTS[key];
+    const cached = settingsCache.get(key);
+    if (cached && cached.expiresAt > now) {
+      result[key] = cached.value;
+    } else {
+      missingKeys.push(key);
+    }
+  }
+
+  if (missingKeys.length > 0) {
+    const rows = await db
+      .select({ name: settings.name, value: settings.value })
+      .from(settings)
+      .where(inArray(settings.name, missingKeys));
+
+    const found = new Map(rows.map((r) => [r.name, r.value]));
+
+    for (const key of missingKeys) {
+      const value = found.has(key) ? found.get(key) : ALL_DEFAULTS[key];
+      result[key] = value;
+      cacheSetting(key, value as SettingTypes[K]);
+    }
   }
 
   return result as Pick<SettingTypes, K>;
@@ -166,8 +189,26 @@ export async function getPollerSettings(): Promise<{
   };
 }
 
-export async function getGeoIPSettings(): Promise<{ usePlexGeoip: boolean }> {
-  return { usePlexGeoip: await getSetting('usePlexGeoip') };
+export async function getGeoIPSettings(): Promise<{
+  usePlexGeoip: boolean;
+  localLocationName: string | null;
+  localCity: string | null;
+  localRegion: string | null;
+  localCountry: string | null;
+  localCountryCode: string | null;
+  localLatitude: number | null;
+  localLongitude: number | null;
+}> {
+  return getSettings([
+    'usePlexGeoip',
+    'localLocationName',
+    'localCity',
+    'localRegion',
+    'localCountry',
+    'localCountryCode',
+    'localLatitude',
+    'localLongitude',
+  ]);
 }
 
 export async function getNetworkSettings(): Promise<{

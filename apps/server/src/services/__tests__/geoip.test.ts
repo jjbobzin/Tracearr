@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 
 // Import ACTUAL production class and types - not local duplicates
-import { GeoIPService, type GeoLocation } from '../geoip.js';
+import { GeoIPService, type GeoLocation, type LocalLocationConfig } from '../geoip.js';
 
 describe('GeoIPService', () => {
   let service: GeoIPService;
@@ -511,6 +511,16 @@ describe('GeoIPService', () => {
   });
 
   describe('lookup', () => {
+    const localConfig: LocalLocationConfig = {
+      localLocationName: 'Home',
+      localCity: 'Denver',
+      localRegion: 'Colorado',
+      localCountry: 'United States',
+      localCountryCode: 'US',
+      localLatitude: 39.7392,
+      localLongitude: -104.9903,
+    };
+
     it('should return Local location for private IPs (without database)', () => {
       const result = service.lookup('192.168.1.1');
 
@@ -525,6 +535,49 @@ describe('GeoIPService', () => {
 
       expect(result.city).toBeNull();
       expect(result.country).toBe('Local Network');
+    });
+
+    it('should return configured local location and coordinates for private IPv4', () => {
+      const result = service.lookup('192.168.1.50', localConfig);
+
+      expect(result.locationName).toBe('Home');
+      expect(result.city).toBe('Denver');
+      expect(result.region).toBe('Colorado');
+      expect(result.country).toBe('United States');
+      expect(result.countryCode).toBe('US');
+      expect(result.lat).toBe(39.7392);
+      expect(result.lon).toBe(-104.9903);
+    });
+
+    it('should return configured local location and coordinates for loopback', () => {
+      const result = service.lookup('127.0.0.1', localConfig);
+
+      expect(result.locationName).toBe('Home');
+      expect(result.city).toBe('Denver');
+      expect(result.lat).toBe(39.7392);
+      expect(result.lon).toBe(-104.9903);
+    });
+
+    it('should return configured local location and coordinates for private IPv6', () => {
+      const result = service.lookup('fd12:3456:789a::1', localConfig);
+
+      expect(result.locationName).toBe('Home');
+      expect(result.city).toBe('Denver');
+      expect(result.lat).toBe(39.7392);
+      expect(result.lon).toBe(-104.9903);
+    });
+
+    it('should preserve Local Network fallback when local coordinates are missing', () => {
+      const result = service.lookup('10.0.0.25', {
+        ...localConfig,
+        localLatitude: null,
+      });
+
+      expect(result.locationName).toBeNull();
+      expect(result.city).toBeNull();
+      expect(result.country).toBe('Local Network');
+      expect(result.lat).toBeNull();
+      expect(result.lon).toBeNull();
     });
 
     it('should return null location for public IPs when no database loaded', () => {

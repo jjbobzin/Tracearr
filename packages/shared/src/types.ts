@@ -396,6 +396,7 @@ export interface Session extends StreamDetailFields {
   watched: boolean; // True if user watched 80%+ of content
   // Network and device info
   ipAddress: string;
+  geoLocationName: string | null;
   geoCity: string | null;
   geoRegion: string | null; // State/province/subdivision
   geoCountry: string | null;
@@ -786,6 +787,7 @@ export interface ViolationSessionInfo {
   episodeNumber: number | null;
   year: number | null;
   ipAddress: string;
+  geoLocationName: string | null;
   geoCity: string | null;
   geoRegion: string | null;
   geoCountry: string | null;
@@ -859,6 +861,7 @@ export interface LocationUserInfo {
 }
 
 export interface LocationStats {
+  locationName: string | null;
   city: string | null;
   region: string | null; // State/province
   country: string | null;
@@ -1034,6 +1037,13 @@ export interface Settings {
   pollerIntervalMs: number;
   // GeoIP settings
   usePlexGeoip: boolean;
+  localLocationName: string | null;
+  localCity: string | null;
+  localRegion: string | null;
+  localCountry: string | null;
+  localCountryCode: string | null;
+  localLatitude: number | null;
+  localLongitude: number | null;
   // Tautulli integration
   tautulliUrl: string | null;
   tautulliApiKey: string | null;
@@ -1214,6 +1224,7 @@ export interface ClientToServerEvents {
 
 // User location aggregation (derived from sessions)
 export interface UserLocation {
+  locationName: string | null;
   city: string | null;
   region: string | null; // State/province/subdivision
   country: string | null;

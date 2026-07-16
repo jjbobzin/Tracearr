@@ -35,6 +35,7 @@ export interface SessionData {
   referenceId?: string | null;
   watched?: boolean;
   ipAddress?: string;
+  geoLocationName?: string | null;
   geoCity?: string | null;
   geoRegion?: string | null;
   geoCountry?: string | null;
@@ -100,6 +101,7 @@ export function buildSession(overrides: SessionData): Required<SessionData> {
     referenceId: overrides.referenceId ?? null,
     watched: overrides.watched ?? false,
     ipAddress: overrides.ipAddress ?? `192.168.1.${100 + (index % 155)}`,
+    geoLocationName: overrides.geoLocationName ?? null,
     geoCity: overrides.geoCity ?? 'New York',
     geoRegion: overrides.geoRegion ?? 'NY',
     geoCountry: overrides.geoCountry ?? 'US',
@@ -131,7 +133,7 @@ export async function createTestSession(data: SessionData): Promise<CreatedSessi
       year, thumb_path, rating_key, external_session_id,
       started_at, stopped_at, last_seen_at, duration_ms, total_duration_ms, progress_ms,
       last_paused_at, paused_duration_ms, reference_id, watched,
-      ip_address, geo_city, geo_region, geo_country, geo_lat, geo_lon,
+      ip_address, geo_location_name, geo_city, geo_region, geo_country, geo_lat, geo_lon,
       geo_asn_number, geo_asn_organization,
       player_name, device_id, product, device, platform,
       quality, is_transcode, bitrate
@@ -161,6 +163,7 @@ export async function createTestSession(data: SessionData): Promise<CreatedSessi
       ${fullData.referenceId ? `'${fullData.referenceId}'` : 'NULL'},
       ${fullData.watched},
       '${fullData.ipAddress}',
+      ${fullData.geoLocationName ? `'${fullData.geoLocationName}'` : 'NULL'},
       ${fullData.geoCity ? `'${fullData.geoCity}'` : 'NULL'},
       ${fullData.geoRegion ? `'${fullData.geoRegion}'` : 'NULL'},
       ${fullData.geoCountry ? `'${fullData.geoCountry}'` : 'NULL'},

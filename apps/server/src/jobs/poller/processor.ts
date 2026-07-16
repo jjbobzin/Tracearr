@@ -261,7 +261,7 @@ async function resolvePendingSession(
     activeRulesV2,
     activeSessions,
     recentSessions,
-    usePlexGeoip,
+    geoIpSettings,
   } = params;
 
   const pendingSession = await cacheService.getPendingSession(server.id, pendingKey);
@@ -281,7 +281,11 @@ async function resolvePendingSession(
     return { status: 'still-pending', updatedSession: buildPendingActiveSession(updatedData) };
   }
 
-  const geo: GeoLocation = await lookupGeoIP(processed.ipAddress, usePlexGeoip);
+  const geo: GeoLocation = await lookupGeoIP(
+    processed.ipAddress,
+    geoIpSettings.usePlexGeoip,
+    geoIpSettings
+  );
   const createResult = await cacheService.withSessionCreateLock(
     server.id,
     processed.sessionKey,
@@ -356,7 +360,7 @@ async function processServerSessions(
   let watchedTransitionOccurred = false;
 
   // Get GeoIP settings once at the start
-  const { usePlexGeoip } = await getGeoIPSettings();
+  const geoIpSettings = await getGeoIPSettings();
 
   try {
     // Fetch sessions from server using unified adapter
@@ -666,7 +670,7 @@ async function processServerSessions(
           activeRulesV2,
           activeSessions,
           recentSessions: recentSessionsMap.get(serverUserId) ?? [],
-          usePlexGeoip,
+          geoIpSettings,
         });
 
         if (pendingOutcome.status === 'confirmed') {
@@ -679,7 +683,11 @@ async function processServerSessions(
         }
 
         // Get GeoIP location (uses Plex API if enabled, falls back to MaxMind)
-        const geo: GeoLocation = await lookupGeoIP(processed.ipAddress, usePlexGeoip);
+        const geo: GeoLocation = await lookupGeoIP(
+          processed.ipAddress,
+          geoIpSettings.usePlexGeoip,
+          geoIpSettings
+        );
 
         const recentSessions = recentSessionsMap.get(serverUserId) ?? [];
 
@@ -900,7 +908,7 @@ async function processServerSessions(
             activeRulesV2,
             activeSessions,
             recentSessions: recentSessionsMap.get(serverUserId) ?? [],
-            usePlexGeoip,
+            geoIpSettings,
           });
 
           if (outcome.status === 'confirmed') {
@@ -929,6 +937,7 @@ async function processServerSessions(
         const geo: GeoLocation =
           existingSession?.ipAddress === processed.ipAddress
             ? {
+                locationName: existingSession.geoLocationName,
                 city: existingSession.geoCity,
                 region: existingSession.geoRegion,
                 country: existingSession.geoCountry,
@@ -940,7 +949,7 @@ async function processServerSessions(
                 asnNumber: existingSession.geoAsnNumber,
                 asnOrganization: existingSession.geoAsnOrganization,
               }
-            : await lookupGeoIP(processed.ipAddress, usePlexGeoip);
+            : await lookupGeoIP(processed.ipAddress, geoIpSettings.usePlexGeoip, geoIpSettings);
 
         if (!existingSession) {
           // Issue #120: Stale cache entry - session key is in Redis but no active session exists in DB

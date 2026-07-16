@@ -35,6 +35,7 @@ import { parseJellystatPlayMethod } from '../utils/transcodeNormalizer.js';
 import type { PubSubService } from './cache.js';
 import { geoasnService } from './geoasn.js';
 import { geoipService } from './geoip.js';
+import { getGeoIPSettings } from './settings.js';
 import {
   createSimpleProgressPublisher,
   createSkippedUserTracker,
@@ -439,6 +440,7 @@ export function transformActivityToSession(
     forceStopped: false,
     shortSession: durationMs < 120000,
     ipAddress: extractIpFromEndpoint(activity.RemoteEndPoint),
+    geoLocationName: geo.locationName ?? null,
     geoCity: geo.city,
     geoRegion: geo.region,
     geoCountry: geo.countryCode ?? geo.country,
@@ -700,6 +702,7 @@ export async function importJellystatBackup(
     progress.message = 'Processing records...';
     publishProgress(progress);
 
+    const geoIpSettings = await getGeoIPSettings();
     const geoCache = new Map<string, ReturnType<typeof geoipService.lookup>>();
     const insertedInThisImport = new Set<string>();
     const updateStreamDetails = options?.updateStreamDetails ?? false;
@@ -809,7 +812,7 @@ export async function importJellystatBackup(
           const ipAddress = extractIpFromEndpoint(activity.RemoteEndPoint);
           let geo = geoCache.get(ipAddress);
           if (!geo) {
-            const baseGeo = geoipService.lookup(ipAddress);
+            const baseGeo = geoipService.lookup(ipAddress, geoIpSettings);
             const asn = geoasnService.lookup(ipAddress);
             geo = {
               ...baseGeo,

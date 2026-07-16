@@ -151,6 +151,7 @@ function formatDuration(ms: number | null): string {
 
 function LocationCard({ location }: { location: UserLocation }) {
   const locationText =
+    location.locationName ||
     [location.city, location.region, location.country].filter(Boolean).join(', ') ||
     'Unknown Location';
 

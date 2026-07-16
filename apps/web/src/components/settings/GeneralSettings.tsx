@@ -19,6 +19,7 @@ import {
   AutosaveNumberField,
   AutosaveSelectField,
   AutosaveSwitchField,
+  AutosaveTextField,
   SaveStatusIndicator,
 } from '@/components/ui/autosave-field';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -266,6 +267,31 @@ export function GeneralSettings() {
     transform: (ms) => Math.max(5000, Math.min(300000, ms)),
   });
   const usePlexGeoipField = useDebouncedSave('usePlexGeoip', settings?.usePlexGeoip);
+  const localLocationNameField = useDebouncedSave(
+    'localLocationName',
+    settings?.localLocationName,
+    { delay: TEXT_INPUT_DELAY }
+  );
+  const localCityField = useDebouncedSave('localCity', settings?.localCity, {
+    delay: TEXT_INPUT_DELAY,
+  });
+  const localRegionField = useDebouncedSave('localRegion', settings?.localRegion, {
+    delay: TEXT_INPUT_DELAY,
+  });
+  const localCountryField = useDebouncedSave('localCountry', settings?.localCountry, {
+    delay: TEXT_INPUT_DELAY,
+  });
+  const localCountryCodeField = useDebouncedSave(
+    'localCountryCode',
+    settings?.localCountryCode,
+    { delay: TEXT_INPUT_DELAY }
+  );
+  const localLatitudeField = useDebouncedSave('localLatitude', settings?.localLatitude, {
+    delay: TEXT_INPUT_DELAY,
+  });
+  const localLongitudeField = useDebouncedSave('localLongitude', settings?.localLongitude, {
+    delay: TEXT_INPUT_DELAY,
+  });
 
   // Network settings fields
   const externalUrlField = useDebouncedSave('externalUrl', settings?.externalUrl, {
@@ -501,6 +527,147 @@ export function GeneralSettings() {
               onRetry={usePlexGeoipField.retry}
               onReset={usePlexGeoipField.reset}
             />
+
+            <div className="space-y-4 rounded-lg border p-4">
+              <div>
+                <h3 className="text-sm font-medium">{t('general.localLocation')}</h3>
+                <p className="text-muted-foreground text-sm">
+                  {t('general.localLocationDesc')}
+                </p>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <AutosaveTextField
+                  id="localLocationName"
+                  label={t('general.localLocationName')}
+                  description={t('general.localLocationNameDesc')}
+                  value={localLocationNameField.value ?? ''}
+                  onChange={(v) => localLocationNameField.setValue(v)}
+                  placeholder={t('general.localLocationNamePlaceholder')}
+                  maxLength={255}
+                  status={localLocationNameField.status}
+                  errorMessage={localLocationNameField.errorMessage}
+                  onRetry={localLocationNameField.retry}
+                  onReset={localLocationNameField.reset}
+                />
+                <AutosaveTextField
+                  id="localCity"
+                  label={t('general.localCity')}
+                  value={localCityField.value ?? ''}
+                  onChange={(v) => localCityField.setValue(v)}
+                  placeholder={t('general.localCityPlaceholder')}
+                  maxLength={255}
+                  status={localCityField.status}
+                  errorMessage={localCityField.errorMessage}
+                  onRetry={localCityField.retry}
+                  onReset={localCityField.reset}
+                />
+                <AutosaveTextField
+                  id="localRegion"
+                  label={t('general.localRegion')}
+                  value={localRegionField.value ?? ''}
+                  onChange={(v) => localRegionField.setValue(v)}
+                  placeholder={t('general.localRegionPlaceholder')}
+                  maxLength={255}
+                  status={localRegionField.status}
+                  errorMessage={localRegionField.errorMessage}
+                  onRetry={localRegionField.retry}
+                  onReset={localRegionField.reset}
+                />
+                <AutosaveTextField
+                  id="localCountry"
+                  label={t('general.localCountry')}
+                  value={localCountryField.value ?? ''}
+                  onChange={(v) => localCountryField.setValue(v)}
+                  placeholder={t('general.localCountryPlaceholder')}
+                  maxLength={100}
+                  status={localCountryField.status}
+                  errorMessage={localCountryField.errorMessage}
+                  onRetry={localCountryField.retry}
+                  onReset={localCountryField.reset}
+                />
+                <AutosaveTextField
+                  id="localCountryCode"
+                  label={t('general.localCountryCode')}
+                  value={localCountryCodeField.value ?? ''}
+                  onChange={(v) => localCountryCodeField.setValue(v)}
+                  placeholder={t('general.localCountryCodePlaceholder')}
+                  maxLength={2}
+                  status={localCountryCodeField.status}
+                  errorMessage={localCountryCodeField.errorMessage}
+                  onRetry={localCountryCodeField.retry}
+                  onReset={localCountryCodeField.reset}
+                />
+                <Field
+                  data-invalid={
+                    localLatitudeField.status === 'error' ||
+                    localLongitudeField.status === 'error'
+                  }
+                >
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <FieldLabel htmlFor="localLatitude">
+                          {t('general.localLatitude')}
+                        </FieldLabel>
+                        <SaveStatusIndicator status={localLatitudeField.status} />
+                      </div>
+                      <Input
+                        id="localLatitude"
+                        type="number"
+                        inputMode="decimal"
+                        min={-90}
+                        max={90}
+                        step="any"
+                        value={localLatitudeField.value ?? ''}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          localLatitudeField.setValue(raw === '' ? null : Number(raw));
+                        }}
+                        placeholder={t('general.localLatitudePlaceholder')}
+                        aria-invalid={localLatitudeField.status === 'error'}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <FieldLabel htmlFor="localLongitude">
+                          {t('general.localLongitude')}
+                        </FieldLabel>
+                        <SaveStatusIndicator status={localLongitudeField.status} />
+                      </div>
+                      <Input
+                        id="localLongitude"
+                        type="number"
+                        inputMode="decimal"
+                        min={-180}
+                        max={180}
+                        step="any"
+                        value={localLongitudeField.value ?? ''}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          localLongitudeField.setValue(raw === '' ? null : Number(raw));
+                        }}
+                        placeholder={t('general.localLongitudePlaceholder')}
+                        aria-invalid={localLongitudeField.status === 'error'}
+                      />
+                    </div>
+                  </div>
+                  <FieldDescription>{t('general.localCoordinatesDesc')}</FieldDescription>
+                  {(localLatitudeField.status === 'error' && localLatitudeField.errorMessage) ||
+                  (localLongitudeField.status === 'error' && localLongitudeField.errorMessage) ? (
+                    <div className="space-y-1">
+                      {localLatitudeField.status === 'error' && localLatitudeField.errorMessage && (
+                        <FieldError>{localLatitudeField.errorMessage}</FieldError>
+                      )}
+                      {localLongitudeField.status === 'error' &&
+                        localLongitudeField.errorMessage && (
+                          <FieldError>{localLongitudeField.errorMessage}</FieldError>
+                        )}
+                    </div>
+                  ) : null}
+                </Field>
+              </div>
+            </div>
           </FieldGroup>
         </CardContent>
       </Card>

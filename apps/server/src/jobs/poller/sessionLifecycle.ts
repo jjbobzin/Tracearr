@@ -220,6 +220,7 @@ export function buildActiveSession(input: BuildActiveSessionInput): ActiveSessio
 
     // Network/device info
     ipAddress: processed.ipAddress,
+    geoLocationName: geo.locationName ?? null,
     geoCity: geo.city,
     geoRegion: geo.region,
     geoCountry: geo.countryCode ?? geo.country,
@@ -319,6 +320,7 @@ export function buildPendingActiveSession(pendingData: PendingSessionData): Acti
 
     // Network/device info
     ipAddress: processed.ipAddress,
+    geoLocationName: geo.locationName ?? null,
     geoCity: geo.city,
     geoRegion: geo.region,
     geoCountry: geo.countryCode ?? geo.country,
@@ -693,6 +695,7 @@ export async function createSessionWithRulesAtomic(
               referenceId,
               watched: false,
               ipAddress: processed.ipAddress,
+              geoLocationName: geo.locationName ?? null,
               geoCity: geo.city,
               geoRegion: geo.region,
               geoCountry: geo.countryCode ?? geo.country,
@@ -764,6 +767,7 @@ export async function createSessionWithRulesAtomic(
             referenceId: inserted.referenceId,
             watched: inserted.watched,
             ipAddress: processed.ipAddress,
+            geoLocationName: geo.locationName ?? null,
             geoCity: geo.city,
             geoRegion: geo.region,
             geoCountry: geo.countryCode ?? geo.country,
@@ -1439,6 +1443,7 @@ export async function reEvaluateRulesOnTranscodeChange(
     referenceId: existingSession.referenceId,
     watched: existingSession.watched,
     ipAddress: existingSession.ipAddress,
+    geoLocationName: existingSession.geoLocationName,
     geoCity: existingSession.geoCity,
     geoRegion: existingSession.geoRegion,
     geoCountry: existingSession.geoCountry,
@@ -1662,6 +1667,7 @@ export async function reEvaluateRulesOnPauseState(
     referenceId: existingSession.referenceId,
     watched: existingSession.watched,
     ipAddress: existingSession.ipAddress,
+    geoLocationName: existingSession.geoLocationName,
     geoCity: existingSession.geoCity,
     geoRegion: existingSession.geoRegion,
     geoCountry: existingSession.geoCountry,

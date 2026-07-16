@@ -64,6 +64,13 @@ const mockAllSettings: Settings = {
   pollerEnabled: true,
   pollerIntervalMs: 15000,
   usePlexGeoip: false,
+  localLocationName: null,
+  localCity: null,
+  localRegion: null,
+  localCountry: null,
+  localCountryCode: null,
+  localLatitude: null,
+  localLongitude: null,
   tautulliUrl: 'http://localhost:8181',
   tautulliApiKey: 'secret-api-key',
   externalUrl: 'https://tracearr.example.com',
@@ -324,6 +331,76 @@ describe('Settings Routes', () => {
       const body = response.json();
       expect(body.pollerEnabled).toBe(false);
       expect(body.pollerIntervalMs).toBe(30000);
+    });
+
+    it('updates local GeoIP coordinates and display fields', async () => {
+      app = await buildTestApp(ownerUser);
+      vi.mocked(getAllSettings).mockResolvedValue({
+        ...mockAllSettings,
+        localLocationName: 'Home',
+        localCity: 'Denver',
+        localRegion: 'Colorado',
+        localCountry: 'United States',
+        localCountryCode: 'US',
+        localLatitude: 39.7392,
+        localLongitude: -104.9903,
+      });
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/settings',
+        payload: {
+          localLocationName: 'Home',
+          localCity: 'Denver',
+          localRegion: 'Colorado',
+          localCountry: 'United States',
+          localCountryCode: 'us',
+          localLatitude: 39.7392,
+          localLongitude: -104.9903,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(setSettings).toHaveBeenCalledWith(
+        expect.objectContaining({
+          localLocationName: 'Home',
+          localCity: 'Denver',
+          localRegion: 'Colorado',
+          localCountry: 'United States',
+          localCountryCode: 'US',
+          localLatitude: 39.7392,
+          localLongitude: -104.9903,
+        })
+      );
+      const body = response.json();
+      expect(body.localLatitude).toBe(39.7392);
+      expect(body.localLongitude).toBe(-104.9903);
+    });
+
+    it('rejects invalid local latitude', async () => {
+      app = await buildTestApp(ownerUser);
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/settings',
+        payload: { localLatitude: 91 },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(setSettings).not.toHaveBeenCalled();
+    });
+
+    it('rejects invalid local longitude', async () => {
+      app = await buildTestApp(ownerUser);
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/settings',
+        payload: { localLongitude: -181 },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(setSettings).not.toHaveBeenCalled();
     });
 
     it('normalizes externalUrl by stripping trailing slash', async () => {

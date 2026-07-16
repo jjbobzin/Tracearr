@@ -33,11 +33,15 @@ vi.mock('../../db/schema.js', async (importOriginal) => {
 import { getGeoIPSettings, getSetting, resetSettingsCache, setSetting } from '../settings.js';
 
 function mockSettingRow(value: unknown) {
+  mockRows(value === undefined ? [] : [{ value }]);
+}
+
+function mockRows<T>(rows: T[]) {
+  const whereResult = Promise.resolve(rows) as Promise<T[]> & { limit: () => Promise<T[]> };
+  whereResult.limit = () => Promise.resolve(rows);
   mockDbSelect.mockReturnValue({
     from: () => ({
-      where: () => ({
-        limit: () => Promise.resolve(value === undefined ? [] : [{ value }]),
-      }),
+      where: () => whereResult,
     }),
   });
 }
@@ -55,14 +59,14 @@ describe('settings cache', () => {
     vi.useRealTimers();
   });
 
-  it('only queries the database once for repeated reads within the TTL', async () => {
+  it('uses the cache for repeated single-setting reads within the TTL', async () => {
     mockSettingRow(true);
 
     await getSetting('usePlexGeoip');
     await getSetting('usePlexGeoip');
     await getGeoIPSettings();
 
-    expect(mockDbSelect).toHaveBeenCalledTimes(1);
+    expect(mockDbSelect).toHaveBeenCalledTimes(2);
   });
 
   it('reflects a setSetting write immediately in-process, within one write', async () => {
@@ -89,5 +93,29 @@ describe('settings cache', () => {
     const value = await getSetting('usePlexGeoip');
     expect(value).toBe(true);
     expect(mockDbSelect).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns local GeoIP settings as part of getGeoIPSettings', async () => {
+    mockRows([
+      { name: 'usePlexGeoip', value: true },
+      { name: 'localLocationName', value: 'Home' },
+      { name: 'localCity', value: 'Denver' },
+      { name: 'localRegion', value: 'Colorado' },
+      { name: 'localCountry', value: 'United States' },
+      { name: 'localCountryCode', value: 'US' },
+      { name: 'localLatitude', value: 39.7392 },
+      { name: 'localLongitude', value: -104.9903 },
+    ]);
+
+    await expect(getGeoIPSettings()).resolves.toEqual({
+      usePlexGeoip: true,
+      localLocationName: 'Home',
+      localCity: 'Denver',
+      localRegion: 'Colorado',
+      localCountry: 'United States',
+      localCountryCode: 'US',
+      localLatitude: 39.7392,
+      localLongitude: -104.9903,
+    });
   });
 });

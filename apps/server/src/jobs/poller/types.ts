@@ -16,7 +16,7 @@ import type {
 } from '@tracearr/shared';
 import type { sessions } from '../../db/schema.js';
 import type { CacheService, PubSubService } from '../../services/cache.js';
-import type { GeoLocation } from '../../services/geoip.js';
+import type { GeoLocation, LocalLocationConfig } from '../../services/geoip.js';
 import type { ViolationInsertResult } from './violations.js';
 
 // ============================================================================
@@ -427,7 +427,7 @@ export interface ResolvePendingSessionInput {
   activeSessions: ActiveSession[];
   /** Recent sessions for rule evaluation context */
   recentSessions: Session[];
-  usePlexGeoip: boolean;
+  geoIpSettings: LocalLocationConfig & { usePlexGeoip: boolean };
 }
 
 /** Outcome of checking Redis for a pending session tracked under a given key. */

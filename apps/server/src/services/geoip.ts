@@ -6,6 +6,7 @@ import maxmind, { type CityResponse, type Reader } from 'maxmind';
 import { GEOIP_CONFIG } from '@tracearr/shared';
 
 export interface GeoLocation {
+  locationName?: string | null;
   city: string | null;
   region: string | null; // State/province/subdivision
   country: string | null;
@@ -18,7 +19,18 @@ export interface GeoLocation {
   asnOrganization: string | null;
 }
 
+export interface LocalLocationConfig {
+  localLocationName: string | null;
+  localCity: string | null;
+  localRegion: string | null;
+  localCountry: string | null;
+  localCountryCode: string | null;
+  localLatitude: number | null;
+  localLongitude: number | null;
+}
+
 const NULL_LOCATION: GeoLocation = {
+  locationName: null,
   city: null,
   region: null,
   country: null,
@@ -32,6 +44,7 @@ const NULL_LOCATION: GeoLocation = {
 };
 
 const LOCAL_LOCATION: GeoLocation = {
+  locationName: null,
   city: null,
   region: null,
   country: 'Local Network',
@@ -43,6 +56,31 @@ const LOCAL_LOCATION: GeoLocation = {
   asnNumber: null,
   asnOrganization: null,
 };
+
+function buildLocalLocation(config?: LocalLocationConfig): GeoLocation {
+  if (
+    config?.localLatitude === null ||
+    config?.localLatitude === undefined ||
+    config?.localLongitude === null ||
+    config?.localLongitude === undefined
+  ) {
+    return LOCAL_LOCATION;
+  }
+
+  return {
+    locationName: config.localLocationName,
+    city: config.localCity,
+    region: config.localRegion,
+    country: config.localCountry ?? 'Local Network',
+    countryCode: config.localCountryCode,
+    continent: null,
+    postal: null,
+    lat: config.localLatitude,
+    lon: config.localLongitude,
+    asnNumber: null,
+    asnOrganization: null,
+  };
+}
 
 export class GeoIPService {
   private reader: Reader<CityResponse> | null = null;
@@ -70,10 +108,10 @@ export class GeoIPService {
     return this.reader !== null;
   }
 
-  lookup(ip: string): GeoLocation {
+  lookup(ip: string, localConfig?: LocalLocationConfig): GeoLocation {
     // Return "Local" for private/local network IPs
     if (this.isPrivateIP(ip)) {
-      return LOCAL_LOCATION;
+      return buildLocalLocation(localConfig);
     }
 
     // Return null location if no database loaded
@@ -95,6 +133,7 @@ export class GeoIPService {
         subdivisions && subdivisions.length > 0 ? (subdivisions[0]?.names?.en ?? null) : null;
 
       return {
+        locationName: null,
         city: result.city?.names?.en ?? null,
         region,
         country: result.country?.names?.en ?? null,

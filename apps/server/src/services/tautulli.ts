@@ -28,7 +28,7 @@ import {
   type SessionUpdate,
   type TimeBounds,
 } from './import/index.js';
-import { getSettings } from './settings.js';
+import { getGeoIPSettings, getSettings } from './settings.js';
 
 const PAGE_SIZE = 5000; // Larger batches = fewer API calls (tested up to 10k, scales linearly)
 const REQUEST_TIMEOUT_MS = 30000; // 30 seconds
@@ -633,6 +633,8 @@ export class TautulliService {
 
     console.log('[Import] Using per-page dedup queries (memory-efficient mode)');
 
+    const geoIpSettings = await getGeoIPSettings();
+
     // GeoIP cache (bounded - cleared every 10 pages to prevent unbounded growth)
     let geoCache = new Map<string, ReturnType<typeof geoipService.lookup>>();
 
@@ -912,7 +914,7 @@ export class TautulliService {
           const ipForLookup = extractIpFromEndpoint(record.ip_address);
           let geo = geoCache.get(ipForLookup);
           if (!geo) {
-            const baseGeo = geoipService.lookup(ipForLookup);
+            const baseGeo = geoipService.lookup(ipForLookup, geoIpSettings);
             const asn = geoasnService.lookup(ipForLookup);
             geo = {
               ...baseGeo,
@@ -982,6 +984,7 @@ export class TautulliService {
             pausedDurationMs: record.paused_counter * 1000,
             watched: record.watched_status === 1,
             ipAddress: extractIpFromEndpoint(record.ip_address),
+            geoLocationName: geo.locationName ?? null,
             geoCity: geo.city,
             geoRegion: geo.region,
             geoCountry: geo.countryCode ?? geo.country,

@@ -40,6 +40,7 @@ vi.mock('../geoasn.js', () => ({
 }));
 
 import { getCacheService } from '../cache.js';
+import { geoipService } from '../geoip.js';
 import { lookupGeoIP } from '../plexGeoip.js';
 
 const PLEX_XML_RESPONSE =
@@ -136,5 +137,39 @@ describe('lookupGeoIP Plex caching', () => {
 
     expect(result.city).toBe('New York');
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not call fetch for private IPs even when Plex GeoIP is enabled', async () => {
+    vi.mocked(geoipService.isPrivateIP).mockReturnValue(true);
+    vi.mocked(geoipService.lookup).mockReturnValue({
+      locationName: 'Home',
+      city: 'Denver',
+      region: 'Colorado',
+      country: 'United States',
+      countryCode: 'US',
+      continent: null,
+      postal: null,
+      lat: 39.7392,
+      lon: -104.9903,
+      asnNumber: null,
+      asnOrganization: null,
+    });
+
+    const localConfig = {
+      localLocationName: 'Home',
+      localCity: 'Denver',
+      localRegion: 'Colorado',
+      localCountry: 'United States',
+      localCountryCode: 'US',
+      localLatitude: 39.7392,
+      localLongitude: -104.9903,
+    };
+
+    const result = await lookupGeoIP('192.168.1.50', true, localConfig);
+
+    expect(result.locationName).toBe('Home');
+    expect(result.lat).toBe(39.7392);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(geoipService.lookup).toHaveBeenCalledWith('192.168.1.50', localConfig);
   });
 });

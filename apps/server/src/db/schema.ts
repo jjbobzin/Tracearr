@@ -303,6 +303,7 @@ export const sessions = pgTable(
     forceStopped: boolean('force_stopped').notNull().default(false), // True if session was force-stopped due to inactivity
     shortSession: boolean('short_session').notNull().default(false), // True if session duration < MIN_PLAY_TIME_MS (120s)
     ipAddress: varchar('ip_address', { length: 45 }).notNull(),
+    geoLocationName: varchar('geo_location_name', { length: 255 }),
     geoCity: varchar('geo_city', { length: 255 }),
     geoRegion: varchar('geo_region', { length: 255 }), // State/province/subdivision
     geoCountry: varchar('geo_country', { length: 100 }),
