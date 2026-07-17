@@ -52,8 +52,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            APP_VERSION=fork-local-map
-            APP_TAG=local-map-coordinates
+            APP_VERSION=1.5.0
+            APP_TAG=supervised-v1.5.0-local-map
             APP_COMMIT=${{ steps.meta.outputs.short_sha }}
             APP_BUILD_DATE=${{ steps.meta.outputs.build_date }}
             CACHE_BUST=${{ github.sha }}
