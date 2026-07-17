@@ -3,6 +3,7 @@
  */
 import { useState } from 'react';
 import { Link as RouterLink } from 'react-router';
+import { getData, getName } from 'country-list';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -14,6 +15,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from '@/components/ui/command';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Field, FieldGroup, FieldLabel, FieldDescription, FieldError } from '@/components/ui/field';
 import {
   AutosaveNumberField,
@@ -41,6 +51,7 @@ import {
   Settings as SettingsIcon,
   Languages,
   Clock,
+  ChevronsUpDown,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
@@ -65,6 +76,8 @@ const THEME_MODES = [
   { value: 'dark' as const, labelKey: 'general.themeDark' as const, icon: Moon, isDefault: true },
   { value: 'system' as const, labelKey: 'general.themeSystem' as const, icon: Monitor },
 ];
+
+const COUNTRY_OPTIONS = getData();
 
 function ApiKeyCard() {
   const { t } = useTranslation(['settings', 'common', 'notifications']);
@@ -255,6 +268,83 @@ function TimeFormatField() {
   );
 }
 
+interface LocalCountrySelectProps {
+  value: string | null | undefined;
+  onChange: (country: { code: string | null; name: string | null }) => void;
+  placeholder: string;
+  searchPlaceholder: string;
+  emptyMessage: string;
+}
+
+function LocalCountrySelect({
+  value,
+  onChange,
+  placeholder,
+  searchPlaceholder,
+  emptyMessage,
+}: LocalCountrySelectProps) {
+  const [open, setOpen] = useState(false);
+  const selectedName = value ? (getName(value) ?? value) : null;
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          role="combobox"
+          aria-expanded={open}
+          className="h-10 w-full justify-between"
+        >
+          <span className={cn(!selectedName && 'text-muted-foreground')}>
+            {selectedName ?? placeholder}
+          </span>
+          <ChevronsUpDown className="h-4 w-4 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[320px] p-0" align="start">
+        <Command>
+          <CommandInput placeholder={searchPlaceholder} />
+          <CommandList>
+            <CommandEmpty>{emptyMessage}</CommandEmpty>
+            <CommandGroup>
+              {value && (
+                <CommandItem
+                  value="clear-country"
+                  onSelect={() => {
+                    onChange({ code: null, name: null });
+                    setOpen(false);
+                  }}
+                >
+                  <span className="text-muted-foreground">{placeholder}</span>
+                </CommandItem>
+              )}
+              {COUNTRY_OPTIONS.map((country) => (
+                <CommandItem
+                  key={country.code}
+                  value={`${country.name} ${country.code}`}
+                  onSelect={() => {
+                    onChange({ code: country.code, name: country.name });
+                    setOpen(false);
+                  }}
+                >
+                  <Check
+                    className={cn(
+                      'mr-2 h-4 w-4',
+                      value === country.code ? 'opacity-100' : 'opacity-0'
+                    )}
+                  />
+                  <span className="flex-1">{country.name}</span>
+                  <span className="text-muted-foreground ml-2 text-xs">{country.code}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 export function GeneralSettings() {
   const { t } = useTranslation(['settings', 'common']);
   const { data: settings, isLoading } = useSettings();
@@ -303,6 +393,15 @@ export function GeneralSettings() {
 
   const handleIntervalChange = (seconds: number) => {
     pollerIntervalField.setValue(seconds * 1000);
+  };
+
+  const handleLocalCountryChange = (country: { code: string | null; name: string | null }) => {
+    localCountryField.setValue(country.name);
+    localCountryCodeField.setValue(country.code);
+    setTimeout(() => {
+      localCountryField.saveNow();
+      localCountryCodeField.saveNow();
+    }, 0);
   };
 
   const handleUseBrowserLocation = () => {
@@ -629,30 +728,38 @@ export function GeneralSettings() {
                   onRetry={localRegionField.retry}
                   onReset={localRegionField.reset}
                 />
-                <AutosaveTextField
-                  id="localCountry"
-                  label={t('general.localCountry')}
-                  value={localCountryField.value ?? ''}
-                  onChange={(v) => localCountryField.setValue(v)}
-                  placeholder={t('general.localCountryPlaceholder')}
-                  maxLength={100}
-                  status={localCountryField.status}
-                  errorMessage={localCountryField.errorMessage}
-                  onRetry={localCountryField.retry}
-                  onReset={localCountryField.reset}
-                />
-                <AutosaveTextField
-                  id="localCountryCode"
-                  label={t('general.localCountryCode')}
-                  value={localCountryCodeField.value ?? ''}
-                  onChange={(v) => localCountryCodeField.setValue(v)}
-                  placeholder={t('general.localCountryCodePlaceholder')}
-                  maxLength={2}
-                  status={localCountryCodeField.status}
-                  errorMessage={localCountryCodeField.errorMessage}
-                  onRetry={localCountryCodeField.retry}
-                  onReset={localCountryCodeField.reset}
-                />
+                <Field
+                  data-invalid={
+                    localCountryField.status === 'error' ||
+                    localCountryCodeField.status === 'error'
+                  }
+                >
+                  <div className="flex items-center justify-between">
+                    <FieldLabel>{t('general.localCountry')}</FieldLabel>
+                    <SaveStatusIndicator
+                      status={
+                        localCountryField.status === 'error'
+                          ? localCountryField.status
+                          : localCountryCodeField.status
+                      }
+                    />
+                  </div>
+                  <LocalCountrySelect
+                    value={localCountryCodeField.value}
+                    onChange={handleLocalCountryChange}
+                    placeholder={t('general.localCountryPlaceholder')}
+                    searchPlaceholder={t('general.localCountrySearchPlaceholder')}
+                    emptyMessage={t('general.localCountryEmpty')}
+                  />
+                  <FieldDescription>{t('general.localCountryDesc')}</FieldDescription>
+                  {localCountryField.status === 'error' && localCountryField.errorMessage && (
+                    <FieldError>{localCountryField.errorMessage}</FieldError>
+                  )}
+                  {localCountryCodeField.status === 'error' &&
+                    localCountryCodeField.errorMessage && (
+                      <FieldError>{localCountryCodeField.errorMessage}</FieldError>
+                    )}
+                </Field>
                 <Field
                   data-invalid={
                     localLatitudeField.status === 'error' ||
