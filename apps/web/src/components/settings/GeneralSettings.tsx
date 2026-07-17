@@ -31,6 +31,7 @@ import {
   Globe,
   AlertTriangle,
   KeyRound,
+  LocateFixed,
   Sun,
   Moon,
   Monitor,
@@ -258,6 +259,7 @@ export function GeneralSettings() {
   const { t } = useTranslation(['settings', 'common']);
   const { data: settings, isLoading } = useSettings();
   const { theme, setTheme, accentHue, setAccentHue } = useTheme();
+  const [isLocatingBrowser, setIsLocatingBrowser] = useState(false);
 
   // General settings fields
   const unitSystemField = useDebouncedSave('unitSystem', settings?.unitSystem);
@@ -301,6 +303,37 @@ export function GeneralSettings() {
 
   const handleIntervalChange = (seconds: number) => {
     pollerIntervalField.setValue(seconds * 1000);
+  };
+
+  const handleUseBrowserLocation = () => {
+    if (!navigator.geolocation) {
+      toast.error(t('general.localBrowserLocationUnavailable'));
+      return;
+    }
+
+    setIsLocatingBrowser(true);
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const latitude = Number(position.coords.latitude.toFixed(2));
+        const longitude = Number(position.coords.longitude.toFixed(2));
+
+        localLatitudeField.setValue(latitude);
+        localLongitudeField.setValue(longitude);
+        localLatitudeField.saveNow();
+        localLongitudeField.saveNow();
+        setIsLocatingBrowser(false);
+        toast.success(t('general.localBrowserLocationSaved'));
+      },
+      () => {
+        setIsLocatingBrowser(false);
+        toast.error(t('general.localBrowserLocationFailed'));
+      },
+      {
+        enableHighAccuracy: false,
+        maximumAge: 300000,
+        timeout: 10000,
+      }
+    );
   };
 
   const handleDetectUrl = () => {
@@ -535,6 +568,21 @@ export function GeneralSettings() {
                   {t('general.localLocationDesc')}
                 </p>
               </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="w-fit gap-2"
+                onClick={handleUseBrowserLocation}
+                disabled={isLocatingBrowser}
+              >
+                {isLocatingBrowser ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <LocateFixed className="h-4 w-4" />
+                )}
+                {t('general.localUseBrowserLocation')}
+              </Button>
 
               <div className="grid gap-4 md:grid-cols-2">
                 <AutosaveTextField
