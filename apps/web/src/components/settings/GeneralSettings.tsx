@@ -306,6 +306,11 @@ export function GeneralSettings() {
   };
 
   const handleUseBrowserLocation = () => {
+    if (!window.isSecureContext) {
+      toast.error(t('general.localBrowserLocationRequiresSecureContext'));
+      return;
+    }
+
     if (!navigator.geolocation) {
       toast.error(t('general.localBrowserLocationUnavailable'));
       return;
@@ -319,8 +324,10 @@ export function GeneralSettings() {
 
         localLatitudeField.setValue(latitude);
         localLongitudeField.setValue(longitude);
-        localLatitudeField.saveNow();
-        localLongitudeField.saveNow();
+        setTimeout(() => {
+          localLatitudeField.saveNow();
+          localLongitudeField.saveNow();
+        }, 0);
         setIsLocatingBrowser(false);
         toast.success(t('general.localBrowserLocationSaved'));
       },
