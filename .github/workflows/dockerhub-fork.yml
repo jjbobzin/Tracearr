@@ -19,6 +19,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -35,8 +38,12 @@ jobs:
       - name: Get build metadata
         id: meta
         run: |
+          base_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
+          base_version="${base_tag#v}"
           echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
+          echo "app_tag=supervised-${base_tag}-local-map" >> "$GITHUB_OUTPUT"
 
       - name: Build and push supervised image
         uses: docker/build-push-action@v7
@@ -52,8 +59,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            APP_VERSION=1.5.0
-            APP_TAG=supervised-v1.5.0-local-map
+            APP_VERSION=${{ steps.meta.outputs.base_version }}
+            APP_TAG=${{ steps.meta.outputs.app_tag }}
             APP_COMMIT=${{ steps.meta.outputs.short_sha }}
             APP_BUILD_DATE=${{ steps.meta.outputs.build_date }}
             CACHE_BUST=${{ github.sha }}
