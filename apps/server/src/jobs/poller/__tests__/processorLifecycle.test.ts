@@ -15,10 +15,10 @@ function createPendingSession(overrides: Partial<PendingSessionData> = {}): Pend
   return {
     id: 'test-uuid-123',
     confirmation: {
-      rulesEvaluated: false,
       confirmedPlayback: false,
       firstSeenAt: now,
       maxViewOffset: 0,
+      initialViewOffset: null,
     },
     processed: {} as any,
     server: { id: 'srv-1', name: 'Test JF', type: 'jellyfin' },

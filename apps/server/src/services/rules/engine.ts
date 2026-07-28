@@ -61,56 +61,6 @@ export function hasPauseConditions(rule: RuleV2): boolean {
 }
 
 /**
- * Evaluate a single condition and return evidence.
- */
-function evaluateCondition(context: EvaluationContext, condition: Condition): ConditionEvidence {
-  const evaluator: ConditionEvaluator | undefined = evaluatorRegistry[condition.field];
-
-  if (!evaluator) {
-    logger.warn(`No evaluator found for condition field: ${condition.field}`, {
-      field: condition.field,
-    });
-    return {
-      field: condition.field,
-      operator: condition.operator,
-      threshold: condition.value,
-      actual: null,
-      matched: false,
-    };
-  }
-
-  try {
-    const result = evaluator(context, condition);
-    // Handle sync and async evaluators
-    if (result instanceof Promise) {
-      logger.warn(`Async evaluator called synchronously for field: ${condition.field}`, {
-        field: condition.field,
-      });
-      return {
-        field: condition.field,
-        operator: condition.operator,
-        threshold: condition.value,
-        actual: null,
-        matched: false,
-      };
-    }
-    return toConditionEvidence(condition, result);
-  } catch (error) {
-    logger.error(`Error evaluating condition field ${condition.field}`, {
-      field: condition.field,
-      error,
-    });
-    return {
-      field: condition.field,
-      operator: condition.operator,
-      threshold: condition.value,
-      actual: null,
-      matched: false,
-    };
-  }
-}
-
-/**
  * Convert an evaluator result to condition evidence.
  */
 function toConditionEvidence(condition: Condition, result: EvaluatorResult): ConditionEvidence {
@@ -135,144 +85,14 @@ interface GroupResult {
   conditions: ConditionEvidence[];
 }
 
-/**
- * Evaluate a condition group (conditions within a group are OR'd).
- * Evaluates ALL conditions to collect full evidence.
- */
-function evaluateConditionGroup(context: EvaluationContext, group: ConditionGroup): GroupResult {
-  if (group.conditions.length === 0) {
-    return { matched: true, conditions: [] };
-  }
-
-  // Evaluate ALL conditions (no short-circuit) to collect full evidence
-  const conditions = group.conditions.map((condition) => evaluateCondition(context, condition));
-
-  // OR logic - any condition matching makes the group true
-  const matched = conditions.some((c) => c.matched);
-
-  return { matched, conditions };
-}
-
 interface AllGroupsResult {
   matchedGroups: number[] | null;
   evidence: GroupEvidence[];
 }
 
 /**
- * Evaluate all condition groups (groups are AND'd together).
- * Returns evidence for all evaluated groups.
- */
-function evaluateAllGroups(
-  context: EvaluationContext,
-  conditions: RuleConditions
-): AllGroupsResult {
-  if (conditions.groups.length === 0) {
-    return { matchedGroups: [], evidence: [] };
-  }
-
-  const matchedGroups: number[] = [];
-  const evidence: GroupEvidence[] = [];
-
-  // AND logic - all groups must match
-  for (let i = 0; i < conditions.groups.length; i++) {
-    const group = conditions.groups[i];
-    if (!group) continue;
-
-    const groupResult = evaluateConditionGroup(context, group);
-    evidence.push({
-      groupIndex: i,
-      matched: groupResult.matched,
-      conditions: groupResult.conditions,
-    });
-
-    if (!groupResult.matched) {
-      return { matchedGroups: null, evidence }; // Any group failing = rule doesn't match
-    }
-    matchedGroups.push(i);
-  }
-
-  return { matchedGroups, evidence };
-}
-
-/**
- * Evaluate a single rule against the given context.
- */
-export function evaluateRule(context: EvaluationContext): EvaluationResult {
-  const { rule } = context;
-
-  // Check if rule has v2 conditions
-  if (!rule.conditions?.groups) {
-    return {
-      ruleId: rule.id,
-      ruleName: rule.name,
-      matched: false,
-      matchedGroups: [],
-      actions: [],
-    };
-  }
-
-  const { matchedGroups, evidence } = evaluateAllGroups(context, rule.conditions);
-  const matched = matchedGroups !== null;
-
-  return {
-    ruleId: rule.id,
-    ruleName: rule.name,
-    matched,
-    matchedGroups: matchedGroups ?? [],
-    actions: matched ? (rule.actions?.actions ?? []) : [],
-    evidence: matched ? evidence : undefined,
-  };
-}
-
-/**
- * Evaluate multiple rules against the given session context.
- * Returns all matching rules with their actions.
- */
-export function evaluateRules(
-  baseContext: Omit<EvaluationContext, 'rule'>,
-  rules: RuleV2[]
-): EvaluationResult[] {
-  const results: EvaluationResult[] = [];
-
-  for (const rule of rules) {
-    // Skip inactive rules
-    if (!rule.isActive) {
-      continue;
-    }
-
-    // Check server scope - if rule is server-specific, must match context server
-    if (rule.serverId && rule.serverId !== baseContext.server.id) {
-      continue;
-    }
-
-    // Check account scope - if rule is account-specific, must match context server_user
-    if (rule.serverUserId && rule.serverUserId !== baseContext.serverUser.id) {
-      continue;
-    }
-
-    // Check identity (person) scope - applies to every server_user of that identity
-    if (rule.userId && rule.userId !== baseContext.serverUser.userId) {
-      continue;
-    }
-
-    const context: EvaluationContext = {
-      ...baseContext,
-      rule,
-    };
-
-    const result = evaluateRule(context);
-
-    // Only include rules that matched
-    if (result.matched) {
-      results.push(result);
-    }
-  }
-
-  return results;
-}
-
-/**
- * Async version of evaluateCondition.
+ * Evaluate a single condition and return evidence. Awaits the evaluator's
+ * result whether it resolves synchronously or via a Promise.
  */
 async function evaluateConditionAsync(
   context: EvaluationContext,
@@ -314,7 +134,8 @@ async function evaluateConditionAsync(
 }
 
 /**
- * Async version of evaluateConditionGroup.
+ * Evaluate a condition group (conditions within a group are OR'd).
+ * Evaluates ALL conditions in parallel to collect full evidence.
  */
 async function evaluateConditionGroupAsync(
   context: EvaluationContext,
@@ -333,7 +154,8 @@ async function evaluateConditionGroupAsync(
 }
 
 /**
- * Async version of evaluateAllGroups.
+ * Evaluate all condition groups (groups are AND'd together).
+ * Returns evidence for all evaluated groups.
  */
 async function evaluateAllGroupsAsync(
   context: EvaluationContext,
@@ -368,7 +190,7 @@ async function evaluateAllGroupsAsync(
 }
 
 /**
- * Async version of evaluateRule.
+ * Evaluate a single rule against the given context.
  */
 export async function evaluateRuleAsync(context: EvaluationContext): Promise<EvaluationResult> {
   const { rule } = context;
@@ -397,7 +219,8 @@ export async function evaluateRuleAsync(context: EvaluationContext): Promise<Eva
 }
 
 /**
- * Async version of evaluateRules.
+ * Evaluate multiple rules against the given session context.
+ * Returns all matching rules with their actions.
  */
 export async function evaluateRulesAsync(
   baseContext: Omit<EvaluationContext, 'rule'>,

@@ -116,6 +116,36 @@ describe('processPollResults', () => {
     expect(enqueueNotification).toHaveBeenCalledTimes(2);
   });
 
+  it('skips the session:started publish and notification for sessions confirmed from a pending entry', async () => {
+    const newSessions = [makeSession('fresh-1'), makeSession('confirmed-1')];
+    const cacheService = {
+      incrementalSyncActiveSessions: vi.fn(),
+      addUserSession: vi.fn(),
+      removeUserSession: vi.fn(),
+    };
+    const pubSubService = { publish: vi.fn() };
+    const enqueueNotification = vi.fn();
+
+    await processPollResults({
+      newSessions,
+      stoppedKeys: [],
+      updatedSessions: [],
+      watchedTransitionOccurred: false,
+      cachedSessions: [],
+      cacheService,
+      pubSubService,
+      enqueueNotification,
+      confirmedFromPendingIds: new Set(['confirmed-1']),
+    });
+
+    const startedPublishes = pubSubService.publish.mock.calls.filter(
+      ([event]) => event === 'session:started'
+    );
+    expect(startedPublishes).toHaveLength(1);
+    expect(startedPublishes[0]?.[1]).toBe(newSessions[0]);
+    expect(enqueueNotification).toHaveBeenCalledTimes(1);
+  });
+
   it('still publishes one session:stopped per stopped session', async () => {
     mockDbSelect.mockReturnValue({
       from: () => ({

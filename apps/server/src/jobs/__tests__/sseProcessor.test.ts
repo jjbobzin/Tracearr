@@ -58,7 +58,6 @@ vi.mock('../poller/stateTracker.js', () => ({
   // Playback confirmation functions for delayed rule evaluation
   isPlaybackConfirmed: vi.fn().mockReturnValue(false),
   createInitialConfirmationState: vi.fn().mockReturnValue({
-    rulesEvaluated: false,
     confirmedPlayback: false,
     firstSeenAt: Date.now(),
     maxViewOffset: 0,
@@ -83,6 +82,7 @@ vi.mock('../poller/sessionLifecycle.js', () => ({
   findActiveSessionsAll: vi.fn(),
   buildActiveSession: vi.fn(),
   handleMediaChangeAtomic: vi.fn(),
+  handleQualityChangeFallout: vi.fn(),
   reEvaluateRulesOnTranscodeChange: vi.fn(),
   confirmAndPersistSession: vi.fn(),
 }));

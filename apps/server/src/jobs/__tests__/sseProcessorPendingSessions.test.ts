@@ -34,6 +34,7 @@ const {
   mockBroadcastViolations,
   mockMapMediaSession,
   mockCreateMediaServerClient,
+  mockGetIdentityServerUserIds,
   mockDb,
 } = vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -52,13 +53,14 @@ const {
       serverName: data.server.name,
       sessionKey: data.processed.sessionKey,
       mediaTitle: data.processed.mediaTitle,
+      pending: true,
     })),
     mockIsPlaybackConfirmed: vi.fn().mockReturnValue(false),
     mockCreateInitialConfirmationState: vi.fn().mockReturnValue({
-      rulesEvaluated: false,
       confirmedPlayback: false,
       firstSeenAt: Date.now(),
       maxViewOffset: 0,
+      initialViewOffset: null,
     }),
     mockUpdateConfirmationState: vi.fn().mockImplementation((state) => state),
     mockDetectMediaChange: vi.fn().mockReturnValue(false),
@@ -69,6 +71,7 @@ const {
     mockCreateMediaServerClient: vi.fn().mockReturnValue({
       getSessions: vi.fn().mockResolvedValue([]),
     }),
+    mockGetIdentityServerUserIds: vi.fn().mockResolvedValue([]),
     mockDb: {
       select: vi.fn().mockReturnValue({
         from: vi.fn().mockReturnValue({
@@ -121,6 +124,10 @@ vi.mock('../../routes/settings.js', () => ({
   getGeoIPSettings: vi.fn().mockResolvedValue({ usePlexGeoip: false }),
 }));
 
+vi.mock('../../services/userService.js', () => ({
+  getIdentityServerUserIds: mockGetIdentityServerUserIds,
+}));
+
 vi.mock('../poller/index.js', () => ({
   triggerReconciliationPoll: vi.fn(),
 }));
@@ -156,6 +163,7 @@ vi.mock('../poller/sessionLifecycle.js', () => ({
   buildActiveSession: mockBuildActiveSession,
   buildPendingActiveSession: mockBuildPendingActiveSession,
   handleMediaChangeAtomic: vi.fn(),
+  handleQualityChangeFallout: vi.fn(),
   reEvaluateRulesOnTranscodeChange: vi.fn(),
   confirmAndPersistSession: mockConfirmAndPersistSession,
 }));
@@ -180,6 +188,7 @@ const mockCacheService = {
   addActiveSession: vi.fn(),
   updateActiveSession: vi.fn(),
   removeActiveSession: vi.fn(),
+  invalidateDashboardStatsCache: vi.fn(),
   addUserSession: vi.fn(),
   removeUserSession: vi.fn(),
   withSessionCreateLock: vi.fn().mockImplementation(async (_s, _k, op) => op()),
@@ -205,10 +214,10 @@ function createMockPendingSession(overrides: Partial<PendingSessionData> = {}): 
   const baseSession = {
     id: randomUUID(),
     confirmation: {
-      rulesEvaluated: false,
       confirmedPlayback: false,
       firstSeenAt: now,
       maxViewOffset: 0,
+      initialViewOffset: null,
     },
     processed: {
       sessionKey: 'test-session-key',
@@ -311,10 +320,83 @@ describe('SSE Processor - Pending Session Flow', () => {
     vi.useRealTimers();
   });
 
+  describe('createNewSession - Pending Cache Entry', () => {
+    it('marks the cached ActiveSession as pending before confirmation', async () => {
+      const mockServerRow = {
+        id: 'server-123',
+        name: 'Test Server',
+        type: 'plex',
+        url: 'http://localhost:32400',
+        token: 'test-token',
+      };
+      const mockServerUserRow = {
+        id: 'server-user-123',
+        userId: 'identity-123',
+        username: 'testuser',
+        thumbUrl: null,
+        identityName: 'Test User',
+        trustScore: 100,
+        sessionCount: 10,
+        lastActivityAt: new Date(),
+        createdAt: new Date(),
+      };
+
+      // fetchFullSession: db.select().from(servers).where().limit()
+      mockDb.select.mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([mockServerRow]),
+          }),
+        }),
+      });
+      // createNewSession: db.select({...}).from(serverUsers).innerJoin(users).where().limit()
+      mockDb.select.mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([mockServerUserRow]),
+            }),
+          }),
+        }),
+      });
+
+      mockCreateMediaServerClient.mockReturnValueOnce({
+        getSessions: vi
+          .fn()
+          .mockResolvedValue([{ sessionKey: 'test-session-key', ratingKey: '12345' }]),
+      });
+      mockMapMediaSession.mockReturnValueOnce({
+        sessionKey: 'test-session-key',
+        ratingKey: '12345',
+        externalUserId: 'user-123',
+        ipAddress: '192.168.1.100',
+        mediaTitle: 'Test Movie',
+        state: 'playing',
+      });
+
+      mockSseManager.emit('plex:session:playing', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 0 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.addActiveSession).toHaveBeenCalled();
+      });
+
+      const cachedSession = mockCacheService.addActiveSession.mock.calls[0]?.[0];
+      expect(cachedSession?.pending).toBe(true);
+    });
+  });
+
   describe('handleStopped - Phantom Session Detection', () => {
     it('discards pending session when stopped before confirmation (phantom session)', async () => {
       const pendingSession = createMockPendingSession();
-      mockCacheService.getPendingSession.mockResolvedValueOnce(pendingSession);
+      // First call is handleStopped's own pending check; second is the in-lock
+      // recheck inside discardPendingSession. Both see the entry present so the
+      // discard removes it as a phantom.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
 
       // Emit stopped event
       mockSseManager.emit('plex:session:stopped', {
@@ -331,6 +413,258 @@ describe('SSE Processor - Pending Session Flow', () => {
       });
 
       // Should NOT have tried to stop a DB session
+      expect(mockFindActiveSessionsAll).not.toHaveBeenCalled();
+      expect(mockStopSessionAtomic).not.toHaveBeenCalled();
+    });
+
+    it('persists a pending session with >= 15s of observed progress instead of discarding it', async () => {
+      const pendingSession = createMockPendingSession({
+        confirmation: {
+          confirmedPlayback: false,
+          firstSeenAt: Date.now(),
+          maxViewOffset: 20000,
+          initialViewOffset: 2000,
+        },
+      });
+      // First call is handleStopped's own pending check, second is the
+      // in-lock recheck inside confirmPendingSessionAndPersist; both must
+      // see the entry still present for the persist to proceed.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
+
+      mockConfirmAndPersistSession.mockResolvedValueOnce({
+        insertedSession: {
+          id: pendingSession.id,
+          serverId: 'server-123',
+          serverUserId: 'server-user-123',
+          sessionKey: 'test-session-key',
+          startedAt: new Date(),
+          state: 'playing',
+        },
+        violationResults: [],
+        qualityChange: null,
+        referenceId: null,
+        wasTerminatedByRule: false,
+      });
+
+      mockBuildActiveSession.mockReturnValueOnce({
+        id: pendingSession.id,
+        serverId: 'server-123',
+        serverUserId: 'server-user-123',
+        sessionKey: 'test-session-key',
+      });
+
+      const activeRow = {
+        id: pendingSession.id,
+        serverId: 'server-123',
+        sessionKey: 'test-session-key',
+        serverUserId: 'server-user-123',
+      };
+      // First call is confirmPendingSessionAndPersist's own race check (no
+      // active session yet), second is handleStopped's post-persist lookup.
+      mockFindActiveSession.mockResolvedValueOnce(null).mockResolvedValueOnce(activeRow);
+
+      // Emit stopped event
+      mockSseManager.emit('plex:session:stopped', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 20000 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockConfirmAndPersistSession).toHaveBeenCalled();
+      });
+
+      // Should have finalized the just-persisted session, not discarded it as a phantom
+      await vi.waitFor(() => {
+        expect(mockStopSessionAtomic).toHaveBeenCalledWith({
+          session: activeRow,
+          stoppedAt: expect.any(Date),
+        });
+      });
+    });
+
+    it('stops the concurrently-persisted row when confirmPendingSessionAndPersist loses the create-lock race', async () => {
+      const pendingSession = createMockPendingSession({
+        confirmation: {
+          confirmedPlayback: false,
+          firstSeenAt: Date.now(),
+          maxViewOffset: 20000,
+          initialViewOffset: 2000,
+        },
+      });
+      // First call is handleStopped's own pending check, second is the
+      // in-lock recheck inside confirmPendingSessionAndPersist; both see the
+      // entry present so the lock body reaches the existingActive check below.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
+
+      const concurrentRow = {
+        id: 'concurrent-session-id',
+        serverId: 'server-123',
+        sessionKey: 'test-session-key',
+        serverUserId: 'server-user-123',
+      };
+
+      // The existingActive check inside confirmPendingSessionAndPersist finds
+      // a row a concurrent caller already created, so the lock body returns
+      // null and confirmPendingSessionAndPersist resolves false without persisting.
+      mockFindActiveSession.mockResolvedValueOnce(concurrentRow);
+
+      // handleStopped must then fall through to the same lookup-and-stop
+      // path used for already-confirmed sessions, closing the row the
+      // concurrent caller created.
+      mockFindActiveSessionsAll.mockResolvedValueOnce([concurrentRow]);
+
+      mockSseManager.emit('plex:session:stopped', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 20000 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockFindActiveSessionsAll).toHaveBeenCalledWith({
+          serverId: 'server-123',
+          sessionKey: 'test-session-key',
+        });
+      });
+
+      await vi.waitFor(() => {
+        expect(mockStopSessionAtomic).toHaveBeenCalledWith({
+          session: concurrentRow,
+          stoppedAt: expect.any(Date),
+        });
+      });
+
+      // The lock body bailed before ever reaching persistence.
+      expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
+    });
+
+    it('aborts the confirm when a concurrent discard wins the race before the lock recheck', async () => {
+      const pendingSession = createMockPendingSession({
+        confirmation: {
+          confirmedPlayback: false,
+          firstSeenAt: Date.now(),
+          maxViewOffset: 20000,
+          initialViewOffset: 2000,
+        },
+      });
+      // First call is handleStopped's own pending check (entry still there).
+      // Second call is the in-lock recheck inside confirmPendingSessionAndPersist,
+      // by which point a concurrent phantom-discard has already deleted the entry.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(null);
+
+      mockSseManager.emit('plex:session:stopped', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 20000 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.withSessionCreateLock).toHaveBeenCalled();
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.getPendingSession).toHaveBeenCalledTimes(2);
+      });
+
+      // The lock body must bail on the recheck, before persisting or touching the cache.
+      expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
+      expect(mockCacheService.deletePendingSession).not.toHaveBeenCalled();
+      expect(mockCacheService.updateActiveSession).not.toHaveBeenCalled();
+      expect(mockCacheService.addActiveSession).not.toHaveBeenCalled();
+
+      // confirmPendingSessionAndPersist resolved false, so handleStopped falls
+      // through to the lookup-and-stop path just like the create-lock-race case.
+      expect(mockFindActiveSessionsAll).toHaveBeenCalledWith({
+        serverId: 'server-123',
+        sessionKey: 'test-session-key',
+      });
+    });
+
+    it('closes the persisted row through the stop path when a discard loses the race to a concurrent confirm', async () => {
+      // Age > 30s but observed progress < 15s: a progress event can confirm+
+      // persist this session while a concurrent stopped event tries to discard
+      // it as a phantom. The discard must not evict the just-confirmed session.
+      const pendingSession = createMockPendingSession({
+        confirmation: {
+          confirmedPlayback: false,
+          firstSeenAt: Date.now(),
+          maxViewOffset: 10000,
+          initialViewOffset: 2000,
+        },
+      });
+
+      // handleStopped's own pending check still sees the entry (progress < 15s
+      // routes it to discardPendingSession). By the time the discard takes the
+      // lock and rechecks, a concurrent confirm has already persisted the row
+      // and deleted the pending entry.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(null);
+
+      const persistedRow = {
+        id: pendingSession.id,
+        serverId: 'server-123',
+        sessionKey: 'test-session-key',
+        serverUserId: 'server-user-123',
+      };
+      mockFindActiveSessionsAll.mockResolvedValueOnce([persistedRow]);
+
+      mockSseManager.emit('plex:session:stopped', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 10000 },
+      });
+
+      // The discard found no pending entry, so it must fall through to the
+      // normal stop path and close the concurrently-persisted row instead of
+      // bare-evicting the freshly confirmed session.
+      await vi.waitFor(() => {
+        expect(mockFindActiveSessionsAll).toHaveBeenCalledWith({
+          serverId: 'server-123',
+          sessionKey: 'test-session-key',
+        });
+      });
+
+      await vi.waitFor(() => {
+        expect(mockStopSessionAtomic).toHaveBeenCalledWith({
+          session: persistedRow,
+          stoppedAt: expect.any(Date),
+        });
+      });
+    });
+
+    it('discards a pending session with < 15s of observed progress when stopped', async () => {
+      const pendingSession = createMockPendingSession({
+        confirmation: {
+          confirmedPlayback: false,
+          firstSeenAt: Date.now(),
+          maxViewOffset: 10000,
+          initialViewOffset: 2000,
+        },
+      });
+      // First call is handleStopped's own pending check; second is the in-lock
+      // recheck inside discardPendingSession. Both see the entry present so the
+      // discard removes it as a phantom.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
+
+      // Emit stopped event
+      mockSseManager.emit('plex:session:stopped', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 10000 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.deletePendingSession).toHaveBeenCalledWith(
+          'server-123',
+          'test-session-key'
+        );
+      });
+
+      expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
       expect(mockFindActiveSessionsAll).not.toHaveBeenCalled();
       expect(mockStopSessionAtomic).not.toHaveBeenCalled();
     });
@@ -430,7 +764,11 @@ describe('SSE Processor - Pending Session Flow', () => {
   describe('handleProgress - Confirmation Threshold', () => {
     it('confirms pending session when viewOffset exceeds 30s threshold', async () => {
       const pendingSession = createMockPendingSession();
-      mockCacheService.getPendingSession.mockResolvedValueOnce(pendingSession);
+      // First call is handleProgress's own pending check, second is the
+      // in-lock recheck inside confirmPendingSessionAndPersist.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
 
       // First call returns true (threshold exceeded)
       mockIsPlaybackConfirmed.mockReturnValueOnce(true);
@@ -479,6 +817,86 @@ describe('SSE Processor - Pending Session Flow', () => {
 
       // Should have updated the session in cache (same ID, just confirming status)
       expect(mockCacheService.updateActiveSession).toHaveBeenCalled();
+
+      // Confirmed sessions carry no pending flag, so rule evaluation counts them
+      const confirmedSession = mockCacheService.updateActiveSession.mock.calls[0]?.[0];
+      expect(confirmedSession?.pending).toBeUndefined();
+    });
+
+    it('publishes session:stopped exactly once when a kill_stream rule terminates the session being confirmed', async () => {
+      const pendingSession = createMockPendingSession();
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
+
+      mockIsPlaybackConfirmed.mockReturnValueOnce(true);
+
+      // In production, confirmAndPersistSession runs the kill_stream action
+      // (via createSessionWithRulesAtomic's post-commit side effects) before
+      // returning, so termination.ts's own session:stopped publish has
+      // already fired by the time this resolves.
+      mockConfirmAndPersistSession.mockImplementationOnce(async () => {
+        await mockPubSubService.publish('session:stopped', pendingSession.id);
+        return {
+          insertedSession: {
+            id: pendingSession.id,
+            serverId: 'server-123',
+            serverUserId: 'server-user-123',
+            sessionKey: 'test-session-key',
+            startedAt: new Date(),
+            state: 'playing',
+          },
+          violationResults: [],
+          qualityChange: null,
+          referenceId: null,
+          wasTerminatedByRule: true,
+        };
+      });
+
+      mockSseManager.emit('plex:session:progress', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 35000 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.deletePendingSession).toHaveBeenCalledWith(
+          'server-123',
+          'test-session-key'
+        );
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.removeActiveSession).toHaveBeenCalledWith(pendingSession.id);
+      });
+
+      const stoppedCalls = mockPubSubService.publish.mock.calls.filter(
+        ([event]) => event === 'session:stopped'
+      );
+      expect(stoppedCalls).toHaveLength(1);
+    });
+
+    it('leaves the pending entry in Redis when the create lock is contended', async () => {
+      const pendingSession = createMockPendingSession();
+      mockCacheService.getPendingSession.mockResolvedValueOnce(pendingSession);
+
+      mockIsPlaybackConfirmed.mockReturnValueOnce(true);
+
+      // Lock contended: another caller holds it, so the lock body never runs.
+      mockCacheService.withSessionCreateLock.mockResolvedValueOnce(null);
+
+      mockSseManager.emit('plex:session:progress', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 35000 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.withSessionCreateLock).toHaveBeenCalled();
+      });
+
+      // Lock body never ran, so nothing was persisted and the pending entry
+      // must still exist in Redis for a later caller to confirm.
+      expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
+      expect(mockCacheService.deletePendingSession).not.toHaveBeenCalled();
     });
 
     it('keeps session pending when viewOffset below threshold', async () => {
@@ -516,11 +934,28 @@ describe('SSE Processor - Pending Session Flow', () => {
         url: 'http://localhost:32400',
         token: 'test-token',
       };
-      // Mock db.select().from(servers).where().limit() to return server
+      const mockServerUserRow = {
+        id: 'server-user-123',
+        userId: 'identity-123',
+        username: 'testuser',
+        thumbUrl: null,
+        identityName: 'Test User',
+        trustScore: 100,
+        sessionCount: 10,
+        lastActivityAt: new Date(),
+        createdAt: new Date(),
+      };
+      // fetchFullSession: db.select().from(servers).where().limit()
+      // createNewSession: db.select({...}).from(serverUsers).innerJoin(users).where().limit()
       mockDb.select.mockReturnValue({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
             limit: vi.fn().mockResolvedValue([mockServer]),
+          }),
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([mockServerUserRow]),
+            }),
           }),
         }),
       });
@@ -535,7 +970,11 @@ describe('SSE Processor - Pending Session Flow', () => {
           mediaTitle: 'Episode 1',
         },
       });
-      mockCacheService.getPendingSession.mockResolvedValueOnce(pendingSession);
+      // First call is handlePlaying's own pending check; second is the in-lock
+      // recheck inside discardPendingSession when the media-change discard runs.
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
 
       // Setup db to return server
       setupDbForFetchSession();
@@ -583,6 +1022,24 @@ describe('SSE Processor - Pending Session Flow', () => {
         null,
         undefined
       );
+
+      // Should have created a fresh pending session for the new media, not
+      // silently dropped it after discarding the old one.
+      await vi.waitFor(() => {
+        expect(mockCacheService.setPendingSession).toHaveBeenCalledWith(
+          'server-123',
+          'test-session-key',
+          expect.objectContaining({
+            processed: expect.objectContaining({ ratingKey: 'new-rating-key' }),
+          })
+        );
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.addActiveSession).toHaveBeenCalledWith(
+          expect.objectContaining({ mediaTitle: 'Episode 2', pending: true })
+        );
+      });
     });
 
     it('updates pending session normally when media has not changed', async () => {
@@ -624,6 +1081,183 @@ describe('SSE Processor - Pending Session Flow', () => {
     });
   });
 
+  describe('cross-user sessionKey reuse guard', () => {
+    const setupDbForCreate = () => {
+      const mockServer = {
+        id: 'server-123',
+        name: 'Test Server',
+        type: 'plex',
+        url: 'http://localhost:32400',
+        token: 'test-token',
+      };
+      const mockServerUserRow = {
+        id: 'server-user-123',
+        userId: 'identity-123',
+        username: 'testuser',
+        thumbUrl: null,
+        identityName: 'Test User',
+        trustScore: 100,
+        sessionCount: 10,
+        lastActivityAt: new Date(),
+        createdAt: new Date(),
+      };
+      mockDb.select.mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([mockServer]),
+          }),
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([mockServerUserRow]),
+            }),
+          }),
+        }),
+      });
+    };
+
+    it('createNewSession creates fresh when the in-lock row belongs to another user', async () => {
+      setupDbForCreate();
+      mockCreateMediaServerClient.mockReturnValueOnce({
+        getSessions: vi
+          .fn()
+          .mockResolvedValue([{ sessionKey: 'test-session-key', ratingKey: '12345' }]),
+      });
+      mockMapMediaSession.mockReturnValueOnce({
+        sessionKey: 'test-session-key',
+        ratingKey: '12345',
+        externalUserId: 'user-123',
+        ipAddress: '192.168.1.100',
+        mediaTitle: 'Test Movie',
+        state: 'playing',
+      });
+
+      // handlePlaying's own lookup finds nothing; the in-lock recheck inside
+      // createNewSession finds a stale open row that Plex reassigned this
+      // sessionKey to - but it belongs to a different server user.
+      mockFindActiveSession
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'stale-id', serverUserId: 'other-user' });
+
+      mockSseManager.emit('plex:session:playing', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 0 },
+      });
+
+      // The foreign row must not block creation - this user gets a fresh pending
+      // session instead of being silently dropped.
+      await vi.waitFor(() => {
+        expect(mockCacheService.setPendingSession).toHaveBeenCalled();
+      });
+      expect(mockCacheService.addActiveSession).toHaveBeenCalled();
+    });
+
+    it('createNewSession skips when the in-lock row belongs to the same user', async () => {
+      setupDbForCreate();
+      mockCreateMediaServerClient.mockReturnValueOnce({
+        getSessions: vi
+          .fn()
+          .mockResolvedValue([{ sessionKey: 'test-session-key', ratingKey: '12345' }]),
+      });
+      mockMapMediaSession.mockReturnValueOnce({
+        sessionKey: 'test-session-key',
+        ratingKey: '12345',
+        externalUserId: 'user-123',
+        ipAddress: '192.168.1.100',
+        mediaTitle: 'Test Movie',
+        state: 'playing',
+      });
+
+      mockFindActiveSession
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'same-id', serverUserId: 'server-user-123' });
+
+      mockSseManager.emit('plex:session:playing', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 0 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockFindActiveSession).toHaveBeenCalledTimes(2);
+      });
+      // Same-user row is a genuine duplicate: no second create.
+      expect(mockCacheService.setPendingSession).not.toHaveBeenCalled();
+      expect(mockCacheService.addActiveSession).not.toHaveBeenCalled();
+    });
+
+    it('confirmPendingSessionAndPersist persists when the in-lock row belongs to another user', async () => {
+      const pendingSession = createMockPendingSession();
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
+      mockIsPlaybackConfirmed.mockReturnValueOnce(true);
+
+      // The in-lock recheck finds a stale open row under a different user.
+      mockFindActiveSession.mockResolvedValueOnce({
+        id: 'stale-id',
+        serverUserId: 'other-user',
+      });
+
+      mockConfirmAndPersistSession.mockResolvedValueOnce({
+        insertedSession: {
+          id: pendingSession.id,
+          serverId: 'server-123',
+          serverUserId: 'server-user-123',
+          sessionKey: 'test-session-key',
+          startedAt: new Date(),
+          state: 'playing',
+        },
+        violationResults: [],
+        qualityChange: null,
+        referenceId: null,
+        wasTerminatedByRule: false,
+      });
+      mockBuildActiveSession.mockReturnValueOnce({
+        id: pendingSession.id,
+        serverId: 'server-123',
+        serverUserId: 'server-user-123',
+        sessionKey: 'test-session-key',
+      });
+
+      mockSseManager.emit('plex:session:progress', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 35000 },
+      });
+
+      // The foreign row must not abort the confirm - this play still persists.
+      await vi.waitFor(() => {
+        expect(mockConfirmAndPersistSession).toHaveBeenCalled();
+      });
+    });
+
+    it('confirmPendingSessionAndPersist bails when the in-lock row belongs to the same user', async () => {
+      const pendingSession = createMockPendingSession();
+      mockCacheService.getPendingSession
+        .mockResolvedValueOnce(pendingSession)
+        .mockResolvedValueOnce(pendingSession);
+      mockIsPlaybackConfirmed.mockReturnValueOnce(true);
+
+      mockFindActiveSession.mockResolvedValueOnce({
+        id: 'same-id',
+        serverUserId: 'server-user-123',
+      });
+
+      mockSseManager.emit('plex:session:progress', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 35000 },
+      });
+
+      // Same-user row means a concurrent caller already persisted: bail and drop
+      // the pending entry instead of double-persisting.
+      await vi.waitFor(() => {
+        expect(mockCacheService.deletePendingSession).toHaveBeenCalledWith(
+          'server-123',
+          'test-session-key'
+        );
+      });
+      expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
+    });
+  });
+
   describe('cleanupOrphanedPendingSessions', () => {
     it('cleans up all orphaned pending sessions on startup', async () => {
       const orphanedSession1 = createMockPendingSession({ id: 'orphan-1' });
@@ -641,8 +1275,14 @@ describe('SSE Processor - Pending Session Flow', () => {
 
       // Should have cleaned up both sessions
       expect(mockCacheService.deletePendingSession).toHaveBeenCalledTimes(2);
-      expect(mockCacheService.removeActiveSession).toHaveBeenCalledWith('orphan-1');
-      expect(mockCacheService.removeActiveSession).toHaveBeenCalledWith('orphan-2');
+      expect(mockCacheService.removeActiveSession).toHaveBeenCalledWith('orphan-1', {
+        skipDashboardInvalidation: true,
+      });
+      expect(mockCacheService.removeActiveSession).toHaveBeenCalledWith('orphan-2', {
+        skipDashboardInvalidation: true,
+      });
+      // One flush after the loop instead of one SCAN per removed session
+      expect(mockCacheService.invalidateDashboardStatsCache).toHaveBeenCalledOnce();
     });
 
     it('handles no orphaned sessions gracefully', async () => {
@@ -652,6 +1292,21 @@ describe('SSE Processor - Pending Session Flow', () => {
 
       // Should not have tried to delete anything
       expect(mockCacheService.deletePendingSession).not.toHaveBeenCalled();
+      expect(mockCacheService.invalidateDashboardStatsCache).not.toHaveBeenCalled();
+    });
+
+    it('swallows a dashboard invalidation failure so startup keeps wiring up SSE', async () => {
+      const orphan = createMockPendingSession({ id: 'orphan-1' });
+      mockCacheService.getAllPendingSessionKeys.mockResolvedValueOnce([
+        { serverId: 'server-123', sessionKey: 'session-1' },
+      ]);
+      mockCacheService.getPendingSession.mockResolvedValueOnce(orphan);
+      mockCacheService.invalidateDashboardStatsCache.mockRejectedValueOnce(new Error('redis down'));
+
+      // This runs before startSSEProcessor and sseManager.start in index.ts. A
+      // rejected promise here would skip both and leave SSE dead until restart,
+      // so the failure must degrade to a logged error, not propagate.
+      await expect(cleanupOrphanedPendingSessions()).resolves.toBeUndefined();
     });
   });
 });

@@ -217,6 +217,8 @@ export interface SessionPauseData {
   pausedDurationMs: number;
   /** Playback position - used to cap duration when pause tracking fails */
   progressMs?: number | null;
+  /** Media runtime - bounds the progress-based cap against corrupt progress metadata */
+  totalDurationMs?: number | null;
 }
 
 // ============================================================================
@@ -236,18 +238,21 @@ export const PLAYBACK_CONFIRM_THRESHOLD_MS = 30_000;
  */
 export const DB_WRITE_FLUSH_INTERVAL_MS = 15_000;
 
+/** A pending session that dies unconfirmed still persists when it showed this much real progress. */
+export const PENDING_STOP_PERSIST_MIN_PROGRESS_MS = 15_000;
+
 /**
  * Tracking data for playback confirmation (stored in Redis session state)
  */
 export interface PlaybackConfirmationState {
-  /** Have rules been evaluated for this session? */
-  rulesEvaluated: boolean;
   /** Has playback been confirmed? */
   confirmedPlayback: boolean;
   /** Timestamp when session first appeared (for duration-based confirmation) */
   firstSeenAt: number;
   /** Highest viewOffset seen (tracks max progress) */
   maxViewOffset: number;
+  /** First observed viewOffset; progress is measured relative to this, not absolute position. */
+  initialViewOffset: number | null;
 }
 
 /**
@@ -320,6 +325,12 @@ export interface ServerProcessingResult {
   updatedSessions: ActiveSession[];
   /** Whether any session crossed the watched-completion threshold this tick */
   watchedTransitionOccurred: boolean;
+  /**
+   * IDs (subset of newSessions) that were confirmed from a pending entry.
+   * The pending create already published session:started, so processPollResults
+   * must not publish it again for these.
+   */
+  confirmedFromPendingIds: Set<string>;
 }
 
 // ============================================================================
@@ -521,6 +532,8 @@ export interface MediaChangeResult {
   /** Violations created during session creation */
   violationResults: ViolationInsertResult[];
   wasTerminatedByRule: boolean;
+  /** Set when the new session's content was already tracked as another un-stopped session for this user+device; that twin was stopped and must be run through handleQualityChangeFallout */
+  qualityChange: QualityChangeResult | null;
 }
 
 // ============================================================================

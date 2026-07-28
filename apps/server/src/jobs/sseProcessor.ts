@@ -32,6 +32,7 @@ import { enqueueNotification } from './notificationQueue.js';
 import {
   batchGetRecentUserSessions,
   getActiveRulesV2,
+  getServerUserIdByExternalId,
   mergeRecentSessionsForIdentity,
 } from './poller/database.js';
 import {
@@ -40,6 +41,7 @@ import {
   shouldFlushDbWrite,
 } from './poller/dbWriteThrottle.js';
 import { triggerReconciliationPoll } from './poller/index.js';
+import { gracePeriodSessionIds } from './poller/processor.js';
 import {
   buildActiveSession,
   buildPendingActiveSession,
@@ -47,6 +49,7 @@ import {
   findActiveSession,
   findActiveSessionsAll,
   handleMediaChangeAtomic,
+  handleQualityChangeFallout,
   reEvaluateRulesOnPauseState,
   reEvaluateRulesOnTranscodeChange,
   stopSessionAtomic,
@@ -60,7 +63,8 @@ import {
   isPlaybackConfirmed,
   updateConfirmationState,
 } from './poller/stateTracker.js';
-import type { PendingSessionData } from './poller/types.js';
+import { PENDING_STOP_PERSIST_MIN_PROGRESS_MS, type PendingSessionData } from './poller/types.js';
+import { excludeUncountableSessions } from './poller/utils.js';
 import { broadcastViolations } from './poller/violations.js';
 
 let cacheService: CacheService | null = null;
@@ -144,7 +148,10 @@ const wrappedHandlers = {
   paused: (e: SessionEvent) => void handlePaused(e),
   stopped: (e: SessionEvent) => void handleStopped(e),
   progress: (e: SessionEvent) => void handleProgress(e),
-  reconciliation: () => void handleReconciliation(),
+  reconciliation: () =>
+    void handleReconciliation().catch((err: unknown) =>
+      console.error('[SSEProcessor] Error in reconciliation handler:', err)
+    ),
   fallbackActivated: (e: FallbackEvent) => handleFallbackActivated(e),
   fallbackDeactivated: (e: FallbackEvent) =>
     void handleFallbackDeactivated(e).catch((err: unknown) =>
@@ -177,8 +184,13 @@ export async function cleanupOrphanedPendingSessions(): Promise<void> {
     return;
   }
 
+  const cache = cacheService;
+  // Dashboard invalidation is deferred to one call after the loop (instead of
+  // one SCAN per removed session) - the flag must survive a mid-loop throw,
+  // hence the outer try/finally rather than folding this into the return path.
+  let dashboardStatsDirty = false;
   try {
-    const pendingKeys = await cacheService.getAllPendingSessionKeys();
+    const pendingKeys = await cache.getAllPendingSessionKeys();
 
     if (pendingKeys.length === 0) {
       console.log('[SSEProcessor] No orphaned pending sessions found');
@@ -188,22 +200,41 @@ export async function cleanupOrphanedPendingSessions(): Promise<void> {
     console.log(`[SSEProcessor] Cleaning up ${pendingKeys.length} orphaned pending session(s)`);
 
     for (const { serverId, sessionKey } of pendingKeys) {
-      const pendingData = await cacheService.getPendingSession(serverId, sessionKey);
+      const pendingData = await cache.getPendingSession(serverId, sessionKey);
       if (pendingData) {
         // Remove from all caches
-        await cacheService.deletePendingSession(serverId, sessionKey);
-        await cacheService.removeActiveSession(pendingData.id);
-        await cacheService.removeUserSession(pendingData.serverUser.id, pendingData.id);
+        await cache.deletePendingSession(serverId, sessionKey);
+        await cache.removeActiveSession(pendingData.id, { skipDashboardInvalidation: true });
+        dashboardStatsDirty = true;
 
         console.log(
           `[SSEProcessor] Cleaned up orphaned session ${sessionKey} (${pendingData.processed.mediaTitle})`
         );
+      } else {
+        // Hash already expired: this member is a zombie left behind in
+        // PENDING_SESSION_IDS. deletePendingSession's del is a no-op here;
+        // its srem is what actually clears it.
+        await cache.deletePendingSession(serverId, sessionKey);
       }
     }
 
     console.log('[SSEProcessor] Orphaned pending session cleanup complete');
   } catch (error) {
     console.error('[SSEProcessor] Error cleaning up orphaned pending sessions:', error);
+  } finally {
+    if (dashboardStatsDirty) {
+      // Runs at startup before startSSEProcessor and sseManager.start. A bare
+      // throw here escapes to index.ts's catch and skips both, leaving SSE dead
+      // until restart. Degrade to a logged error instead.
+      try {
+        await cache.invalidateDashboardStatsCache();
+      } catch (error) {
+        console.error(
+          '[SSEProcessor] Error invalidating dashboard stats after orphan cleanup:',
+          error
+        );
+      }
+    }
   }
 }
 
@@ -338,11 +369,32 @@ async function handlePlaying(event: {
 
     const { session, server } = result;
 
-    const existingSession = await findActiveSession({
+    // Look up by sessionKey alone. Passing the incoming ratingKey would filter
+    // out the still-active old row on a real media change (same sessionKey, new
+    // ratingKey), leaving detectMediaChange below unreachable.
+    const existingRow = await findActiveSession({
       serverId,
       sessionKey: notification.sessionKey,
-      ratingKey: session.ratingKey,
     });
+
+    // Plex resets sessionKey counters on PMS restart, so within the
+    // reconciliation window a stale open row from one user can carry the same
+    // sessionKey a different user's new play now uses. Only reuse the row when
+    // its server user matches this event's user; otherwise treat it as no match
+    // so the stale row falls to its own cleanup and the create path below runs.
+    // createNewSession re-applies this same server-user match under its lock, so
+    // the foreign row is never reused and a fresh row is written under the
+    // correct user.
+    let existingSession = existingRow;
+    if (existingRow) {
+      const incomingServerUserId = await getServerUserIdByExternalId(
+        serverId,
+        session.externalUserId
+      );
+      if (incomingServerUserId !== existingRow.serverUserId) {
+        existingSession = null;
+      }
+    }
 
     if (existingSession) {
       // DB doesn't store liveUuid; reuse incoming if mediaType is 'live'
@@ -420,7 +472,8 @@ async function handlePaused(event: {
 
 /**
  * Handle stopped event
- * If session is still pending (< 30s), discard it silently (phantom session).
+ * If session is still pending and unconfirmed, discard it unless it showed real
+ * progress (a short resume near the end of a file), in which case persist it.
  * If session is confirmed, stop it normally.
  */
 async function handleStopped(event: {
@@ -431,16 +484,50 @@ async function handleStopped(event: {
 
   try {
     // First check for a pending session (Redis-only, not yet confirmed)
-    // If found and not confirmed, this is a phantom session - discard it
     if (cacheService) {
       const pendingData = await cacheService.getPendingSession(serverId, notification.sessionKey);
       if (pendingData) {
-        await discardPendingSession(serverId, notification.sessionKey, pendingData);
-        console.log(
-          `[SSEProcessor] Discarded phantom session ${notification.sessionKey} (id: ${pendingData.id}) ` +
-            `(stopped before 30s confirmation)`
-        );
-        return;
+        const { maxViewOffset, initialViewOffset } = pendingData.confirmation;
+        const progress = maxViewOffset - (initialViewOffset ?? maxViewOffset);
+
+        if (progress >= PENDING_STOP_PERSIST_MIN_PROGRESS_MS) {
+          // Real playback happened; a short resume near the end of a file must
+          // still reach history and flip watched-state. Age-based confirmation
+          // was never reached, so the observed progress is the evidence here.
+          const persisted = await confirmPendingSessionAndPersist(
+            serverId,
+            notification.sessionKey,
+            {
+              ...pendingData,
+              confirmation: { ...pendingData.confirmation, confirmedPlayback: true },
+            }
+          );
+          if (persisted) {
+            const sessionRow = await findActiveSession({
+              serverId,
+              sessionKey: notification.sessionKey,
+              ratingKey: pendingData.processed.ratingKey,
+            });
+            if (sessionRow) await stopSession(sessionRow);
+            return;
+          }
+          // False here has three causes: the in-lock pending recheck found
+          // the entry already discarded (no row exists to close), the
+          // existingActive recheck found a row already persisted or the
+          // create lock was contended (a concurrent caller got there
+          // first), or a kill_stream rule terminated the session while
+          // confirming it (termination.ts already closed and broadcast
+          // it). Fall through to the lookup-and-stop below so a row from
+          // the concurrent-caller case still gets closed instead of
+          // lingering until the stale sweep.
+        } else {
+          await discardPendingSession(serverId, notification.sessionKey, pendingData);
+          console.log(
+            `[SSEProcessor] Discarded phantom session ${notification.sessionKey} (id: ${pendingData.id}) ` +
+              `(stopped before 30s confirmation)`
+          );
+          return;
+        }
       }
     }
 
@@ -518,16 +605,32 @@ async function handleProgress(event: {
     }
 
     const watchedTransition = watched && !existingSession.watched;
+    let wasStoppedConcurrently = false;
     if (watchedTransition || shouldFlushDbWrite(existingSession.id, now.getTime())) {
-      await db
+      // Guarded by isNull(stoppedAt): a stop racing this write must not
+      // resurrect the session into the cache.
+      const updateResult = await db
         .update(sessions)
         .set({
           progressMs: notification.viewOffset,
           lastSeenAt: now, // Update for stale session detection
           watched,
         })
-        .where(eq(sessions.id, existingSession.id));
-      recordDbWrite(existingSession.id, now.getTime());
+        .where(and(eq(sessions.id, existingSession.id), isNull(sessions.stoppedAt)))
+        .returning({ id: sessions.id });
+
+      if (updateResult.length === 0) {
+        wasStoppedConcurrently = true;
+        console.log(
+          `[SSEProcessor] Session ${existingSession.id} already stopped, skipping progress resurrection`
+        );
+      } else {
+        recordDbWrite(existingSession.id, now.getTime());
+      }
+    }
+
+    if (wasStoppedConcurrently) {
+      return;
     }
 
     if (cacheService) {
@@ -570,23 +673,58 @@ export async function sweepOrphanedPendingSessions(cache?: CacheService | null):
   const svc = cache ?? cacheService;
   if (!svc) return;
 
-  const pendingKeys = await svc.getAllPendingSessionKeys();
   const now = Date.now();
   let sweptCount = 0;
+  let zombieCount = 0;
+  // Same deferred-invalidation shape as processor.ts's grace/stale sweeps:
+  // one flush after the loop instead of one SCAN per removed session. The
+  // flag must survive a mid-loop throw, hence the try/finally.
+  let dashboardStatsDirty = false;
 
-  for (const { serverId, sessionKey } of pendingKeys) {
-    const pendingData = await svc.getPendingSession(serverId, sessionKey);
-    if (pendingData && now - pendingData.lastSeenAt > ORPHAN_THRESHOLD_MS) {
-      await svc.deletePendingSession(serverId, sessionKey);
-      await svc.removeActiveSession(pendingData.id);
-      await svc.removeUserSession(pendingData.serverUser.id, pendingData.id);
-
-      if (pubSubService) {
-        await pubSubService.publish('session:stopped', pendingData.id);
+  // This runs on the 30s reconciliation tick. A Redis or Postgres outage here
+  // must degrade to a logged error, not a rejected promise that surfaces as an
+  // unhandledRejection and crashes the process.
+  try {
+    const pendingKeys = await svc.getAllPendingSessionKeys();
+    for (const { serverId, sessionKey } of pendingKeys) {
+      const pendingData = await svc.getPendingSession(serverId, sessionKey);
+      if (!pendingData) {
+        // Hash already expired: this member is a zombie left behind in
+        // PENDING_SESSION_IDS. deletePendingSession's del is a no-op here;
+        // its srem is what actually clears it.
+        await svc.deletePendingSession(serverId, sessionKey);
+        zombieCount++;
+        continue;
       }
+      if (now - pendingData.lastSeenAt > ORPHAN_THRESHOLD_MS) {
+        await svc.deletePendingSession(serverId, sessionKey);
+        await svc.removeActiveSession(pendingData.id, { skipDashboardInvalidation: true });
+        dashboardStatsDirty = true;
 
-      sweptCount++;
+        if (pubSubService) {
+          await pubSubService.publish('session:stopped', pendingData.id);
+        }
+
+        sweptCount++;
+      }
     }
+  } catch (error) {
+    console.error('[SSEProcessor] Error sweeping orphaned pending sessions:', error);
+  } finally {
+    if (dashboardStatsDirty) {
+      try {
+        await svc.invalidateDashboardStatsCache();
+      } catch (error) {
+        console.error(
+          '[SSEProcessor] Error invalidating dashboard stats after orphan sweep:',
+          error
+        );
+      }
+    }
+  }
+
+  if (zombieCount > 0) {
+    console.log(`[SSEProcessor] Cleared ${zombieCount} zombie pending-session set member(s)`);
   }
 
   if (sweptCount > 0) {
@@ -600,46 +738,64 @@ export async function sweepOrphanedPendingSessions(cache?: CacheService | null):
  */
 async function processSessionWriteRetries(): Promise<void> {
   if (!cacheService) return;
+  const cache = cacheService;
 
-  const retries = await cacheService.getSessionWriteRetries();
+  // Runs on the reconciliation tick; a Redis/Postgres outage must degrade to a
+  // logged error rather than reject up into the unhandled handler.
+  let retries;
+  try {
+    retries = await cache.getSessionWriteRetries();
+  } catch (error) {
+    console.error('[SSEProcessor] Error loading session write retries:', error);
+    return;
+  }
 
   for (const retry of retries) {
-    if (retry.attempts >= SESSION_WRITE_RETRY.MAX_TOTAL_ATTEMPTS) {
-      clearDbWriteTracking(retry.sessionId);
-      await cacheService.removeSessionWriteRetry(retry.sessionId);
+    // Isolated per retry: a transient error on one entry must not abandon the
+    // rest of the queue for this tick.
+    try {
+      if (retry.attempts >= SESSION_WRITE_RETRY.MAX_TOTAL_ATTEMPTS) {
+        clearDbWriteTracking(retry.sessionId);
+        await cache.removeSessionWriteRetry(retry.sessionId);
+        console.error(
+          `[SSEProcessor] Max retry attempts (${SESSION_WRITE_RETRY.MAX_TOTAL_ATTEMPTS}) ` +
+            `reached for session ${retry.sessionId}, abandoning`
+        );
+        continue;
+      }
+
+      // Attempt to find the session
+      const session = await db
+        .select()
+        .from(sessions)
+        .where(and(eq(sessions.id, retry.sessionId), isNull(sessions.stoppedAt)))
+        .limit(1)
+        .then((rows) => rows[0]);
+
+      if (!session) {
+        // Session no longer exists or already stopped
+        clearDbWriteTracking(retry.sessionId);
+        await cache.removeSessionWriteRetry(retry.sessionId);
+        continue;
+      }
+
+      const result = await stopSessionAtomic({
+        session,
+        stoppedAt: new Date(retry.stopData.stoppedAt),
+        forceStopped: retry.stopData.forceStopped,
+      });
+
+      if (result.wasUpdated || !result.needsRetry) {
+        await cache.removeSessionWriteRetry(retry.sessionId);
+        console.log(`[SSEProcessor] Retry succeeded for session ${retry.sessionId}`);
+      } else {
+        await cache.incrementSessionWriteRetry(retry.sessionId);
+      }
+    } catch (error) {
       console.error(
-        `[SSEProcessor] Max retry attempts (${SESSION_WRITE_RETRY.MAX_TOTAL_ATTEMPTS}) ` +
-          `reached for session ${retry.sessionId}, abandoning`
+        `[SSEProcessor] Error processing session write retry for ${retry.sessionId}:`,
+        error
       );
-      continue;
-    }
-
-    // Attempt to find the session
-    const session = await db
-      .select()
-      .from(sessions)
-      .where(and(eq(sessions.id, retry.sessionId), isNull(sessions.stoppedAt)))
-      .limit(1)
-      .then((rows) => rows[0]);
-
-    if (!session) {
-      // Session no longer exists or already stopped
-      clearDbWriteTracking(retry.sessionId);
-      await cacheService.removeSessionWriteRetry(retry.sessionId);
-      continue;
-    }
-
-    const result = await stopSessionAtomic({
-      session,
-      stoppedAt: new Date(retry.stopData.stoppedAt),
-      forceStopped: retry.stopData.forceStopped,
-    });
-
-    if (result.wasUpdated || !result.needsRetry) {
-      await cacheService.removeSessionWriteRetry(retry.sessionId);
-      console.log(`[SSEProcessor] Retry succeeded for session ${retry.sessionId}`);
-    } else {
-      await cacheService.incrementSessionWriteRetry(retry.sessionId);
     }
   }
 }
@@ -897,12 +1053,17 @@ async function createNewSession(
         return null;
       }
 
+      // Reject a row whose server user differs from this play. Plex reuses
+      // sessionKey counters across PMS restarts, so a stale open row from
+      // another user can carry this key; skipping create against it would leave
+      // this user untracked. Leave the foreign row for the stale-sweep and
+      // create fresh under the correct user.
       const existingActive = await findActiveSession({
         serverId,
         sessionKey: processed.sessionKey,
         ratingKey: processed.ratingKey,
       });
-      if (existingActive) {
+      if (existingActive?.serverUserId === userDetail.id) {
         console.log(
           `[SSEProcessor] Active session already exists for ${processed.sessionKey}, skipping create`
         );
@@ -941,7 +1102,6 @@ async function createNewSession(
 
   // Add to active sessions cache so Now Playing shows it immediately
   await cache.addActiveSession(activeSession);
-  await cache.addUserSession(userDetail.id, activeSession.id);
 
   // Broadcast session:started immediately for real-time UI updates
   // Note: Rules are NOT evaluated yet - that happens after confirmation
@@ -1001,7 +1161,10 @@ async function handleMediaChange(
   }
 
   const activeRulesV2 = await getActiveRulesV2();
-  const activeSessions = await cacheService.getAllActiveSessions();
+  const activeSessions = excludeUncountableSessions(
+    await cacheService.getAllActiveSessions(),
+    gracePeriodSessionIds()
+  );
   const identityServerUserIds = await resolveIdentityServerUserIds(
     serverUser.userId,
     'media change'
@@ -1023,13 +1186,13 @@ async function handleMediaChange(
     return;
   }
 
-  const { stoppedSession, insertedSession, violationResults, wasTerminatedByRule } = result;
+  const { stoppedSession, insertedSession, violationResults, wasTerminatedByRule, qualityChange } =
+    result;
 
   clearDbWriteTracking(stoppedSession.id);
 
   // Update cache for stopped session
   await cacheService.removeActiveSession(stoppedSession.id);
-  await cacheService.removeUserSession(stoppedSession.serverUserId, stoppedSession.id);
 
   if (pubSubService) {
     await pubSubService.publish('session:stopped', stoppedSession.id);
@@ -1039,6 +1202,10 @@ async function handleMediaChange(
     } catch (error) {
       console.error('[SSEProcessor] Error broadcasting violations:', error);
     }
+  }
+
+  if (qualityChange) {
+    await handleQualityChangeFallout(qualityChange, cacheService, pubSubService);
   }
 
   if (wasTerminatedByRule) {
@@ -1058,7 +1225,6 @@ async function handleMediaChange(
   });
 
   await cacheService.addActiveSession(activeSession);
-  await cacheService.addUserSession(serverUser.id, insertedSession.id);
 
   if (pubSubService) {
     await pubSubService.publish('session:started', activeSession);
@@ -1135,8 +1301,20 @@ async function updateExistingSession(
     Object.assign(updatePayload, pickStreamDetailFields(processed));
   }
 
-  // Update session in database
-  await db.update(sessions).set(updatePayload).where(eq(sessions.id, existingSession.id));
+  // Update session in database. Guarded by isNull(stoppedAt): a stop racing
+  // this write must not resurrect the session into the cache.
+  const updateResult = await db
+    .update(sessions)
+    .set(updatePayload)
+    .where(and(eq(sessions.id, existingSession.id), isNull(sessions.stoppedAt)))
+    .returning({ id: sessions.id });
+
+  if (updateResult.length === 0) {
+    console.log(
+      `[SSEProcessor] Session ${existingSession.id} already stopped, skipping resurrection`
+    );
+    return;
+  }
 
   // Re-evaluate transcode-related V2 rules when transcode state changes.
   // At session creation (especially via SSE), transcode state may not be known yet,
@@ -1174,7 +1352,10 @@ async function updateExistingSession(
 
           const server = serverRows[0];
           if (server) {
-            const activeSessions = await cacheService.getAllActiveSessions();
+            const activeSessions = excludeUncountableSessions(
+              await cacheService.getAllActiveSessions(),
+              gracePeriodSessionIds()
+            );
             const identityServerUserIds = await resolveIdentityServerUserIds(
               serverUserDetail.userId,
               'transcode re-eval'
@@ -1241,7 +1422,10 @@ async function updateExistingSession(
 
           const server = serverRows[0];
           if (server) {
-            const activeSessions = await cacheService.getAllActiveSessions();
+            const activeSessions = excludeUncountableSessions(
+              await cacheService.getAllActiveSessions(),
+              gracePeriodSessionIds()
+            );
             const identityServerUserIds = await resolveIdentityServerUserIds(
               serverUserDetail.userId,
               'pause re-eval'
@@ -1338,17 +1522,47 @@ async function discardPendingSession(
   pendingData: PendingSessionData
 ): Promise<void> {
   if (!cacheService) return;
-
+  const cache = cacheService;
   const sessionId = pendingData.id;
 
-  // Clean up from all caches
-  await cacheService.deletePendingSession(serverId, sessionKey);
-  await cacheService.removeActiveSession(sessionId);
-  await cacheService.removeUserSession(pendingData.serverUser.id, sessionId);
+  // Take the same lock the confirm path uses and re-read the pending entry.
+  // A concurrent confirm can persist this session and delete the pending entry
+  // before this lock-free discard runs; without the recheck the discard would
+  // evict the freshly confirmed session and leave its DB row open until the
+  // stale sweep.
+  const outcome = await cache.withSessionCreateLock(serverId, sessionKey, async () => {
+    const stillPending = await cache.getPendingSession(serverId, sessionKey);
+    if (!stillPending) {
+      return 'confirmed-elsewhere' as const;
+    }
+    await cache.deletePendingSession(serverId, sessionKey);
+    await cache.removeActiveSession(sessionId);
+    return 'discarded' as const;
+  });
 
-  // Broadcast session:stopped so UI removes it
-  if (pubSubService) {
-    await pubSubService.publish('session:stopped', sessionId);
+  if (outcome === 'discarded') {
+    // Broadcast session:stopped so UI removes the phantom.
+    if (pubSubService) {
+      await pubSubService.publish('session:stopped', sessionId);
+    }
+    return;
+  }
+
+  // A confirm won the race: the pending entry was already persisted ('confirmed
+  // -elsewhere') or the confirm still holds the lock (null). Either way the
+  // pending entry is not this discard's to remove. Close any persisted row
+  // through the normal stop path instead of evicting a live session.
+  //
+  // Known residual (S2 ghost window): confirmPendingSessionAndPersist does its
+  // updateActiveSession/broadcast after releasing the create lock, so a confirm
+  // that just released can re-add the session to the cache moments after this
+  // stop closes it here. The row stays closed in the DB; the stale cache entry
+  // self-heals on the next reconciliation tick or its cache TTL. Left as-is
+  // because widening the lock to cover the post-persist cache write would hold
+  // it across broadcasts for every confirm.
+  const persisted = await findActiveSessionsAll({ serverId, sessionKey });
+  for (const row of persisted) {
+    await stopSession(row);
   }
 }
 
@@ -1447,13 +1661,14 @@ async function updatePendingSession(
  * @param serverId Server ID
  * @param sessionKey Session key
  * @param pendingData Final pending session data (includes pre-generated UUID)
+ * @returns true if a session row now sits active in the DB/cache for this identity
  */
 async function confirmPendingSessionAndPersist(
   serverId: string,
   sessionKey: string,
   pendingData: PendingSessionData
-): Promise<void> {
-  if (!cacheService) return;
+): Promise<boolean> {
+  if (!cacheService) return false;
 
   // Capture for closure - avoids non-null assertion in callback
   const cache = cacheService;
@@ -1461,54 +1676,69 @@ async function confirmPendingSessionAndPersist(
   // The session ID is stable - pre-generated when pending session was created
   const sessionId = pendingData.id;
 
-  // Delete from pending session tracking
-  await cache.deletePendingSession(serverId, sessionKey);
-
-  // Use lock to prevent race conditions
+  // Delete only after the row is confirmed to exist (persisted here, or already
+  // persisted by a concurrent caller), never before the lock. A contended lock
+  // must leave the pending entry in Redis for the next confirming caller instead
+  // of losing the session with no DB row written.
   const result = await cache.withSessionCreateLock(serverId, sessionKey, async () => {
-    // Double-check no active session was created while we were confirming
+    // A stop's phantom-discard runs without this lock, so it can delete the
+    // pending entry at any point up to here. Recheck before doing anything
+    // else: if it's gone, a discard already won and this confirm must not
+    // resurrect the session.
+    const stillPending = await cache.getPendingSession(serverId, sessionKey);
+    if (!stillPending) {
+      console.log(
+        `[SSEProcessor] Pending session ${sessionKey} was discarded before confirm reached the lock, skipping`
+      );
+      return null;
+    }
+
+    // Double-check no active session was created while we were confirming.
+    // Reject a row whose server user differs from this pending session: Plex
+    // reuses sessionKey counters across PMS restarts, so a stale open row from
+    // another user can carry this key. Bailing against it would drop this
+    // confirmed play; leave the foreign row for the stale-sweep and persist.
     const existingActive = await findActiveSession({
       serverId,
       sessionKey,
       ratingKey: pendingData.processed.ratingKey,
     });
-    if (existingActive) {
+    if (existingActive?.serverUserId === pendingData.serverUser.id) {
       console.log(`[SSEProcessor] Active session created while confirming ${sessionKey}, skipping`);
+      await cache.deletePendingSession(serverId, sessionKey);
       return null;
     }
 
     const activeRulesV2 = await getActiveRulesV2();
-    const activeSessions = await cache.getAllActiveSessions();
+    const activeSessions = excludeUncountableSessions(
+      await cache.getAllActiveSessions(),
+      gracePeriodSessionIds()
+    );
     const recentSessions = await fetchRecentSessionsForRules(
       pendingData.serverUser.id,
       pendingData.serverUser.identityServerUserIds
     );
 
-    return confirmAndPersistSession({
+    const persisted = await confirmAndPersistSession({
       pendingData,
       activeRulesV2,
       activeSessions,
       recentSessions,
     });
+
+    await cache.deletePendingSession(serverId, sessionKey);
+    return persisted;
   });
 
   if (!result) {
-    return;
+    return false;
   }
 
   const { insertedSession, violationResults, qualityChange, wasTerminatedByRule } = result;
 
   // Handle quality change (rare but possible)
   if (qualityChange) {
-    clearDbWriteTracking(qualityChange.stoppedSession.id);
-    await cache.removeActiveSession(qualityChange.stoppedSession.id);
-    await cache.removeUserSession(
-      qualityChange.stoppedSession.serverUserId,
-      qualityChange.stoppedSession.id
-    );
-    if (pubSubService) {
-      await pubSubService.publish('session:stopped', qualityChange.stoppedSession.id);
-    }
+    await handleQualityChangeFallout(qualityChange, cache, pubSubService);
   }
 
   // Broadcast any violations
@@ -1520,18 +1750,16 @@ async function confirmPendingSessionAndPersist(
     }
   }
 
-  // If terminated by rule, clean up the session from cache and broadcast stop
+  // If terminated by rule, clean up the session from cache. termination.ts
+  // already broadcast session:stopped for the kill, so this path must not
+  // publish it a second time.
   if (wasTerminatedByRule) {
     await cache.removeActiveSession(sessionId);
-    await cache.removeUserSession(pendingData.serverUser.id, sessionId);
 
-    if (pubSubService) {
-      await pubSubService.publish('session:stopped', sessionId);
-    }
     console.log(
       `[SSEProcessor] Confirmed session ${sessionId} was terminated by rule, removed from cache`
     );
-    return;
+    return false;
   }
 
   // Build the confirmed active session with full DB data
@@ -1557,6 +1785,7 @@ async function confirmPendingSessionAndPersist(
   console.log(
     `[SSEProcessor] Confirmed and persisted session ${sessionId} for ${pendingData.processed.mediaTitle}`
   );
+  return true;
 }
 
 /**
@@ -1583,7 +1812,6 @@ async function stopSession(existingSession: typeof sessions.$inferSelect): Promi
 
   if (cacheService) {
     await cacheService.removeActiveSession(existingSession.id);
-    await cacheService.removeUserSession(existingSession.serverUserId, existingSession.id);
   }
 
   if (pubSubService) {

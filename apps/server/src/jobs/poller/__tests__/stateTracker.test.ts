@@ -283,6 +283,68 @@ describe('calculateStopDuration', () => {
       expect(result.finalPausedDurationMs).toBe(60 * 60 * 1000 + (3 * 60 - 61) * 60 * 1000);
     });
   });
+
+  describe('totalDurationMs clamp against corrupt progress', () => {
+    it('clamps the progress cap to totalDurationMs + 60s when progressMs is glitched past the runtime', () => {
+      const startedAt = new Date('2024-01-01T10:00:00Z');
+      const stoppedAt = new Date('2024-01-01T13:00:00Z'); // 3h elapsed
+
+      const result = calculateStopDuration(
+        {
+          startedAt,
+          lastPausedAt: null,
+          pausedDurationMs: 0,
+          progressMs: 10 * 60 * 60 * 1000, // 10h - corrupt, far past the runtime
+          totalDurationMs: 60 * 60 * 1000, // 1h media
+        },
+        stoppedAt
+      );
+
+      // Without the runtime clamp the 10h progress cap never bites and 3h leaks
+      // through. Clamped to 1h + 1min.
+      expect(result.durationMs).toBe(61 * 60 * 1000);
+      expect(result.finalPausedDurationMs).toBe(3 * 60 * 60 * 1000 - 61 * 60 * 1000);
+    });
+
+    it('is a no-op when progress sits within the runtime (progress cap already binds)', () => {
+      const startedAt = new Date('2024-01-01T10:00:00Z');
+      const stoppedAt = new Date('2024-01-01T10:45:00Z'); // 45min elapsed
+
+      const result = calculateStopDuration(
+        {
+          startedAt,
+          lastPausedAt: null,
+          pausedDurationMs: 0,
+          progressMs: 40 * 60 * 1000, // 40min progress, within the 1h runtime
+          totalDurationMs: 60 * 60 * 1000,
+        },
+        stoppedAt
+      );
+
+      // progress cap (41min) is already below runtime + 60s, so the clamp does
+      // not change the result - same value with or without the fix.
+      expect(result.durationMs).toBe(41 * 60 * 1000);
+    });
+
+    it('does not clamp when totalDurationMs is null (progress cap stands)', () => {
+      const startedAt = new Date('2024-01-01T10:00:00Z');
+      const stoppedAt = new Date('2024-01-01T13:00:00Z');
+
+      const result = calculateStopDuration(
+        {
+          startedAt,
+          lastPausedAt: null,
+          pausedDurationMs: 0,
+          progressMs: 10 * 60 * 60 * 1000,
+          totalDurationMs: null,
+        },
+        stoppedAt
+      );
+
+      // No runtime known, 10h cap never bites, full 3h elapsed stands.
+      expect(result.durationMs).toBe(3 * 60 * 60 * 1000);
+    });
+  });
 });
 
 describe('checkWatchCompletion', () => {

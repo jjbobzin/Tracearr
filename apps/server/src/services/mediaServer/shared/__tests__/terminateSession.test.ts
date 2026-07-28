@@ -71,4 +71,19 @@ describe('BaseMediaServerClient.terminateSession control-capability guard', () =
     expect(messageIdx).toBeGreaterThanOrEqual(0);
     expect(stopIdx).toBeGreaterThan(messageIdx);
   });
+
+  it('bounds both the message and Stop calls with an AbortSignal, so an unresponsive server cannot hang the kill worker', async () => {
+    withSessions([{ Id: 'sess1', SupportsMediaControl: true }]);
+
+    await makeClient().terminateSession('sess1', 'Concurrent stream limit');
+
+    const [, messageOpts] = mockFetch.mock.calls.find(([url]) =>
+      String(url).includes('/Sessions/sess1/Message')
+    )!;
+    const [, stopOpts] = mockFetch.mock.calls.find(([url]) =>
+      String(url).includes('/Sessions/sess1/Playing/Stop')
+    )!;
+    expect(messageOpts.signal).toBeInstanceOf(AbortSignal);
+    expect(stopOpts.signal).toBeInstanceOf(AbortSignal);
+  });
 });

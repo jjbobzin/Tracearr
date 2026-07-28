@@ -84,7 +84,14 @@ export function calculateStopDuration(
 
   // Cap duration at progressMs + 60s if pause tracking failed
   if (session.progressMs != null && session.progressMs > 0) {
-    const maxDurationMs = session.progressMs + 60000;
+    let maxDurationMs = session.progressMs + 60000;
+    // Corrupt progress metadata (progressMs past the media runtime) would push
+    // the cap above the real playback ceiling and let a bad duration through.
+    // Bound it by the runtime when we know it. Legitimate sessions, including
+    // rewatchers, never exceed totalDurationMs + 60s.
+    if (session.totalDurationMs != null && session.totalDurationMs > 0) {
+      maxDurationMs = Math.min(maxDurationMs, session.totalDurationMs + 60000);
+    }
     if (durationMs > maxDurationMs) {
       console.log(
         `[StateTracker] Duration capped: ${Math.round(durationMs / 1000)}s -> ${Math.round(maxDurationMs / 1000)}s (progress: ${Math.round(session.progressMs / 1000)}s)`
@@ -379,22 +386,20 @@ export function shouldGroupWithPreviousSession(
  *
  * A session is confirmed when ANY of these conditions are met:
  * 1. Already marked as confirmed (idempotent)
- * 2. Progress (viewOffset) exceeds 30 seconds
- * 3. Session has been active for 30+ seconds (any state)
+ * 2. Session has been active for 30+ seconds (any state)
  */
 export function isPlaybackConfirmed(
   state: PlaybackConfirmationState,
-  currentViewOffset: number,
+  _currentViewOffset: number,
   _currentState: string,
   now: number
 ): boolean {
   if (state.confirmedPlayback) return true;
-  if (currentViewOffset > PLAYBACK_CONFIRM_THRESHOLD_MS) return true;
-  const activeDuration = now - state.firstSeenAt;
-  if (activeDuration > PLAYBACK_CONFIRM_THRESHOLD_MS) {
-    return true;
-  }
-  return false;
+  // Absolute position must not confirm: a resumed item reports its saved
+  // position on first sight, which let rules evaluate against a cache that
+  // still contained the session the user switched away from. Age is the
+  // only confirmation signal; 30s is enough for the stale twin to sweep.
+  return now - state.firstSeenAt > PLAYBACK_CONFIRM_THRESHOLD_MS;
 }
 
 /**
@@ -402,10 +407,10 @@ export function isPlaybackConfirmed(
  */
 export function createInitialConfirmationState(now: number): PlaybackConfirmationState {
   return {
-    rulesEvaluated: false,
     confirmedPlayback: false,
     firstSeenAt: now,
     maxViewOffset: 0,
+    initialViewOffset: null,
   };
 }
 
@@ -418,6 +423,8 @@ export function updateConfirmationState(
 ): PlaybackConfirmationState {
   return {
     ...state,
+    // Redis blobs from before this field default null here, first update fills it.
+    initialViewOffset: state.initialViewOffset ?? viewOffset,
     maxViewOffset: Math.max(state.maxViewOffset, viewOffset),
   };
 }

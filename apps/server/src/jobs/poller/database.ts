@@ -10,15 +10,13 @@ import {
   TIME_MS,
   SESSION_LIMITS,
   type Session,
-  type Rule,
-  type RuleParams,
   type RuleV2,
   type RuleConditions,
   type RuleActions,
   type ViolationSeverity,
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { sessions, rules, serverUsers } from '../../db/schema.js';
+import { sessions, rules, serverUsers, terminationLogs } from '../../db/schema.js';
 import { mapSessionRow } from './sessionMapper.js';
 
 // ============================================================================
@@ -180,40 +178,57 @@ export async function batchGetIdentityServerUserIds(
   return result;
 }
 
+/**
+ * Resolve the local server_user id for an external account id on a server.
+ * Returns null when no matching server user exists.
+ *
+ * Used to verify that an active session row belongs to the user of an incoming
+ * event before reusing it: Plex resets sessionKey counters on PMS restart, so a
+ * stale open row can carry the same sessionKey a different user's new play now
+ * uses.
+ */
+export async function getServerUserIdByExternalId(
+  serverId: string,
+  externalId: string
+): Promise<string | null> {
+  const rows = await db
+    .select({ id: serverUsers.id })
+    .from(serverUsers)
+    .where(and(eq(serverUsers.serverId, serverId), eq(serverUsers.externalId, externalId)))
+    .limit(1);
+
+  return rows[0]?.id ?? null;
+}
+
+/**
+ * Sessions already terminated (successfully) under a given violation.
+ *
+ * A multi-target kill_stream match fans out one job per target, all sharing the
+ * violation id. As each sibling job terminates its target, that session leaves
+ * the active-session cache. Re-verification of the still-pending siblings needs
+ * those already-killed sessions back in the count context: a session stopped BY
+ * THIS violation is action reach, not the condition clearing, so it must keep
+ * counting for its siblings instead of dropping the concurrent total below the
+ * threshold. Returns the mapped session rows so callers can fold them back into
+ * the evaluation context. Empty when the violation is null or nothing under it
+ * has been terminated yet.
+ */
+export async function getSessionsTerminatedByViolation(violationId: string): Promise<Session[]> {
+  const logRows = await db
+    .select({ sessionId: terminationLogs.sessionId })
+    .from(terminationLogs)
+    .where(and(eq(terminationLogs.violationId, violationId), eq(terminationLogs.success, true)));
+
+  const ids = [...new Set(logRows.map((r) => r.sessionId))];
+  if (ids.length === 0) return [];
+
+  const sessionRows = await db.select().from(sessions).where(inArray(sessions.id, ids));
+  return sessionRows.map(mapSessionRow);
+}
+
 // ============================================================================
 // Rule Loading
 // ============================================================================
-
-/**
- * Get all active legacy (V1) rules for evaluation
- *
- * Only returns rules with type and params set (legacy format).
- * V2 rules using conditions/actions are evaluated by a separate system.
- *
- * @returns Array of active Rule objects
- *
- * @example
- * const rules = await getActiveRules();
- * // Evaluate each session against these rules
- */
-export async function getActiveRules(): Promise<Rule[]> {
-  // Filter for legacy rules that have type set (V2 rules have type=null)
-  const activeRules = await db
-    .select()
-    .from(rules)
-    .where(and(eq(rules.isActive, true), isNotNull(rules.type)));
-
-  return activeRules.map((r) => ({
-    id: r.id,
-    name: r.name,
-    type: r.type!,
-    params: r.params as unknown as RuleParams,
-    serverUserId: r.serverUserId,
-    isActive: r.isActive,
-    createdAt: r.createdAt,
-    updatedAt: r.updatedAt,
-  }));
-}
 
 // TTL fallback for multi-instance deployments: another instance's invalidation isn't visible here, so a rule change can take up to this long to apply.
 const RULES_CACHE_TTL_MS = 10_000;
@@ -237,18 +252,13 @@ export function invalidateRulesCache(): void {
  * const rulesV2 = await getActiveRulesV2();
  * // Evaluate session events against these rules
  */
-export async function getActiveRulesV2(): Promise<RuleV2[]> {
-  const now = Date.now();
-  if (rulesCache && rulesCache.expiresAt > now) {
-    return rulesCache.data;
-  }
-
-  const activeRules = await db
-    .select()
-    .from(rules)
-    .where(and(eq(rules.isActive, true), isNotNull(rules.conditions)));
-
-  const mapped = activeRules.map((r) => ({
+/**
+ * Map a raw `rules` table row (V2 columns) to the shared RuleV2 shape.
+ * Shared by getActiveRulesV2 and the kill-queue reverify path so both build
+ * an identical RuleV2 from the same row.
+ */
+export function mapRuleRowToRuleV2(r: typeof rules.$inferSelect): RuleV2 {
+  return {
     id: r.id,
     name: r.name,
     description: r.description,
@@ -262,7 +272,21 @@ export async function getActiveRulesV2(): Promise<RuleV2[]> {
     actions: r.actions as RuleActions,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
-  }));
+  };
+}
+
+export async function getActiveRulesV2(): Promise<RuleV2[]> {
+  const now = Date.now();
+  if (rulesCache && rulesCache.expiresAt > now) {
+    return rulesCache.data;
+  }
+
+  const activeRules = await db
+    .select()
+    .from(rules)
+    .where(and(eq(rules.isActive, true), isNotNull(rules.conditions)));
+
+  const mapped = activeRules.map(mapRuleRowToRuleV2);
 
   rulesCache = { data: mapped, expiresAt: now + RULES_CACHE_TTL_MS };
   return mapped;

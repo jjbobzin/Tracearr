@@ -536,6 +536,7 @@ export type SessionTarget = z.infer<typeof sessionTargetSchema>;
 
 export const killStreamActionSchema = z.object({
   type: z.literal('kill_stream'),
+  /** Seconds to wait before killing. The kill only fires if the rule condition still holds after the wait; 0 (default) still re-checks once before killing. */
   delay_seconds: z.number().int().min(0).max(300).optional(),
   require_confirmation: z.boolean().optional(),
   cooldown_minutes: z.number().int().nonnegative().optional(),

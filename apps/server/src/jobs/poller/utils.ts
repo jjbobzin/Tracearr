@@ -5,6 +5,7 @@
  * These functions have no side effects and are easily testable.
  */
 
+import type { ActiveSession } from '@tracearr/shared';
 import { normalizeClient } from '../../utils/platformNormalizer.js';
 
 export const parseJellyfinClient = normalizeClient;
@@ -76,4 +77,27 @@ export function formatQualityString(
     return `${formatted} Mbps`;
   }
   return isTranscoding ? 'Transcoding' : 'Direct';
+}
+
+// ============================================================================
+// Rule Evaluation Session Filtering
+// ============================================================================
+
+/**
+ * Drops sessions rule evaluation must not count: grace-flagged ones (at
+ * least one confirmed missed poll, the system's own signal that the stream
+ * probably stopped) and unconfirmed pending ones. Counting either makes
+ * concurrent-stream rules fire on phantoms, e.g. killing the stream a user
+ * just switched to. Sessions missing for the first time in the current tick
+ * are not flagged yet and still count, which keeps one anomalous poll from
+ * distorting detection. Returns the input array untouched when nothing is
+ * excluded so hot-path callers avoid a copy.
+ */
+export function excludeUncountableSessions(
+  sessions: ActiveSession[],
+  graceSessionIds: Set<string>
+): ActiveSession[] {
+  const needsFilter = sessions.some((s) => s.pending || graceSessionIds.has(s.id));
+  if (!needsFilter) return sessions;
+  return sessions.filter((s) => !s.pending && !graceSessionIds.has(s.id));
 }

@@ -207,6 +207,17 @@ export const ACTION_DEFINITIONS: Record<ActionType, ActionDefinition> = {
         description: 'Minimum time between terminations for the same user',
       },
       {
+        name: 'delay_seconds',
+        label: 'Sustain window (seconds)',
+        type: 'number',
+        min: 0,
+        max: 300,
+        step: 5,
+        unit: 'seconds',
+        description:
+          'Wait this many seconds, then kill the stream only if the rule still matches. 0 kills immediately after a final re-check.',
+      },
+      {
         name: 'target',
         label: 'Target',
         type: 'select',

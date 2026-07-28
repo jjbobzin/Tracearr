@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { compare, compareArray } from '../comparisons.js';
+import { compare } from '../comparisons.js';
 
 describe('compare', () => {
   describe('eq operator', () => {
@@ -127,21 +127,5 @@ describe('compare', () => {
     it('returns false when string contains substring', () => {
       expect(compare('Plex Web Player', 'not_contains', 'Plex')).toBe(false);
     });
-  });
-});
-
-describe('compareArray', () => {
-  it('handles in operator', () => {
-    expect(compareArray('US', 'in', ['US', 'CA'])).toBe(true);
-    expect(compareArray('UK', 'in', ['US', 'CA'])).toBe(false);
-  });
-
-  it('handles not_in operator', () => {
-    expect(compareArray('UK', 'not_in', ['US', 'CA'])).toBe(true);
-    expect(compareArray('US', 'not_in', ['US', 'CA'])).toBe(false);
-  });
-
-  it('returns false when expected is not an array', () => {
-    expect(compareArray('US', 'in', 'US')).toBe(false);
   });
 });

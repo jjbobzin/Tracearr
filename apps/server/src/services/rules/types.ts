@@ -19,6 +19,10 @@ export interface EvaluationContext {
    *  Optional so contexts built before a lookup (or in old tests) fall back
    *  to single server_user behavior. */
   identityServerUserIds?: string[];
+  /** Violation this match created, if any. Populated by callers that insert
+   *  the violation before executing actions; kill_stream needs it to attribute
+   *  the eventual queue outcome (killed/skipped/failed) back to the record. */
+  violationId?: string | null;
 }
 
 export interface EvaluatorResult {
@@ -33,7 +37,16 @@ export type ConditionEvaluator = (
   condition: Condition
 ) => EvaluatorResult | Promise<EvaluatorResult>;
 
-export type ActionExecutor = (context: EvaluationContext, action: Action) => void | Promise<void>;
+/** Non-void executors return which target session ids they successfully
+ *  handed to a downstream queue (currently kill_stream only). queueFailure is
+ *  set when there were targets to kill but none reached the queue (queue down),
+ *  so the caller records the action as failed rather than queued. */
+export type ActionExecutorResult = { enqueuedSessionIds?: string[]; queueFailure?: boolean } | void;
+
+export type ActionExecutor = (
+  context: EvaluationContext,
+  action: Action
+) => ActionExecutorResult | Promise<ActionExecutorResult>;
 
 export interface EvaluationResult {
   ruleId: string;

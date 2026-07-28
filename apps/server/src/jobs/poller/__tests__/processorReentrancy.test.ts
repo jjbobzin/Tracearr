@@ -10,6 +10,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockDbSelect = vi.fn();
+const { mockCreateMediaServerClient, mockGetActiveRulesV2 } = vi.hoisted(() => ({
+  mockCreateMediaServerClient: vi.fn(),
+  mockGetActiveRulesV2: vi.fn().mockResolvedValue([]),
+}));
 
 vi.mock('../../../db/client.js', () => ({
   db: { select: (...args: unknown[]) => mockDbSelect(...args) },
@@ -29,7 +33,7 @@ vi.mock('../../../serverState.js', () => ({
 }));
 
 vi.mock('../../../services/mediaServer/index.js', () => ({
-  createMediaServerClient: vi.fn(),
+  createMediaServerClient: mockCreateMediaServerClient,
 }));
 
 vi.mock('../../../services/plexGeoip.js', () => ({
@@ -53,7 +57,7 @@ vi.mock('../../notificationQueue.js', () => ({
 }));
 
 vi.mock('../database.js', () => ({
-  getActiveRulesV2: vi.fn().mockResolvedValue([]),
+  getActiveRulesV2: mockGetActiveRulesV2,
   batchGetIdentityServerUserIds: vi.fn().mockResolvedValue(new Map()),
   batchGetRecentUserSessions: vi.fn().mockResolvedValue(new Map()),
   widenRecentSessionsForMergedIdentities: vi.fn(),
@@ -91,6 +95,21 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
     resolve = r;
   });
   return { promise, resolve };
+}
+
+/**
+ * Thenable query-chain stub for `db.select().from(servers)`. Awaiting the
+ * `from()` result directly (triggerReconciliationPoll's unfiltered fetch)
+ * resolves to `allRows`; chaining `.where()` (triggerServerPoll's per-server
+ * fetch) resolves to `whereRows`.
+ */
+function chainResolving(allRows: unknown[], whereRows: unknown[] = allRows) {
+  const obj: Record<string, unknown> = {};
+  obj.where = () => Promise.resolve(whereRows);
+  obj.then = (resolve: (v: unknown[]) => void, reject?: (e: unknown) => void) =>
+    Promise.resolve(allRows).then(resolve, reject);
+  obj.catch = (reject: (e: unknown) => void) => Promise.resolve(allRows).catch(reject);
+  return obj;
 }
 
 describe('reentrancy guards', () => {
@@ -159,5 +178,90 @@ describe('reentrancy guards', () => {
 
       expect(mockDbSelect).toHaveBeenCalledTimes(2);
     });
+  });
+});
+
+/**
+ * These tests exercise the shared per-server lock directly: triggerServerPoll
+ * and triggerReconciliationPoll are different entry points but must not run
+ * processServerSessions for the same server at the same time, since both
+ * read and mutate the module-level missedPollTracking grace-period map.
+ */
+describe('cross-entry-point server lock', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const serverRow1 = {
+    id: 'server-1',
+    name: 'Server 1',
+    type: 'plex',
+    url: 'http://localhost:32400',
+    token: 'token-1',
+  };
+  const serverRow2 = {
+    id: 'server-2',
+    name: 'Server 2',
+    type: 'plex',
+    url: 'http://localhost:32401',
+    token: 'token-2',
+  };
+
+  it('skips a server in triggerReconciliationPoll while triggerServerPoll is still processing it', async () => {
+    mockDbSelect.mockReturnValue({ from: () => chainResolving([serverRow1]) });
+    const gate = deferred<unknown[]>();
+    mockCreateMediaServerClient.mockReturnValue({ getSessions: () => gate.promise });
+
+    const first = triggerServerPoll('server-1');
+    await vi.waitFor(() => expect(mockCreateMediaServerClient).toHaveBeenCalledTimes(1));
+
+    const second = triggerReconciliationPoll();
+    await second;
+
+    // Reconciliation must have skipped server-1 outright - it never reached
+    // processServerSessions for it, so the media client was not called again.
+    expect(mockCreateMediaServerClient).toHaveBeenCalledTimes(1);
+
+    gate.resolve([]);
+    await first;
+  });
+
+  it('does not block a different server: triggerReconciliationPoll still processes server-2', async () => {
+    mockDbSelect.mockReturnValue({
+      from: () => chainResolving([serverRow1, serverRow2], [serverRow1]),
+    });
+    const gate1 = deferred<unknown[]>();
+    const gate2 = deferred<unknown[]>();
+    let call = 0;
+    mockCreateMediaServerClient.mockImplementation(() => {
+      call++;
+      return { getSessions: () => (call === 1 ? gate1.promise : gate2.promise) };
+    });
+
+    const first = triggerServerPoll('server-1');
+    await vi.waitFor(() => expect(mockCreateMediaServerClient).toHaveBeenCalledTimes(1));
+
+    const second = triggerReconciliationPoll();
+
+    gate1.resolve([]);
+    gate2.resolve([]);
+    await Promise.all([first, second]);
+
+    // One call for triggerServerPoll's server-1, one for reconciliation's
+    // server-2 - server-1 is never processed twice.
+    expect(mockCreateMediaServerClient).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases the lock when a run throws, so a later run for the same server still executes', async () => {
+    mockDbSelect.mockReturnValue({ from: () => chainResolving([serverRow1]) });
+    mockGetActiveRulesV2.mockRejectedValueOnce(new Error('boom'));
+
+    await triggerServerPoll('server-1');
+    expect(mockDbSelect).toHaveBeenCalledTimes(1);
+
+    // If the throw had left the lock held, this second call would skip and
+    // never touch the db.
+    await triggerServerPoll('server-1');
+    expect(mockDbSelect).toHaveBeenCalledTimes(2);
   });
 });

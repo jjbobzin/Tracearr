@@ -58,10 +58,10 @@ describe('updatePendingSession', () => {
   const basePending: PendingSessionData = {
     id: 'test-uuid',
     confirmation: {
-      rulesEvaluated: false,
       confirmedPlayback: false,
       firstSeenAt: 1710600000000,
       maxViewOffset: 0,
+      initialViewOffset: null,
     },
     processed: {} as any,
     server: { id: 'srv-1', name: 'Test', type: 'jellyfin' },

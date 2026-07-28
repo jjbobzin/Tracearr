@@ -139,7 +139,6 @@ describe('Redis Prefix Coverage', () => {
 
     // Test function-based keys
     expect(REDIS_KEYS.SESSION_BY_ID('test-id')).toMatch(new RegExp(`^${TEST_PREFIX}`));
-    expect(REDIS_KEYS.USER_SESSIONS('user-1')).toMatch(new RegExp(`^${TEST_PREFIX}`));
     expect(REDIS_KEYS.RATE_LIMIT_LOGIN('127.0.0.1')).toMatch(new RegExp(`^${TEST_PREFIX}`));
     expect(REDIS_KEYS.RATE_LIMIT_MOBILE_PAIR('127.0.0.1')).toMatch(new RegExp(`^${TEST_PREFIX}`));
     expect(REDIS_KEYS.RATE_LIMIT_MOBILE_REFRESH('127.0.0.1')).toMatch(

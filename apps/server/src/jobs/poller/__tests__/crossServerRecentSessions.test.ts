@@ -110,6 +110,7 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     transcodeInfo: null,
     subtitleInfo: null,
     ...overrides,
+    geoLocationName: overrides.geoLocationName ?? null,
   };
 }
 

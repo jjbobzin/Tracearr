@@ -21,6 +21,7 @@ vi.mock('../mediaServer/plex/eventSource.js', () => ({
       connect: vi.fn().mockResolvedValue(undefined),
       disconnect: vi.fn(),
       removeAllListeners: vi.fn(),
+      retryFromFallback: vi.fn(),
       getStatus: vi.fn().mockReturnValue({
         serverId: 'plex-1',
         serverName: 'Plex Server',
@@ -41,6 +42,7 @@ vi.mock('../mediaServer/shared/jellyfinEmbyEventSource.js', () => ({
       connect: vi.fn().mockResolvedValue(undefined),
       disconnect: vi.fn(),
       removeAllListeners: vi.fn(),
+      retryFromFallback: vi.fn(),
       getStatus: vi.fn().mockReturnValue({
         serverId: 'jf-1',
         serverName: 'Jellyfin Server',
@@ -60,11 +62,31 @@ vi.mock('../serviceTracker.js', () => ({
 }));
 
 import { SSEManager } from '../sseManager.js';
+import { PlexEventSource } from '../mediaServer/plex/eventSource.js';
 import type { CacheService, PubSubService } from '../cache.js';
 
 interface PrivateManager {
   refreshConnectionStatuses: () => void;
   startReconciliation: () => void;
+}
+
+interface PrivateManagerInternals {
+  connections: Map<string, { state: string }>;
+  lastNudgeAt: Map<string, number>;
+  handleConnectionStateChange: (
+    serverId: string,
+    serverName: string,
+    state: string,
+    status: {
+      serverId: string;
+      serverName: string;
+      state: string;
+      connectedAt: Date | null;
+      lastEventAt: Date | null;
+      reconnectAttempts: number;
+      error: string | null;
+    }
+  ) => void;
 }
 
 function makeCacheService(): CacheService {
@@ -100,7 +122,7 @@ describe('SSEManager.refreshConnectionStatuses', () => {
 
     vi.mocked(cache.setServerConnectionStatus).mockClear();
 
-    // Drive the private refresh directly — this is what the reconciliation timer calls
+    // Drive the private refresh directly - this is what the reconciliation timer calls
     (manager as unknown as PrivateManager).refreshConnectionStatuses();
 
     expect(cache.setServerConnectionStatus).toHaveBeenCalledOnce();
@@ -128,7 +150,7 @@ describe('SSEManager.refreshConnectionStatuses', () => {
   });
 
   it('skips refresh gracefully when no cacheService is set', () => {
-    // Do NOT call initialize() — cacheService stays null; must not throw
+    // Do NOT call initialize() - cacheService stays null; must not throw
     expect(() => {
       (manager as unknown as PrivateManager).refreshConnectionStatuses();
     }).not.toThrow();
@@ -161,5 +183,108 @@ describe('SSEManager.refreshConnectionStatuses', () => {
       'jf-1',
       expect.objectContaining({ mode: 'realtime', state: 'connected' })
     );
+  });
+});
+
+describe('SSEManager.addServer', () => {
+  let manager: SSEManager;
+  let cache: CacheService;
+
+  beforeEach(() => {
+    manager = new SSEManager();
+    cache = makeCacheService();
+  });
+
+  afterEach(async () => {
+    await manager.stop();
+    vi.clearAllMocks();
+  });
+
+  it('disconnects and clears listeners on the eventSource when connect() throws', async () => {
+    const disconnect = vi.fn();
+    const removeAllListeners = vi.fn();
+    vi.mocked(PlexEventSource).mockImplementationOnce(function () {
+      return {
+        on: vi.fn(),
+        connect: vi.fn().mockRejectedValue(new Error('connect failed')),
+        disconnect,
+        removeAllListeners,
+        retryFromFallback: vi.fn(),
+        getStatus: vi.fn(),
+      } as unknown as InstanceType<typeof PlexEventSource>;
+    });
+
+    await manager.initialize(cache, makePubSubService());
+
+    await expect(
+      manager.addServer('plex-1', 'Plex Server', 'plex', 'http://plex.local', 'token')
+    ).rejects.toThrow('connect failed');
+
+    expect(removeAllListeners).toHaveBeenCalledOnce();
+    expect(disconnect).toHaveBeenCalledOnce();
+    // Failed connect must never leave a tracked connection behind
+    expect(manager.getStatus()).toEqual([]);
+  });
+
+  it('does not leak pendingOperations tracking after a failed connect, so retry can proceed', async () => {
+    vi.mocked(PlexEventSource).mockImplementationOnce(function () {
+      return {
+        on: vi.fn(),
+        connect: vi.fn().mockRejectedValue(new Error('connect failed')),
+        disconnect: vi.fn(),
+        removeAllListeners: vi.fn(),
+        retryFromFallback: vi.fn(),
+        getStatus: vi.fn(),
+      } as unknown as InstanceType<typeof PlexEventSource>;
+    });
+
+    await manager.initialize(cache, makePubSubService());
+
+    await expect(
+      manager.addServer('plex-1', 'Plex Server', 'plex', 'http://plex.local', 'token')
+    ).rejects.toThrow('connect failed');
+
+    // A retry with a working connect() must succeed - a stuck pendingOperations
+    // entry from the failed attempt would silently no-op this call instead.
+    await manager.addServer('plex-1', 'Plex Server', 'plex', 'http://plex.local', 'token');
+    expect(manager.getStatus()).toHaveLength(1);
+  });
+});
+
+describe('SSEManager.removeServer', () => {
+  let manager: SSEManager;
+  let cache: CacheService;
+
+  beforeEach(() => {
+    manager = new SSEManager();
+    cache = makeCacheService();
+  });
+
+  afterEach(async () => {
+    await manager.stop();
+    vi.clearAllMocks();
+  });
+
+  it('prunes lastNudgeAt so a re-added server with the same id is not rate-limited by stale state', async () => {
+    await manager.initialize(cache, makePubSubService());
+    await manager.addServer('jf-1', 'Jellyfin Server', 'jellyfin', 'http://jf.local', 'token');
+
+    const internals = manager as unknown as PrivateManagerInternals;
+    internals.handleConnectionStateChange('jf-1', 'Jellyfin Server', 'fallback', {
+      serverId: 'jf-1',
+      serverName: 'Jellyfin Server',
+      state: 'fallback',
+      connectedAt: null,
+      lastEventAt: null,
+      reconnectAttempts: 0,
+      error: null,
+    });
+
+    manager.nudgeReconnect('jf-1');
+    expect(internals.lastNudgeAt.has('jf-1')).toBe(true);
+
+    await manager.removeServer('jf-1');
+
+    expect(internals.lastNudgeAt.has('jf-1')).toBe(false);
   });
 });

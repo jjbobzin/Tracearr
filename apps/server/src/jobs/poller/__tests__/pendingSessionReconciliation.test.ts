@@ -19,6 +19,7 @@ const {
   mockBuildActiveSession,
   mockFindActiveSession,
   mockProcessPollResults,
+  mockHandleQualityChangeFallout,
   mockDb,
 } = vi.hoisted(() => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -76,6 +77,7 @@ const {
     mockBuildActiveSession: vi.fn(),
     mockFindActiveSession: vi.fn().mockResolvedValue(null),
     mockProcessPollResults: vi.fn().mockResolvedValue(undefined),
+    mockHandleQualityChangeFallout: vi.fn().mockResolvedValue(undefined),
     mockDb: {
       // Server lookup calls select() with no column argument. The server-user
       // join query and the plex duplicate-content check both pass columns, so
@@ -130,6 +132,7 @@ vi.mock('../sessionLifecycle.js', () => ({
   findActiveSession: mockFindActiveSession,
   findActiveSessionByComposite: vi.fn().mockResolvedValue(null),
   handleMediaChangeAtomic: vi.fn(),
+  handleQualityChangeFallout: mockHandleQualityChangeFallout,
   processPollResults: mockProcessPollResults,
   reEvaluateRulesOnPauseState: vi.fn(),
   reEvaluateRulesOnTranscodeChange: vi.fn(),
@@ -148,10 +151,10 @@ function createPendingSessionData(): PendingSessionData {
   return {
     id: 'pending-uuid-123',
     confirmation: {
-      rulesEvaluated: false,
       confirmedPlayback: false,
       firstSeenAt: now - 31000,
       maxViewOffset: 31000,
+      initialViewOffset: 1000,
     },
     processed: {
       sessionKey: 'test-session-key',
@@ -283,6 +286,46 @@ describe('poller isNew branch defers to a pending session', () => {
     expect(call.newSessions[0].id).toBe('pending-uuid-123');
   });
 
+  it('runs quality-change fallout for the stopped twin when confirming a pending session', async () => {
+    mockUpdatePendingSession.mockReturnValue({
+      updatedData: createPendingSessionData(),
+      isConfirmed: true,
+    });
+
+    const qualityChange = {
+      stoppedSession: {
+        id: 'twin-session-id',
+        serverUserId: 'server-user-1',
+        sessionKey: 'twin-session-key',
+        deviceId: 'device-1',
+        ratingKey: '12345',
+      },
+      referenceId: 'twin-session-id',
+    };
+
+    mockCreateSessionWithRulesAtomic.mockResolvedValue({
+      insertedSession: { id: 'pending-uuid-123', sessionKey: 'test-session-key' },
+      violationResults: [],
+      qualityChange,
+      referenceId: 'twin-session-id',
+      wasTerminatedByRule: false,
+    });
+
+    mockBuildActiveSession.mockReturnValue({
+      id: 'pending-uuid-123',
+      serverId: 'server-1',
+      sessionKey: 'test-session-key',
+    });
+
+    await triggerServerPoll('server-1');
+
+    expect(mockHandleQualityChangeFallout).toHaveBeenCalledWith(
+      qualityChange,
+      cacheService,
+      expect.objectContaining({ publish: expect.any(Function) })
+    );
+  });
+
   it('keeps the session pending and does not create anything when still below threshold', async () => {
     mockUpdatePendingSession.mockReturnValue({
       updatedData: createPendingSessionData(),
@@ -311,5 +354,101 @@ describe('poller isNew branch defers to a pending session', () => {
     expect(getPendingSessionCalls).toBeGreaterThanOrEqual(2);
     expect(mockCreateSessionWithRulesAtomic).not.toHaveBeenCalled();
     expect(mockProcessPollResults).not.toHaveBeenCalled();
+  });
+
+  it("bails out cleanly when the pending session is confirmed by another process inside resolvePendingSession's own lock", async () => {
+    // First read (before the lock) sees the pending session and confirms it.
+    // SSE fully confirms and creates the same session in the gap before the
+    // lock is acquired, so the re-check inside the lock finds it gone.
+    mockUpdatePendingSession.mockReturnValue({
+      updatedData: createPendingSessionData(),
+      isConfirmed: true,
+    });
+
+    let getPendingSessionCalls = 0;
+    cacheService.getPendingSession = vi.fn(async (_serverId: string, key: string) => {
+      if (key !== 'test-session-key') return null;
+      getPendingSessionCalls++;
+      return getPendingSessionCalls === 1 ? createPendingSessionData() : null;
+    });
+
+    await expect(triggerServerPoll('server-1')).resolves.not.toThrow();
+
+    expect(getPendingSessionCalls).toBeGreaterThanOrEqual(2);
+    expect(mockCreateSessionWithRulesAtomic).not.toHaveBeenCalled();
+    expect(cacheService.deletePendingSession).not.toHaveBeenCalled();
+    // Nothing new/updated/stopped for this session this tick, so processPollResults
+    // is skipped entirely (same as the sibling "confirmed by other" path above).
+    expect(mockProcessPollResults).not.toHaveBeenCalled();
+  });
+
+  it('deletes the stale pending entry when the in-lock existingById check finds the row already persisted', async () => {
+    // Pending stays present through both reads, but a concurrent caller already
+    // wrote the row for this pre-generated id. The in-lock existingById check
+    // finds it and bails without creating a duplicate. The pending entry must
+    // still be dropped here, or the orphan sweep later phantom-stops the live
+    // row this pending id points at.
+    mockUpdatePendingSession.mockReturnValue({
+      updatedData: createPendingSessionData(),
+      isConfirmed: true,
+    });
+
+    const mockServerRow = {
+      id: 'server-1',
+      name: 'Test Server',
+      type: 'plex',
+      url: 'http://localhost:32400',
+      token: 'test-token',
+    };
+    const mockServerUserRow = {
+      id: 'server-user-1',
+      userId: 'identity-1',
+      serverId: 'server-1',
+      externalId: 'user-123',
+      username: 'alice',
+      email: null,
+      thumbUrl: null,
+      isServerAdmin: false,
+      trustScore: 100,
+      sessionCount: 5,
+      lastActivityAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      identityName: 'Alice',
+    };
+
+    // Override the DB so the in-lock existingById lookup (a columns query with
+    // no innerJoin) resolves a row for the pre-generated id.
+    mockDb.select.mockImplementation((columns?: unknown) => ({
+      from: vi.fn(() => {
+        if (columns === undefined) {
+          const s: Record<string, unknown> = {};
+          s.where = () => s;
+          s.limit = () => s;
+          s.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+            Promise.resolve([mockServerRow]).then(res, rej);
+          return s;
+        }
+        const o: Record<string, unknown> = {};
+        o.where = () => o;
+        o.limit = () => o;
+        o.innerJoin = () => {
+          const j: Record<string, unknown> = {};
+          j.where = () => j;
+          j.limit = () => j;
+          j.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+            Promise.resolve([mockServerUserRow]).then(res, rej);
+          return j;
+        };
+        o.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+          Promise.resolve([{ id: 'pending-uuid-123' }]).then(res, rej);
+        return o;
+      }),
+    }));
+
+    await triggerServerPoll('server-1');
+
+    expect(mockCreateSessionWithRulesAtomic).not.toHaveBeenCalled();
+    expect(cacheService.deletePendingSession).toHaveBeenCalledWith('server-1', 'test-session-key');
   });
 });

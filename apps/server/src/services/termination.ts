@@ -186,7 +186,6 @@ export async function terminateSession(
     if (cacheService) {
       try {
         await cacheService.removeActiveSession(session.id);
-        await cacheService.removeUserSession(session.serverUserId, session.id);
 
         // Cooldown prevents re-creating this session if it reappears in polls
         if (session.ratingKey) {

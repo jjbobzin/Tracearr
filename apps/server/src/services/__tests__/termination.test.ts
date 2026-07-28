@@ -94,7 +94,6 @@ describe('terminateSession', () => {
   // Mock services
   const mockCacheService = {
     removeActiveSession: vi.fn().mockResolvedValue(undefined),
-    removeUserSession: vi.fn().mockResolvedValue(undefined),
   };
 
   const mockPubSubService = {
@@ -145,10 +144,6 @@ describe('terminateSession', () => {
       });
 
       expect(mockCacheService.removeActiveSession).toHaveBeenCalledWith(mockSession.id);
-      expect(mockCacheService.removeUserSession).toHaveBeenCalledWith(
-        mockSession.serverUserId,
-        mockSession.id
-      );
     });
 
     it('should broadcast session:stopped event on success', async () => {
@@ -255,10 +250,6 @@ describe('terminateSession', () => {
       });
 
       expect(mockCacheService.removeActiveSession).toHaveBeenCalledWith(mockSession.id);
-      expect(mockCacheService.removeUserSession).toHaveBeenCalledWith(
-        mockSession.serverUserId,
-        mockSession.id
-      );
     });
 
     it('should still broadcast stop event when session already gone', async () => {
@@ -322,7 +313,6 @@ describe('terminateSession', () => {
       });
 
       expect(mockCacheService.removeActiveSession).not.toHaveBeenCalled();
-      expect(mockCacheService.removeUserSession).not.toHaveBeenCalled();
     });
 
     it('should NOT broadcast stop event on failure', async () => {
@@ -573,6 +563,33 @@ describe('terminateSession', () => {
           violationId,
           reason: 'Concurrent stream limit exceeded',
         })
+      );
+    });
+
+    it('leaves the session row untouched and skips the stop broadcast when the kill call fails', async () => {
+      const mockSession = createMockSession();
+      const ruleId = randomUUID();
+      const violationId = randomUUID();
+      mockSessionFindFirst.mockResolvedValue(mockSession);
+      mockMediaClient.terminateSession.mockRejectedValue(new Error('Media server unreachable'));
+      const insertChain = mockDbInsertChain();
+
+      const result = await terminateSession({
+        sessionId: mockSession.id,
+        trigger: 'rule',
+        ruleId,
+        violationId,
+        reason: 'Concurrent stream limit exceeded',
+      });
+
+      // The session is still actually playing - state must not be touched.
+      expect(db.update).not.toHaveBeenCalled();
+      // No session:stopped event for a session that never stopped.
+      expect(mockPubSubService.publish).not.toHaveBeenCalled();
+      // The termination attempt itself is recorded as failed.
+      expect(result.success).toBe(false);
+      expect(insertChain.values).toHaveBeenCalledWith(
+        expect.objectContaining({ ruleId, violationId, success: false })
       );
     });
   });

@@ -458,6 +458,8 @@ export abstract class BaseMediaServerClient
         'Content-Type': 'application/json',
         ...this.buildHeaders(),
       },
+      // Bounds the call so an unresponsive server can't wedge the kill worker.
+      signal: AbortSignal.timeout(10000),
     });
 
     // Best-effort: don't fail if client doesn't support messages or session ended
@@ -506,6 +508,8 @@ export abstract class BaseMediaServerClient
     const response = await fetch(`${this.baseUrl}/Sessions/${sessionId}/Playing/Stop`, {
       method: 'POST',
       headers: this.buildHeaders(),
+      // Bounds the call so an unresponsive server can't wedge the kill worker.
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) {

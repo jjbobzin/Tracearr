@@ -52,17 +52,3 @@ export function compare(actual: unknown, operator: Operator, expected: Condition
       return false;
   }
 }
-
-export function compareArray(
-  actual: unknown,
-  operator: 'in' | 'not_in',
-  expected: ConditionValue
-): boolean {
-  if (!Array.isArray(expected)) return false;
-
-  if (operator === 'in') {
-    return (expected as (string | number)[]).includes(actual as string | number);
-  } else {
-    return !(expected as (string | number)[]).includes(actual as string | number);
-  }
-}

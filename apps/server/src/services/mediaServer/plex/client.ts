@@ -390,6 +390,8 @@ export class PlexClient implements IMediaServerClient, IMediaServerClientWithHis
     const response = await fetch(`${this.baseUrl}/status/sessions/terminate?${params}`, {
       method: 'POST',
       headers: this.buildHeaders(),
+      // Bounds the call so an unresponsive PMS can't wedge the kill worker.
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!response.ok) {

@@ -201,30 +201,41 @@ export class SSEManager extends EventEmitter {
         lastEventAt: null,
       };
 
-      if (serverType === 'plex') {
-        const eventSource = new PlexEventSource({
-          serverId,
-          serverName,
-          url,
-          token,
-        });
+      try {
+        if (serverType === 'plex') {
+          const eventSource = new PlexEventSource({
+            serverId,
+            serverName,
+            url,
+            token,
+          });
 
-        this.setupPlexEventHandlers(eventSource, serverId, serverName);
-        connection.eventSource = eventSource;
-        await eventSource.connect();
-      } else {
-        // Jellyfin/Emby: attempt plugin SSE connection
-        const eventSource = new JellyfinEmbyEventSource({
-          serverId,
-          serverName,
-          url,
-          serverType,
-          token,
-        });
+          this.setupPlexEventHandlers(eventSource, serverId, serverName);
+          connection.eventSource = eventSource;
+          await eventSource.connect();
+        } else {
+          // Jellyfin/Emby: attempt plugin SSE connection
+          const eventSource = new JellyfinEmbyEventSource({
+            serverId,
+            serverName,
+            url,
+            serverType,
+            token,
+          });
 
-        this.setupJellyfinEmbyEventHandlers(eventSource, serverId, serverName, serverType);
-        connection.eventSource = eventSource;
-        await eventSource.connect();
+          this.setupJellyfinEmbyEventHandlers(eventSource, serverId, serverName, serverType);
+          connection.eventSource = eventSource;
+          await eventSource.connect();
+        }
+      } catch (error) {
+        // connect() threw before the connection was tracked in this.connections,
+        // so removeServerInternal's cleanup path never sees it. Tear down the
+        // listeners and any partial connection here instead of leaking them.
+        if (connection.eventSource) {
+          connection.eventSource.removeAllListeners();
+          connection.eventSource.disconnect();
+        }
+        throw error;
       }
 
       this.connections.set(serverId, connection);
@@ -270,6 +281,7 @@ export class SSEManager extends EventEmitter {
     }
 
     this.connections.delete(serverId);
+    this.lastNudgeAt.delete(serverId);
     console.log(`[SSEManager] Removed server ${connection.serverName}`);
   }
 
@@ -347,7 +359,7 @@ export class SSEManager extends EventEmitter {
 
   /**
    * Get list of servers that need polling (fallback mode or non-SSE-connected)
-   * JF/Emby servers with active plugin SSE are NOT included — events drive them.
+   * JF/Emby servers with active plugin SSE are NOT included; events drive them.
    * JF/Emby servers in unsupported/fallback state ARE included for normal polling.
    */
   getServersNeedingPoll(): string[] {
@@ -488,7 +500,7 @@ export class SSEManager extends EventEmitter {
 
       const connectionStatus = this.buildConnectionStatus(serverId, serverName, serverType, status);
 
-      // Persist to Redis and broadcast — fail-safe: errors here don't stop ingestion
+      // Persist to Redis and broadcast; fail-safe: errors here don't stop ingestion
       if (this.cacheService) {
         this.cacheService
           .setServerConnectionStatus(serverId, connectionStatus)
