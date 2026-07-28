@@ -38,6 +38,7 @@ jobs:
       - name: Get build metadata
         id: meta
         run: |
+          git fetch --force --tags https://github.com/connorgallopo/Tracearr.git 'refs/tags/v*:refs/tags/v*'
           base_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
           base_version="${base_tag#v}"
           echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
