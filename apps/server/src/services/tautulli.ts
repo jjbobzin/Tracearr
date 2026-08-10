@@ -7,8 +7,13 @@ import { and, eq, isNotNull, isNull, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
 import { serverUsers, sessions, users } from '../db/schema.js';
-import { checkAggregateNeedsRebuild, refreshAggregates } from '../db/timescale.js';
+import {
+  checkAggregateNeedsRebuild,
+  refreshAggregates,
+  uncapDecompressionForTx,
+} from '../db/timescale.js';
 import { enqueueMaintenanceJob } from '../jobs/maintenanceQueue.js';
+import { batchGetLibraryItemIdentity } from '../jobs/poller/database.js';
 import { sanitizeCodec } from '../utils/codecNormalizer.js';
 import { extractIpFromEndpoint } from '../utils/parsing.js';
 import { normalizeClient } from '../utils/platformNormalizer.js';
@@ -34,6 +39,24 @@ const PAGE_SIZE = 5000; // Larger batches = fewer API calls (tested up to 10k, s
 const REQUEST_TIMEOUT_MS = 30000; // 30 seconds
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000; // Base delay, will be multiplied by attempt number
+
+// Resolve external IDs from Plex legacy agent guids; new-style plex:// guids carry no external ID.
+export function parseHistoryGuid(guid: string | null): {
+  imdbId?: string;
+  tmdbId?: number;
+  tvdbId?: number;
+} {
+  if (!guid) return {};
+  const legacy = guid.match(/^com\.plexapp\.agents\.(thetvdb|themoviedb|imdb):\/\/([^/?]+)/);
+  if (!legacy) return {};
+  const [, agent, rawId] = legacy;
+  if (agent === 'imdb' && rawId!.startsWith('tt')) return { imdbId: rawId! };
+  const numeric = parseInt(rawId!, 10);
+  if (Number.isNaN(numeric)) return {};
+  if (agent === 'thetvdb') return { tvdbId: numeric };
+  if (agent === 'themoviedb') return { tmdbId: numeric };
+  return {};
+}
 
 // Helper for fields that can be number or empty string (Tautulli API inconsistency)
 // Exported for testing
@@ -735,6 +758,11 @@ export class TautulliService {
       );
       const sessionByTimeKey = await queryExistingByTimeKeys(serverId, pageTimeKeys);
 
+      const pageRatingKeys = validRecords
+        .map((r) => (typeof r.rating_key === 'number' ? String(r.rating_key) : null))
+        .filter((k): k is string => k !== null);
+      const identityByRatingKey = await batchGetLibraryItemIdentity(serverId, pageRatingKeys);
+
       for (const record of validRecords) {
         progress.processedRecords++;
 
@@ -953,6 +981,16 @@ export class TautulliService {
           // Track this insert to prevent duplicates within this import run
           insertedThisRun.add(referenceIdStr);
 
+          const identity = ratingKeyStr ? identityByRatingKey.get(ratingKeyStr) : undefined;
+          // Legacy episode guids carry the series' external ID, so trust guid IDs for movies only.
+          const guidIds = record.media_type === 'movie' ? parseHistoryGuid(record.guid) : {};
+          const parentRatingKeyStr =
+            typeof record.parent_rating_key === 'number' ? String(record.parent_rating_key) : null;
+          const grandparentRatingKeyStr =
+            typeof record.grandparent_rating_key === 'number'
+              ? String(record.grandparent_rating_key)
+              : null;
+
           // Collect insert
           insertBatch.push({
             serverId,
@@ -960,6 +998,13 @@ export class TautulliService {
             sessionKey,
             ratingKey: ratingKeyStr,
             externalSessionId: referenceIdStr,
+            parentRatingKey: parentRatingKeyStr,
+            grandparentRatingKey: grandparentRatingKeyStr,
+            mediaId: identity?.mediaId ?? null,
+            showMediaId: identity?.showMediaId ?? null,
+            imdbId: identity?.imdbId ?? guidIds.imdbId ?? null,
+            tmdbId: identity?.tmdbId ?? guidIds.tmdbId ?? null,
+            tvdbId: identity?.tvdbId ?? guidIds.tvdbId ?? null,
             state: 'stopped',
             mediaType,
             mediaTitle: record.title,
@@ -983,6 +1028,7 @@ export class TautulliService {
             progressMs: record.duration * 1000,
             pausedDurationMs: record.paused_counter * 1000,
             watched: record.watched_status === 1,
+            shortSession: record.duration * 1000 < 120000,
             ipAddress: extractIpFromEndpoint(record.ip_address),
             geoLocationName: geo.locationName ?? null,
             geoCity: geo.city,
@@ -1423,6 +1469,12 @@ export class TautulliService {
         // Batch write all updates in a single transaction
         if (pendingUpdates.length > 0) {
           await db.transaction(async (tx) => {
+            // The cap on decompressed tuples is per transaction, so it adds up
+            // across every UPDATE below, and `WHERE id = ?` matches no
+            // segmentby column - each row decompresses its segment. Enrichment
+            // ran uncapped before the cap came back globally; keep that, scoped
+            // to this transaction.
+            await uncapDecompressionForTx(tx);
             for (const update of pendingUpdates) {
               await tx.update(sessions).set(update.data).where(eq(sessions.id, update.id));
             }

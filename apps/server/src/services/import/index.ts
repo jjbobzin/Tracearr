@@ -44,3 +44,10 @@ export {
   createProgressTracker,
   createSimpleProgressPublisher,
 } from './progressTracker.js';
+
+// Media Enrichment
+export {
+  type MediaEnrichment,
+  type MediaServerClientWithItems,
+  fetchMediaEnrichment,
+} from './mediaEnrichment.js';

@@ -5,10 +5,10 @@ version: "3.8"
 
 services:
   timescale-test:
-    image: timescale/timescaledb:2.25.0-pg16@sha256:9e9f50161784dc57d3f547b89ded4af73553f9acb4677345ed05f45af7c7f664
+    image: timescale/timescaledb:2.29.1-pg18@sha256:373eb0fee9c0f8e0b4b0d4e74c7d0dd463dce05de6b49982701c4b540e94cba0
     shm_size: 512mb  # Required for PostgreSQL shared memory (increase for large imports)
     # Increase lock table size for large imports (Tautulli imports with many TimescaleDB chunks)
-    command: postgres -c max_locks_per_transaction=4096 -c timescaledb.telemetry_level=off
+    command: postgres -c max_locks_per_transaction=4096 -c timescaledb.telemetry_level=off -c max_connections=200
     ports:
       - "5433:5432"  # Different port to avoid conflicts with dev
     environment:
@@ -16,7 +16,7 @@ services:
       - POSTGRES_PASSWORD=test
       - POSTGRES_DB=tracearr_test
     volumes:
-      - timescale_test_data:/var/lib/postgresql/data
+      - timescale_test_data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U test -d tracearr_test"]
       interval: 5s
@@ -25,6 +25,7 @@ services:
 
   redis-test:
     image: redis:8-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    command: ["redis-server", "--databases", "32"]
     ports:
       - "6380:6379"  # Different port to avoid conflicts with dev
     volumes:

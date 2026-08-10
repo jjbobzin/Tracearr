@@ -28,8 +28,18 @@ import {
 import { MediaServerIcon } from '@/components/icons/MediaServerIcon';
 import { api } from '@/lib/api';
 import { useSocket } from '@/hooks/useSocket';
-import { ImportProgressCard, FileDropzone, type ImportProgressData } from '@/components/import';
-import type { Server, TautulliImportProgress, JellystatImportProgress } from '@tracearr/shared';
+import {
+  ImportProgressCard,
+  FileDropzone,
+  PlaybackReportingImportSection,
+  type ImportProgressData,
+} from '@/components/import';
+import type {
+  Server,
+  TautulliImportProgress,
+  JellystatImportProgress,
+  PlaybackReportingImportProgress,
+} from '@tracearr/shared';
 import { useSettings, useUpdateSettings, useServers } from '@/hooks/queries';
 
 // Tautulli Import Section Component
@@ -491,6 +501,14 @@ export function ImportSettings() {
   const [isJellystatImporting, setIsJellystatImporting] = useState(false);
   const [_jellystatActiveJobId, setJellystatActiveJobId] = useState<string | null>(null);
 
+  // Playback Reporting state
+  const [playbackReportingProgress, setPlaybackReportingProgress] =
+    useState<PlaybackReportingImportProgress | null>(null);
+  const [isPlaybackReportingImporting, setIsPlaybackReportingImporting] = useState(false);
+  const [_playbackReportingActiveJobId, setPlaybackReportingActiveJobId] = useState<string | null>(
+    null
+  );
+
   // Handle both array and wrapped response formats
   const servers = Array.isArray(serversData)
     ? serversData
@@ -595,6 +613,49 @@ export function ImportSettings() {
     void checkActiveJellystatImports();
   }, [jellyfinEmbyServers.length]);
 
+  // Check for active Playback Reporting import on mount
+  useEffect(() => {
+    if (jellyfinEmbyServers.length === 0) return;
+
+    const checkActivePlaybackReportingImports = async () => {
+      for (const server of jellyfinEmbyServers) {
+        try {
+          const result = await api.import.playbackReporting.getActive(server.id);
+          if (result.active && result.jobId) {
+            setSelectedJellyfinServerId(server.id);
+            setPlaybackReportingActiveJobId(result.jobId);
+            setIsPlaybackReportingImporting(true);
+
+            const progressPercent = typeof result.progress === 'number' ? result.progress : 0;
+            setPlaybackReportingProgress({
+              status: 'processing',
+              totalRecords: 0,
+              fetchedRecords: 0,
+              processedRecords: 0,
+              importedRecords: 0,
+              skippedRecords: 0,
+              duplicateRecords: 0,
+              unknownUserRecords: 0,
+              overlapRecords: 0,
+              filteredRecords: 0,
+              errorRecords: 0,
+              enrichedRecords: 0,
+              message:
+                progressPercent > 0
+                  ? t('import.importInProgressPercent', { percent: progressPercent })
+                  : t('import.importInProgressGeneric'),
+            });
+            break;
+          }
+        } catch {
+          // Ignore errors
+        }
+      }
+    };
+
+    void checkActivePlaybackReportingImports();
+  }, [jellyfinEmbyServers.length]);
+
   // Listen for Tautulli import progress via WebSocket
   useEffect(() => {
     if (!socket) return;
@@ -629,6 +690,24 @@ export function ImportSettings() {
     socket.on('import:jellystat:progress', handleJellystatProgress);
     return () => {
       socket.off('import:jellystat:progress', handleJellystatProgress);
+    };
+  }, [socket]);
+
+  // Listen for Playback Reporting import progress via WebSocket
+  useEffect(() => {
+    if (!socket) return;
+
+    const handlePlaybackReportingProgress = (progress: PlaybackReportingImportProgress) => {
+      setPlaybackReportingProgress(progress);
+      if (progress.status === 'complete' || progress.status === 'error') {
+        setIsPlaybackReportingImporting(false);
+        setPlaybackReportingActiveJobId(null);
+      }
+    };
+
+    socket.on('import:playbackreporting:progress', handlePlaybackReportingProgress);
+    return () => {
+      socket.off('import:playbackreporting:progress', handlePlaybackReportingProgress);
     };
   }, [socket]);
 
@@ -786,6 +865,60 @@ export function ImportSettings() {
     }
   };
 
+  const handleStartPlaybackReportingImport = async (opts: {
+    serverId: string;
+    timezone: string;
+    enrichMedia: boolean;
+    importFullRange: boolean;
+  }) => {
+    setIsPlaybackReportingImporting(true);
+    setPlaybackReportingProgress({
+      status: 'fetching',
+      totalRecords: 0,
+      fetchedRecords: 0,
+      processedRecords: 0,
+      importedRecords: 0,
+      skippedRecords: 0,
+      duplicateRecords: 0,
+      unknownUserRecords: 0,
+      overlapRecords: 0,
+      filteredRecords: 0,
+      errorRecords: 0,
+      enrichedRecords: 0,
+      message: t('import.startingImport'),
+    });
+
+    try {
+      const result = await api.import.playbackReporting.start(
+        opts.serverId,
+        opts.timezone,
+        opts.enrichMedia,
+        opts.importFullRange
+      );
+      if (result.jobId) {
+        setPlaybackReportingActiveJobId(result.jobId);
+      }
+    } catch (err) {
+      setIsPlaybackReportingImporting(false);
+      setPlaybackReportingActiveJobId(null);
+      setPlaybackReportingProgress({
+        status: 'error',
+        totalRecords: 0,
+        fetchedRecords: 0,
+        processedRecords: 0,
+        importedRecords: 0,
+        skippedRecords: 0,
+        duplicateRecords: 0,
+        unknownUserRecords: 0,
+        overlapRecords: 0,
+        filteredRecords: 0,
+        errorRecords: 0,
+        enrichedRecords: 0,
+        message: err instanceof Error ? err.message : 'Import failed',
+      });
+    }
+  };
+
   // Convert progress types for the reusable component
   const tautulliProgressData: ImportProgressData | null = tautulliProgress
     ? {
@@ -913,20 +1046,31 @@ export function ImportSettings() {
             </TabsContent>
 
             <TabsContent value="jellyfin" className="mt-0 space-y-6">
-              <JellystatImportSection
-                jellyfinEmbyServers={jellyfinEmbyServers}
-                selectedJellyfinServerId={selectedJellyfinServerId}
-                setSelectedJellyfinServerId={setSelectedJellyfinServerId}
-                selectedFile={selectedFile}
-                handleFileSelect={handleFileSelect}
-                enrichMedia={enrichMedia}
-                setEnrichMedia={setEnrichMedia}
-                updateStreamDetails={updateStreamDetails}
-                setUpdateStreamDetails={setUpdateStreamDetails}
-                isJellystatImporting={isJellystatImporting}
-                handleStartJellystatImport={handleStartJellystatImport}
-                jellystatProgressData={jellystatProgressData}
+              <PlaybackReportingImportSection
+                jellyfinServers={jellyfinEmbyServers}
+                selectedServerId={selectedJellyfinServerId}
+                onServerChange={setSelectedJellyfinServerId}
+                progress={playbackReportingProgress}
+                isImporting={isPlaybackReportingImporting}
+                onStartImport={handleStartPlaybackReportingImport}
               />
+
+              <div className="border-t pt-6">
+                <JellystatImportSection
+                  jellyfinEmbyServers={jellyfinEmbyServers}
+                  selectedJellyfinServerId={selectedJellyfinServerId}
+                  setSelectedJellyfinServerId={setSelectedJellyfinServerId}
+                  selectedFile={selectedFile}
+                  handleFileSelect={handleFileSelect}
+                  enrichMedia={enrichMedia}
+                  setEnrichMedia={setEnrichMedia}
+                  updateStreamDetails={updateStreamDetails}
+                  setUpdateStreamDetails={setUpdateStreamDetails}
+                  isJellystatImporting={isJellystatImporting}
+                  handleStartJellystatImport={handleStartJellystatImport}
+                  jellystatProgressData={jellystatProgressData}
+                />
+              </div>
             </TabsContent>
           </Tabs>
         ) : hasPlexServers ? (
@@ -950,20 +1094,33 @@ export function ImportSettings() {
             tautulliProgressData={tautulliProgressData}
           />
         ) : (
-          <JellystatImportSection
-            jellyfinEmbyServers={jellyfinEmbyServers}
-            selectedJellyfinServerId={selectedJellyfinServerId}
-            setSelectedJellyfinServerId={setSelectedJellyfinServerId}
-            selectedFile={selectedFile}
-            handleFileSelect={handleFileSelect}
-            enrichMedia={enrichMedia}
-            setEnrichMedia={setEnrichMedia}
-            updateStreamDetails={updateStreamDetails}
-            setUpdateStreamDetails={setUpdateStreamDetails}
-            isJellystatImporting={isJellystatImporting}
-            handleStartJellystatImport={handleStartJellystatImport}
-            jellystatProgressData={jellystatProgressData}
-          />
+          <div className="space-y-6">
+            <PlaybackReportingImportSection
+              jellyfinServers={jellyfinEmbyServers}
+              selectedServerId={selectedJellyfinServerId}
+              onServerChange={setSelectedJellyfinServerId}
+              progress={playbackReportingProgress}
+              isImporting={isPlaybackReportingImporting}
+              onStartImport={handleStartPlaybackReportingImport}
+            />
+
+            <div className="border-t pt-6">
+              <JellystatImportSection
+                jellyfinEmbyServers={jellyfinEmbyServers}
+                selectedJellyfinServerId={selectedJellyfinServerId}
+                setSelectedJellyfinServerId={setSelectedJellyfinServerId}
+                selectedFile={selectedFile}
+                handleFileSelect={handleFileSelect}
+                enrichMedia={enrichMedia}
+                setEnrichMedia={setEnrichMedia}
+                updateStreamDetails={updateStreamDetails}
+                setUpdateStreamDetails={setUpdateStreamDetails}
+                isJellystatImporting={isJellystatImporting}
+                handleStartJellystatImport={handleStartJellystatImport}
+                jellystatProgressData={jellystatProgressData}
+              />
+            </div>
+          </div>
         )}
       </CardContent>
     </Card>

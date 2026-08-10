@@ -1,7 +1,9 @@
 /**
  * Play Statistics Routes
  *
- * GET /plays - Plays over time (engagement-based, >= 2 min sessions)
+ * GET /plays - Plays over time (engagement-based, >= 2 min sessions).
+ *   Accepts an optional mediaType filter (movie|episode); omitting it keeps
+ *   the response identical to before the filter existed.
  * GET /plays-by-dayofweek - Plays grouped by day of week
  * GET /plays-by-hourofday - Plays grouped by hour of day
  *
@@ -10,10 +12,19 @@
  */
 
 import type { FastifyPluginAsync } from 'fastify';
+import { sql } from 'drizzle-orm';
+import { z } from 'zod';
 import { statsQuerySchema } from '@tracearr/shared';
 import { resolveDateRange } from './utils.js';
 import { resolveServerIds, buildMultiServerFragment } from '../../utils/serverFiltering.js';
 import { queryPlaysOverTime, queryPlaysByDayOfWeek, queryPlaysByHourOfDay } from './queries.js';
+import { PRIMARY_MEDIA_TYPES } from '../../constants/index.js';
+
+// /plays queries the sessions table directly (already restricted to primary
+// media types), so the optional filter only ever needs to narrow within that set.
+const playsMediaTypeQuerySchema = z.object({
+  mediaType: z.enum(PRIMARY_MEDIA_TYPES).optional(),
+});
 
 /**
  * Get bucket interval based on the requested period.
@@ -46,8 +57,13 @@ export const playsRoutes: FastifyPluginAsync = async (app) => {
     if (!query.success) {
       return reply.badRequest('Invalid query parameters');
     }
+    const mediaTypeQuery = playsMediaTypeQuerySchema.safeParse(request.query);
+    if (!mediaTypeQuery.success) {
+      return reply.badRequest('Invalid query parameters');
+    }
 
     const { period, startDate, endDate, serverId, serverIds, timezone } = query.data;
+    const { mediaType } = mediaTypeQuery.data;
     const authUser = request.user;
     const dateRange = resolveDateRange(period, startDate, endDate);
     // Default to UTC for backwards compatibility
@@ -57,6 +73,7 @@ export const playsRoutes: FastifyPluginAsync = async (app) => {
     const serverFilter = buildMultiServerFragment(resolvedIds);
     const bucketInterval = getBucketInterval(period);
     const customEnd = period === 'custom' && dateRange.end ? dateRange.end : undefined;
+    const mediaTypeFilter = mediaType ? sql`AND media_type = ${mediaType}` : undefined;
 
     const data = await queryPlaysOverTime({
       rangeStart: dateRange.start,
@@ -64,6 +81,7 @@ export const playsRoutes: FastifyPluginAsync = async (app) => {
       bucketInterval,
       serverFilter,
       endDate: customEnd,
+      mediaTypeFilter,
     });
 
     return { data };

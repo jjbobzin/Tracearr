@@ -40,6 +40,24 @@ export function isMaintenance(): boolean {
   return _mode === 'maintenance';
 }
 
+/**
+ * Which startup phase is running while the server is not yet ready. A
+ * non-null value means killing the process risks interrupting half-applied
+ * work (database migrations, aggregate rebuilds); /health surfaces it so the
+ * UI can warn against restarting.
+ */
+export type InitStep = 'migrations' | 'timescale' | 'services';
+
+let _initStep: InitStep | null = null;
+
+export function getInitStep(): InitStep | null {
+  return _initStep;
+}
+
+export function setInitStep(step: InitStep | null): void {
+  _initStep = step;
+}
+
 /** True if the server has ever reached 'ready' mode during this process lifetime. */
 export function wasEverReady(): boolean {
   return _wasReady;
@@ -91,4 +109,16 @@ export function getRestoreProgress(): RestoreProgress | null {
 
 export function setRestoreProgress(p: RestoreProgress | null): void {
   _restoreProgress = p;
+}
+
+// Migration/init failure - surfaced on /health so a stuck migration stays visible
+// (both db and redis read healthy in this case, so those flags alone don't show it).
+let _lastMigrationError: string | null = null;
+
+export function getLastMigrationError(): string | null {
+  return _lastMigrationError;
+}
+
+export function setLastMigrationError(message: string | null): void {
+  _lastMigrationError = message;
 }

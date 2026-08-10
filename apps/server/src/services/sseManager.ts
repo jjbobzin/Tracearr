@@ -21,6 +21,7 @@ import {
   type SSEConnectionState,
   type SSEConnectionStatus,
   type ServerConnectionStatus,
+  type PluginIssue,
   type PlexPlaySessionNotification,
 } from '@tracearr/shared';
 import { registerService, unregisterService } from './serviceTracker.js';
@@ -30,10 +31,21 @@ import { PlexEventSource } from './mediaServer/plex/eventSource.js';
 import {
   JellyfinEmbyEventSource,
   type PluginSessionEvent,
+  type PluginLibraryEvent,
+  type PluginServerStats,
 } from './mediaServer/shared/jellyfinEmbyEventSource.js';
+import { recordServerStatsSample } from './serverLiveStats.js';
+import { getRedis } from '../lib/redisShared.js';
+import { probeSsePlugin } from './mediaServer/shared/ssePluginProbe.js';
 import { broadcastToAll } from '../websocket/index.js';
+import { isLeader } from './leaderLease.js';
 import { triggerServerPoll } from '../jobs/poller/index.js';
 import { compareVersions } from '../utils/pluginVersion.js';
+import {
+  clearPendingLibraryEventSync,
+  recordLibraryEvent,
+  clearPendingLibraryEventSyncs,
+} from './libraryEventSync.js';
 import type { CacheService, PubSubService } from './cache.js';
 
 // Events emitted by SSEManager for consumers
@@ -51,27 +63,57 @@ interface ServerConnection {
   serverId: string;
   serverName: string;
   serverType: 'plex' | 'jellyfin' | 'emby';
+  // Kept for the plugin-list probe when the SSE endpoint 404s
+  url: string;
+  token: string;
   eventSource: PlexEventSource | JellyfinEmbyEventSource | null;
   state: SSEConnectionState;
   inFallback: boolean;
   connectedAt: Date | null;
   lastEventAt: Date | null;
+  pluginIssue: PluginIssue | null;
 }
 
 // Per-server debounce timers to coalesce rapid plugin events before polling
 const pendingServerPolls = new Map<string, NodeJS.Timeout>();
+// First-event timestamps backing the debounce max-wait: a trailing debounce
+// alone never fires while events arrive faster than the delay, which is
+// exactly the busy-server case, so the poll must fire unconditionally once
+// the max wait elapses.
+const pendingServerPollSince = new Map<string, number>();
 
 const NUDGE_MIN_INTERVAL_MS = 60 * 1000;
+const SERVER_POLL_DEBOUNCE_MS = 1000;
+const SERVER_POLL_MAX_WAIT_MS = 2000;
+// Min gap between plugin-list probes per server while its endpoint 404s
+const PLUGIN_PROBE_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
 function scheduleServerPoll(serverId: string, serverName: string): void {
+  if (!isLeader()) return;
+  const now = Date.now();
+  const firstEventAt = pendingServerPollSince.get(serverId);
+  if (firstEventAt !== undefined && now - firstEventAt >= SERVER_POLL_MAX_WAIT_MS) {
+    const existing = pendingServerPolls.get(serverId);
+    if (existing) clearTimeout(existing);
+    pendingServerPolls.delete(serverId);
+    pendingServerPollSince.delete(serverId);
+    console.log(`[PluginSSE] ${serverName}: live event burst, refreshing`);
+    void triggerServerPoll(serverId);
+    return;
+  }
+  if (firstEventAt === undefined) {
+    pendingServerPollSince.set(serverId, now);
+  }
+
   const existing = pendingServerPolls.get(serverId);
   if (existing) clearTimeout(existing);
 
   const timer = setTimeout(() => {
     pendingServerPolls.delete(serverId);
+    pendingServerPollSince.delete(serverId);
     console.log(`[PluginSSE] ${serverName}: live event, refreshing`);
     void triggerServerPoll(serverId);
-  }, 1000);
+  }, SERVER_POLL_DEBOUNCE_MS);
 
   pendingServerPolls.set(serverId, timer);
 }
@@ -100,6 +142,8 @@ export class SSEManager extends EventEmitter {
   private pendingOperations = new Set<string>();
   private latestPluginVersion: string | null = null;
   private lastNudgeAt = new Map<string, number>();
+  private lastPluginProbeAt = new Map<string, number>();
+  private pluginProbesInFlight = new Set<string>();
 
   /**
    * Initialize the SSE manager with cache services
@@ -158,6 +202,8 @@ export class SSEManager extends EventEmitter {
       clearTimeout(timer);
     }
     pendingServerPolls.clear();
+    pendingServerPollSince.clear();
+    clearPendingLibraryEventSyncs();
 
     for (const connection of this.connections.values()) {
       if (connection.eventSource) {
@@ -193,12 +239,15 @@ export class SSEManager extends EventEmitter {
         serverId,
         serverName,
         serverType,
+        url,
+        token,
         eventSource: null,
         state: 'disconnected',
         // Start in fallback so the poller covers the server until a stream actually opens
         inFallback: true,
         connectedAt: null,
         lastEventAt: null,
+        pluginIssue: null,
       };
 
       try {
@@ -274,6 +323,8 @@ export class SSEManager extends EventEmitter {
       clearTimeout(pending);
       pendingServerPolls.delete(serverId);
     }
+    pendingServerPollSince.delete(serverId);
+    clearPendingLibraryEventSync(serverId);
 
     if (connection.eventSource) {
       connection.eventSource.removeAllListeners();
@@ -282,6 +333,7 @@ export class SSEManager extends EventEmitter {
 
     this.connections.delete(serverId);
     this.lastNudgeAt.delete(serverId);
+    this.lastPluginProbeAt.delete(serverId);
     console.log(`[SSEManager] Removed server ${connection.serverName}`);
   }
 
@@ -347,7 +399,11 @@ export class SSEManager extends EventEmitter {
    */
   nudgeReconnect(serverId: string): void {
     const connection = this.connections.get(serverId);
-    if (!connection?.eventSource || connection.state !== 'fallback') return;
+    if (!connection?.eventSource) return;
+    // 'unsupported' is nudgeable too: a reachable server (the poll just
+    // succeeded) may have had its 404 verdict caused by a proxy hiccup, a
+    // restart, or the plugin being installed since.
+    if (connection.state !== 'fallback' && connection.state !== 'unsupported') return;
 
     const now = Date.now();
     const last = this.lastNudgeAt.get(serverId) ?? 0;
@@ -398,6 +454,14 @@ export class SSEManager extends EventEmitter {
       this.emit('plex:session:progress', { serverId, notification });
     });
 
+    eventSource.on('library:added', ({ ratingKey }: { ratingKey: string }) => {
+      recordLibraryEvent({ serverId, serverName, type: 'added', itemId: ratingKey });
+    });
+
+    eventSource.on('library:removed', ({ ratingKey }: { ratingKey: string }) => {
+      recordLibraryEvent({ serverId, serverName, type: 'removed', itemId: ratingKey });
+    });
+
     eventSource.on('connection:state', (state: SSEConnectionState) => {
       this.handleConnectionStateChange(serverId, serverName, state, eventSource.getStatus());
     });
@@ -441,6 +505,8 @@ export class SSEManager extends EventEmitter {
       error: status.error,
       pluginVersion,
       pluginUpdateAvailable,
+      pluginIssue:
+        state === 'unsupported' ? (this.connections.get(serverId)?.pluginIssue ?? null) : null,
     };
   }
 
@@ -494,27 +560,92 @@ export class SSEManager extends EventEmitter {
       scheduleServerPoll(serverId, serverName);
     });
 
+    // The plugin emits these today - see jellyfinEmbyEventSource.ts
+    eventSource.on('library:event', ({ type, itemId }: PluginLibraryEvent) => {
+      recordLibraryEvent({ serverId, serverName, type, itemId });
+    });
+
+    // Plugin v0.4+ CPU/RAM samples feed the live-stats endpoint's rolling buffer
+    eventSource.on('stats:event', (sample: PluginServerStats) => {
+      const connection = this.connections.get(serverId);
+      if (connection) connection.lastEventAt = new Date();
+      void recordServerStatsSample(getRedis(), serverId, sample);
+    });
+
     eventSource.on('connection:state', (state: SSEConnectionState) => {
       const status = eventSource.getStatus();
       this.handleConnectionStateChange(serverId, serverName, state, status);
 
-      const connectionStatus = this.buildConnectionStatus(serverId, serverName, serverType, status);
-
-      // Persist to Redis and broadcast; fail-safe: errors here don't stop ingestion
-      if (this.cacheService) {
-        this.cacheService
-          .setServerConnectionStatus(serverId, connectionStatus)
-          .catch((err: unknown) => {
-            console.error(`[SSEManager] Failed to write connection status for ${serverName}:`, err);
-          });
+      const connection = this.connections.get(serverId);
+      if (connection) {
+        if (state === 'connected') {
+          connection.pluginIssue = null;
+        } else if (state === 'unsupported') {
+          this.diagnoseUnsupported(serverId);
+        }
       }
 
-      broadcastToAll(WS_EVENTS.SERVER_CONNECTION as 'server:connection', connectionStatus);
+      this.publishJellyfinEmbyStatus(serverId, serverName, serverType, status);
     });
 
     eventSource.on('connection:error', (error: Error) => {
       console.error(`[SSEManager] Plugin SSE error for ${serverName}:`, error.message);
     });
+  }
+
+  private publishJellyfinEmbyStatus(
+    serverId: string,
+    serverName: string,
+    serverType: 'jellyfin' | 'emby',
+    status: SSEConnectionStatus
+  ): void {
+    const connectionStatus = this.buildConnectionStatus(serverId, serverName, serverType, status);
+
+    // Persist to Redis and broadcast; fail-safe: errors here don't stop ingestion
+    if (this.cacheService) {
+      this.cacheService
+        .setServerConnectionStatus(serverId, connectionStatus)
+        .catch((err: unknown) => {
+          console.error(`[SSEManager] Failed to write connection status for ${serverName}:`, err);
+        });
+    }
+
+    broadcastToAll(WS_EVENTS.SERVER_CONNECTION as 'server:connection', connectionStatus);
+  }
+
+  /**
+   * Ask the server's plugin list why its SSE endpoint 404s, then republish the
+   * connection status carrying the diagnosis. Throttled per server; the answer
+   * distinguishes "not installed" from "installed but blocked by a proxy".
+   */
+  private diagnoseUnsupported(serverId: string): void {
+    const connection = this.connections.get(serverId);
+    if (!connection || connection.serverType === 'plex') return;
+    if (this.pluginProbesInFlight.has(serverId)) return;
+
+    const now = Date.now();
+    const last = this.lastPluginProbeAt.get(serverId) ?? 0;
+    if (now - last < PLUGIN_PROBE_MIN_INTERVAL_MS) return;
+    this.lastPluginProbeAt.set(serverId, now);
+    this.pluginProbesInFlight.add(serverId);
+
+    const { url, token, serverType } = connection;
+    void probeSsePlugin({ baseUrl: url, serverType, token })
+      .then((issue) => {
+        const current = this.connections.get(serverId);
+        if (!current?.eventSource || current.state !== 'unsupported') return;
+        current.pluginIssue = issue;
+        console.log(`[SSEManager] Plugin diagnosis for ${current.serverName}: ${issue}`);
+        this.publishJellyfinEmbyStatus(
+          serverId,
+          current.serverName,
+          serverType,
+          current.eventSource.getStatus()
+        );
+      })
+      .finally(() => {
+        this.pluginProbesInFlight.delete(serverId);
+      });
   }
 
   /**
@@ -580,6 +711,11 @@ export class SSEManager extends EventEmitter {
     );
 
     this.reconciliationTimer = setInterval(() => {
+      // Server CRUD served by another instance never calls this instance's
+      // refresh; converge on the DB server list here instead.
+      void this.refresh().catch((error: unknown) => {
+        console.error('[SSEManager] Reconciliation refresh failed:', error);
+      });
       this.refreshConnectionStatuses();
       this.emit('reconciliation:needed');
     }, POLLING_INTERVALS.SSE_RECONCILIATION);
@@ -615,6 +751,13 @@ export class SSEManager extends EventEmitter {
    * Refresh server list (call when servers are added/removed)
    */
   async refresh(): Promise<void> {
+    // Only the leaseholder runs SSE connections. A follower serving a server
+    // CRUD request must not build its own connection set; the leader
+    // converges on the change via the reconciliation tick below.
+    if (!isLeader()) {
+      console.log('[SSEManager] Not the leader, skipping SSE refresh');
+      return;
+    }
     const refreshLockId = '__refresh__';
     if (this.pendingOperations.has(refreshLockId)) {
       console.log('[SSEManager] Refresh already in progress, skipping');

@@ -22,8 +22,12 @@ import {
   type LibraryCompletionQueryInput,
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { validateServerAccess } from '../../utils/serverFiltering.js';
-import { buildLibraryServerFilter, buildLibraryCacheKey } from './utils.js';
+import {
+  validateServerAccess,
+  resolveServerIds,
+  buildMultiServerFragment,
+} from '../../utils/serverFiltering.js';
+import { buildLibraryCacheKey } from './utils.js';
 
 /** Completion status derived from 85% threshold */
 type CompletionStatus = 'completed' | 'in_progress' | 'not_started';
@@ -186,10 +190,15 @@ export const libraryCompletionRoute: FastifyPluginAsync = async (app) => {
         }
       }
 
+      // resolvedIds mirrors the scope validateServerAccess already cleared above.
+      const resolvedIds = resolveServerIds(authUser, serverId, undefined, { strict: false });
+      const serverCacheSegment =
+        resolvedIds !== undefined ? resolvedIds.slice().sort().join(',') : 'all';
+
       // Build cache key with all varying params
       const cacheKey = buildLibraryCacheKey(
         REDIS_KEYS.LIBRARY_COMPLETION,
-        serverId,
+        serverCacheSegment,
         `${libraryId ?? 'all'}-${mediaType ?? 'all'}-${aggregateLevel}-${statusFilter}-${minCompletionPct ?? 'none'}-${maxCompletionPct ?? 'none'}-${sortBy}-${sortOrder}-${page}-${pageSize}`
       );
 
@@ -204,9 +213,13 @@ export const libraryCompletionRoute: FastifyPluginAsync = async (app) => {
       }
 
       // Build base filters for library_items (li)
-      const serverFilter = buildLibraryServerFilter(serverId, authUser, 'li');
+      const serverFilter = buildMultiServerFragment(resolvedIds, 'li.server_id');
       const libraryFilter = libraryId ? sql`AND li.library_id = ${libraryId}` : sql``;
-      const mediaTypeFilter = mediaType ? sql`AND li.media_type = ${mediaType}` : sql``;
+      // mediaType is always movie/episode/show; unfiltered item-level completion must
+      // still exclude season, which has no engagement of its own and would show as 0%.
+      const mediaTypeFilter = mediaType
+        ? sql`AND li.media_type = ${mediaType}`
+        : sql`AND li.media_type != 'season'`;
 
       // Status filter
       const statusFilterSql =
@@ -323,6 +336,7 @@ async function executeItemLevel(
         ON ces.rating_key = li.rating_key
         AND ces.server_id = li.server_id
       WHERE 1=1
+        AND li.removed_at IS NULL
         ${serverFilter}
         ${libraryFilter}
         ${mediaTypeFilter}
@@ -404,6 +418,7 @@ async function executeItemLevel(
         ON ces.rating_key = li.rating_key
         AND ces.server_id = li.server_id
       WHERE 1=1
+        AND li.removed_at IS NULL
         ${serverFilter}
         ${libraryFilter}
         ${mediaTypeFilter}
@@ -503,6 +518,7 @@ async function executeSeasonLevel(
         ON ces.rating_key = li.rating_key
         AND ces.server_id = li.server_id
       WHERE li.media_type = 'episode'
+        AND li.removed_at IS NULL
         AND ces.show_title IS NOT NULL
         AND ces.season_number IS NOT NULL
         ${serverFilter}
@@ -577,6 +593,7 @@ async function executeSeasonLevel(
         ON ces.rating_key = li.rating_key
         AND ces.server_id = li.server_id
       WHERE li.media_type = 'episode'
+        AND li.removed_at IS NULL
         AND ces.show_title IS NOT NULL
         AND ces.season_number IS NOT NULL
         ${serverFilter}
@@ -667,6 +684,7 @@ async function executeSeriesLevel(
         ON ces.rating_key = li.rating_key
         AND ces.server_id = li.server_id
       WHERE li.media_type = 'episode'
+        AND li.removed_at IS NULL
         AND ces.show_title IS NOT NULL
         AND ces.season_number IS NOT NULL
         ${serverFilter}
@@ -760,6 +778,7 @@ async function executeSeriesLevel(
         ON ces.rating_key = li.rating_key
         AND ces.server_id = li.server_id
       WHERE li.media_type = 'episode'
+        AND li.removed_at IS NULL
         AND ces.show_title IS NOT NULL
         AND ces.season_number IS NOT NULL
         ${serverFilter}

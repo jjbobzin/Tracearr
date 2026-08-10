@@ -256,4 +256,94 @@ describe('PlexClient sort-based incremental sync', () => {
       expect(result.items[0]!.title).toBe('Recent Episode');
     });
   });
+
+  describe('getLibrarySeasons', () => {
+    it('requests type=3 and paginates via headers, not query params', async () => {
+      mockFetchJson.mockResolvedValue(emptyResponse());
+      const client = makeClient();
+
+      await client.getLibrarySeasons('5', { offset: 40, limit: 20 });
+
+      const [url, options] = mockFetchJson.mock.calls[0]! as [string, { headers?: unknown }];
+      expect(url).toContain('/library/sections/5/all');
+      expect(url).toContain('type=3');
+      // The pagination trap: type=3 queries ignore Start/Size as query params
+      // (always return the whole result set) but honor them as headers.
+      expect(url).not.toContain('X-Plex-Container-Start');
+      expect(url).not.toContain('X-Plex-Container-Size');
+      expect(options.headers).toMatchObject({
+        'X-Plex-Container-Start': '40',
+        'X-Plex-Container-Size': '20',
+      });
+    });
+
+    it('advances the header offset across pages until totalSize is covered', async () => {
+      mockFetchJson
+        .mockResolvedValueOnce(
+          makeItemsResponse([{ ratingKey: 's1', title: 'Season 1', updatedAt: 1 }], 2)
+        )
+        .mockResolvedValueOnce(
+          makeItemsResponse([{ ratingKey: 's2', title: 'Season 2', updatedAt: 1 }], 2)
+        );
+
+      const client = makeClient();
+      const first = await client.getLibrarySeasons('5', { offset: 0, limit: 1 });
+      expect(first.totalCount).toBe(2);
+      const second = await client.getLibrarySeasons('5', { offset: 1, limit: 1 });
+
+      const headersA = (mockFetchJson.mock.calls[0]![1] as { headers: Record<string, string> })
+        .headers;
+      const headersB = (mockFetchJson.mock.calls[1]![1] as { headers: Record<string, string> })
+        .headers;
+      expect(headersA['X-Plex-Container-Start']).toBe('0');
+      expect(headersB['X-Plex-Container-Start']).toBe('1');
+      expect(first.items[0]!.ratingKey).toBe('s1');
+      expect(second.items[0]!.ratingKey).toBe('s2');
+    });
+  });
+
+  describe('getLibrarySeasonsSince', () => {
+    it('sorts by updatedAt, filters type=3, and paginates via headers', async () => {
+      const since = new Date('2024-06-01T00:00:00Z');
+      const sinceUnix = Math.floor(since.getTime() / 1000);
+
+      mockFetchJson
+        .mockResolvedValueOnce(
+          makeItemsResponse([
+            { ratingKey: 'season-1', title: 'Season 1', updatedAt: sinceUnix + 100 },
+          ])
+        )
+        .mockResolvedValueOnce(emptyResponse());
+
+      const client = makeClient();
+      await client.getLibrarySeasonsSince('5', since);
+
+      const [url, options] = mockFetchJson.mock.calls[0]! as [string, { headers?: unknown }];
+      expect(url).toContain('type=3');
+      expect(url).toContain('sort=updatedAt%3Adesc');
+      expect(url).not.toContain('X-Plex-Container-Start');
+      expect(options.headers).toMatchObject({
+        'X-Plex-Container-Start': '0',
+        'X-Plex-Container-Size': '100',
+      });
+    });
+
+    it('stops at the cutoff like the other since-fetches', async () => {
+      const since = new Date('2024-06-01T00:00:00Z');
+      const sinceUnix = Math.floor(since.getTime() / 1000);
+
+      mockFetchJson.mockResolvedValue(
+        makeItemsResponse([
+          { ratingKey: 'new-season', title: 'New', updatedAt: sinceUnix + 100 },
+          { ratingKey: 'old-season', title: 'Old', updatedAt: sinceUnix - 100 },
+        ])
+      );
+
+      const client = makeClient();
+      const result = await client.getLibrarySeasonsSince('5', since);
+
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0]!.title).toBe('New');
+    });
+  });
 });

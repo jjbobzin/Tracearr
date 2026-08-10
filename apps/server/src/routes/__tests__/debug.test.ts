@@ -663,8 +663,8 @@ describe('Debug Routes', () => {
       expect(body.success).toBe(true);
       expect(body.message).toBe('Aggregates refreshed (last 7 days)');
 
-      // Should call execute for each of the 4 active aggregates
-      expect(db.execute).toHaveBeenCalledTimes(4);
+      // One refresh per continuous aggregate defined in timescale.ts
+      expect(db.execute).toHaveBeenCalledTimes(5);
     });
 
     it('handles individual aggregate refresh failure gracefully', async () => {

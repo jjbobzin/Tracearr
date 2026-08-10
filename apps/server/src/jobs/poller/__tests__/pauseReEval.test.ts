@@ -324,7 +324,6 @@ function createDefaultInput(overrides: Partial<PauseReEvalInput> = {}): PauseReE
       thumbUrl: null,
       identityName: null,
       trustScore: 100,
-      sessionCount: 10,
       lastActivityAt: new Date(),
       createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), // 30 days ago
       identityServerUserIds: ['user-1'],

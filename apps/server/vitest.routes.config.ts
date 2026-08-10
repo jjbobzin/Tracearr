@@ -23,6 +23,7 @@ export default mergeConfig(
         'src/routes/__tests__/*.test.ts',
         'src/routes/stats/__tests__/*.test.ts',
         'src/routes/users/__tests__/*.test.ts',
+        'src/routes/library/__tests__/*.test.ts',
       ],
       coverage: {
         provider: 'v8',

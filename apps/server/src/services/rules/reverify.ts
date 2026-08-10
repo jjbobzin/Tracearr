@@ -52,6 +52,7 @@ import { getCacheService } from '../cache.js';
 import {
   batchGetIdentityServerUserIds,
   batchGetRecentUserSessions,
+  maxWindowHoursFromRules,
   getSessionsTerminatedByViolation,
   mapRuleRowToRuleV2,
   widenRecentSessionsForMergedIdentities,
@@ -276,7 +277,14 @@ export async function reverifyKillCondition(
     identityServerUserIds && identityServerUserIds.length > 1
       ? identityServerUserIds
       : [contextSession.serverUserId];
-  const recentSessionsMap = await batchGetRecentUserSessions(recentSessionsUserIds);
+  // The kill worker runs on every instance while the rules cache (and the
+  // window default it feeds) only refreshes where rules evaluate, so the
+  // window must be derived from THIS rule, never from the module default.
+  const ruleWindowHours = maxWindowHoursFromRules([rule]);
+  const recentSessionsMap = await batchGetRecentUserSessions(
+    recentSessionsUserIds,
+    ruleWindowHours
+  );
 
   // Widen recentSessions across the identity's server_user ids so windowed
   // evaluators (unique_ips_in_window, travel_speed_kmh, ...) see the same
@@ -286,7 +294,8 @@ export async function reverifyKillCondition(
   if (identityServerUserIds && identityServerUserIds.length > 1) {
     await widenRecentSessionsForMergedIdentities(
       recentSessionsMap,
-      new Map([[contextSession.serverUser.userId, identityServerUserIds]])
+      new Map([[contextSession.serverUser.userId, identityServerUserIds]]),
+      ruleWindowHours
     );
   }
 

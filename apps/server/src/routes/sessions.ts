@@ -948,26 +948,26 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
     const { whereClause } = filterResult;
 
     // Unique Titles KPI. Single-server: COUNT(DISTINCT media_title), matching main exactly.
-    // Multi-server: dedupe by external-id match key (imdb->tmdb->tvdb->normalized-title) via a
-    // library_items join so the same title on two servers counts once; unmatched sessions fall
-    // back to a normalized title key from the session's media_title.
+    // Multi-server: dedupe by canonical media identity - a merged-loser id folds to its
+    // winner via media.merged_into_id (mirrors value_rollup's alias fold in catalog.ts) -
+    // falling back to an ASCII-stripped title+year key, then the raw title (catches non-Latin
+    // titles the strip empties out), then the per-server rating key for titleless sessions.
+    // A session with none of those resolves to NULL, which COUNT(DISTINCT) already excludes.
     const resolvedIds = resolveServerIds(authUser, query.data.serverId, query.data.serverIds, {
       strict: false,
     });
     const singleServer = resolvedIds?.length === 1;
+    const mediaJoinFragment = singleServer ? sql`` : sql`LEFT JOIN media am ON am.id = s.media_id`;
     const uniqueContentExpr = singleServer
       ? sql`COUNT(DISTINCT s.media_title)`
       : sql`COUNT(DISTINCT
           COALESCE(
-            CASE WHEN li.imdb_id IS NOT NULL AND li.imdb_id <> '' THEN 'imdb:' || li.imdb_id END,
-            CASE WHEN li.tmdb_id IS NOT NULL THEN 'tmdb:' || li.tmdb_id::text END,
-            CASE WHEN li.tvdb_id IS NOT NULL THEN 'tvdb:' || li.tvdb_id::text END,
-            NULLIF('title:' || LOWER(REGEXP_REPLACE(COALESCE(s.media_title, ''), '[^a-zA-Z0-9]', '', 'g')), 'title:')
+            COALESCE(am.merged_into_id, s.media_id)::text,
+            'title:' || NULLIF(LOWER(REGEXP_REPLACE(COALESCE(s.media_title, ''), '[^a-zA-Z0-9]', '', 'g')), '') || ':' || COALESCE(s.year::text, ''),
+            'raw:' || NULLIF(s.media_title, ''),
+            'rk:' || s.server_id || ':' || NULLIF(s.rating_key, '')
           )
         )`;
-    const libraryJoin = singleServer
-      ? sql``
-      : sql`LEFT JOIN library_items li ON li.server_id = s.server_id AND li.rating_key = s.rating_key`;
 
     // uniqueUsers is counted by identity (server_users.user_id), not by
     // account, so a person merged across two servers in the filtered set
@@ -980,7 +980,7 @@ export const sessionRoutes: FastifyPluginAsync = async (app) => {
         ${uniqueContentExpr}::int as unique_content
       FROM sessions s
       JOIN server_users su_agg ON su_agg.id = s.server_user_id
-      ${libraryJoin}
+      ${mediaJoinFragment}
       ${whereClause}
     `);
 

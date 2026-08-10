@@ -12,10 +12,12 @@ import {
   Gauge,
   Smartphone,
   Activity,
-  BookOpen,
   Sparkles,
   HardDrive,
   Eye,
+  Clapperboard,
+  LayoutGrid,
+  Tags,
 } from 'lucide-react';
 import type { NavKey } from '@tracearr/translations';
 
@@ -50,10 +52,12 @@ export const navigation: NavEntry[] = [
     ],
   },
   {
-    nameKey: 'library',
-    icon: BookOpen,
+    nameKey: 'media',
+    icon: Clapperboard,
     children: [
-      { nameKey: 'overview', href: '/library', icon: LayoutDashboard },
+      { nameKey: 'overview', href: '/media', icon: LayoutDashboard },
+      { nameKey: 'mediaBrowse', href: '/media/browse', icon: LayoutGrid },
+      { nameKey: 'mediaGenres', href: '/media/genres', icon: Tags },
       { nameKey: 'quality', href: '/library/quality', icon: Sparkles },
       { nameKey: 'storage', href: '/library/storage', icon: HardDrive },
       { nameKey: 'watch', href: '/library/watch', icon: Eye },

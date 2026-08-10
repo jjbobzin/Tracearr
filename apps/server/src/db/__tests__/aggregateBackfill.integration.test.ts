@@ -172,6 +172,40 @@ describe('aggregate backfill (version-mismatch startup path)', () => {
     expect(result.backfillPending).toBeUndefined();
     expect(await getBackfillMarker()).toBeNull();
   });
+
+  it('resumes instead of re-dropping definitions when a version-mismatch retry finds a marker already targeting the current version', async () => {
+    // Simulates a boot that already ran the DDL rebuild for the current
+    // target version and left a marker before the background backfill
+    // failed. The stored version is still the old one, so this boot sees
+    // the same version mismatch again.
+    await setStoredVersionRaw(AGGREGATE_SCHEMA_VERSION - 1);
+    await setBackfillMarkerRaw(AGGREGATE_SCHEMA_VERSION);
+
+    const result = await initTimescaleDB();
+
+    expect(result.success).toBe(true);
+    expect(result.backfillPending?.targetVersion).toBe(AGGREGATE_SCHEMA_VERSION);
+    expect(
+      result.actions.some((a) => a.includes('resuming pending backfill instead of recreating'))
+    ).toBe(true);
+    expect(result.actions.some((a) => a.includes('recreating aggregate definitions'))).toBe(false);
+  });
+
+  it('still drops and recreates when the leftover marker targets an older version than the current mismatch', async () => {
+    const server = await createTestServer();
+    const user = await createTestUser();
+    const serverUser = await createTestServerUser({ serverId: server.id, userId: user.id });
+    await seedMultiChunkSessions(server.id, serverUser.id, 10, 10);
+
+    await setStoredVersionRaw(AGGREGATE_SCHEMA_VERSION - 1);
+    await setBackfillMarkerRaw(AGGREGATE_SCHEMA_VERSION - 1);
+
+    const result = await initTimescaleDB();
+
+    expect(result.success).toBe(true);
+    expect(result.backfillPending?.targetVersion).toBe(AGGREGATE_SCHEMA_VERSION);
+    expect(result.actions.some((a) => a.includes('recreating aggregate definitions'))).toBe(true);
+  });
 });
 
 describe('runAggregateBackfill', () => {

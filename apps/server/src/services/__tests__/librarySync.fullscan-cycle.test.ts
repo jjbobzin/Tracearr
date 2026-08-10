@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /**
- * Tests for the periodic full-scan cycle logic in LibrarySyncService.
+ * Tests for the periodic full-scan safety net in LibrarySyncService.
+ * Time-based: a full scan is forced when the last one is older than
+ * FULL_SCAN_MAX_AGE_MS, so event-sync bursts can't drag the cadence forward.
  */
 
 vi.mock('../../db/client.js', () => ({
@@ -11,7 +13,11 @@ vi.mock('../../db/client.js', () => ({
     insert: vi.fn(),
     delete: vi.fn(),
     transaction: vi.fn(),
-    execute: vi.fn().mockResolvedValue(undefined),
+    // getActiveItemCount's count-mismatch check reads this. Every test here
+    // uses totalCount: 100, so match it - otherwise the (correct) bidirectional
+    // mismatch check reads a local count of 0 against a server total of 100 and
+    // forces a full scan the incremental-path tests don't expect.
+    execute: vi.fn().mockResolvedValue({ rows: [{ count: 100 }] }),
   },
 }));
 
@@ -21,6 +27,15 @@ vi.mock('../../jobs/heavyOpsLock.js', () => ({
 
 vi.mock('../mediaServer/index.js', () => ({
   createMediaServerClient: vi.fn(),
+}));
+
+vi.mock('../../jobs/sessionIdentityBackfill.js', () => ({
+  backfillSessionIdentityBatch: vi.fn().mockResolvedValue({ updated: 0, oldest: null }),
+}));
+
+vi.mock('../library/mediaResolutionService.js', () => ({
+  resolveMediaBatch: vi.fn().mockResolvedValue(new Map()),
+  reconcileMediaDuplicates: vi.fn().mockResolvedValue(0),
 }));
 
 import type { Redis } from 'ioredis';
@@ -139,7 +154,7 @@ function makeMockClient(opts: { totalCount?: number; itemsSinceCount?: number } 
     getLibraryLeaves: vi.fn().mockResolvedValue({ items: [], totalCount: 0 }),
     getSessions: vi.fn(),
     getUsers: vi.fn(),
-    testConnection: vi.fn(),
+    testConnection: vi.fn().mockResolvedValue(true),
     terminateSession: vi.fn(),
   };
 }
@@ -164,24 +179,27 @@ describe('LibrarySyncService full-scan cycle', () => {
     setupDbSelectMocks(TEST_SERVER);
   });
 
-  it('uses incremental sync on first few cycles', async () => {
+  it('uses incremental sync while the last full scan is fresh', async () => {
     const client = makeMockClient({ totalCount: 100, itemsSinceCount: 5 });
     mockCreateClient.mockReturnValue(client);
 
-    // Simulate prior sync state (cycle 1, not at interval yet)
+    // Prior sync state with a recent full scan (1 hour ago)
     await mockRedis.set(
       'tracearr:library:sync:last:srv-1:1',
       new Date(Date.now() - 3600000).toISOString()
     );
     await mockRedis.set('tracearr:library:sync:count:srv-1:1', '100');
-    await mockRedis.set('tracearr:library:sync:cycle:srv-1:1', '1');
+    await mockRedis.set(
+      'tracearr:library:sync:fullscan:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
 
     await service.syncServer('srv-1', undefined, 'scheduled');
 
     expect(client.getLibraryItemsSince).toHaveBeenCalled();
   });
 
-  it('forces full scan when cycle reaches FULL_SCAN_INTERVAL', async () => {
+  it('forces full scan when the last full scan is older than FULL_SCAN_MAX_AGE_MS', async () => {
     const client = makeMockClient({ totalCount: 100 });
     mockCreateClient.mockReturnValue(client);
 
@@ -190,12 +208,36 @@ describe('LibrarySyncService full-scan cycle', () => {
       new Date(Date.now() - 3600000).toISOString()
     );
     await mockRedis.set('tracearr:library:sync:count:srv-1:1', '100');
-    await mockRedis.set('tracearr:library:sync:cycle:srv-1:1', '7');
+    // 85 hours ago, past the 84h max age
+    await mockRedis.set(
+      'tracearr:library:sync:fullscan:srv-1:1',
+      new Date(Date.now() - 85 * 3600000).toISOString()
+    );
 
     await service.syncServer('srv-1', undefined, 'scheduled');
 
     expect(client.getLibraryItemsSince).not.toHaveBeenCalled();
     expect(client.getLibraryItems).toHaveBeenCalled();
+  });
+
+  it('stays incremental when the full-scan timestamp is missing (upgrade path seeds it)', async () => {
+    const client = makeMockClient({ totalCount: 100, itemsSinceCount: 5 });
+    mockCreateClient.mockReturnValue(client);
+
+    // Pre-upgrade state: sync history exists but no fullscan timestamp
+    await mockRedis.set(
+      'tracearr:library:sync:last:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
+    await mockRedis.set('tracearr:library:sync:count:srv-1:1', '100');
+
+    await service.syncServer('srv-1', undefined, 'scheduled');
+
+    expect(client.getLibraryItemsSince).toHaveBeenCalled();
+    // The save path seeded the clock so the time-based safety net is armed
+    const seeded = await mockRedis.get('tracearr:library:sync:fullscan:srv-1:1');
+    expect(seeded).toBeTruthy();
+    expect(Number.isNaN(new Date(seeded!).getTime())).toBe(false);
   });
 
   it('always forces full scan for manual triggers', async () => {
@@ -207,10 +249,100 @@ describe('LibrarySyncService full-scan cycle', () => {
       new Date(Date.now() - 3600000).toISOString()
     );
     await mockRedis.set('tracearr:library:sync:count:srv-1:1', '100');
-    await mockRedis.set('tracearr:library:sync:cycle:srv-1:1', '1');
+    await mockRedis.set(
+      'tracearr:library:sync:fullscan:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
 
     await service.syncServer('srv-1', undefined, 'manual');
 
     expect(client.getLibraryItemsSince).not.toHaveBeenCalled();
+  });
+});
+
+describe('undercount escalation memory (accepted shortfall)', () => {
+  let service: LibrarySyncService;
+  let mockRedis: Redis;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    service = new LibrarySyncService();
+    mockRedis = makeMockRedis();
+    initLibrarySyncRedis(mockRedis);
+    setupDbSelectMocks(TEST_SERVER);
+  });
+
+  it('escalates once for a structural gap, records the shortfall, then stays incremental on the same gap', async () => {
+    const client1 = makeMockClient({ totalCount: 100, itemsSinceCount: 0 });
+    mockCreateClient.mockReturnValue(client1);
+
+    await mockRedis.set(
+      'tracearr:library:sync:last:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
+    await mockRedis.set('tracearr:library:sync:count:srv-1:1', '100');
+    await mockRedis.set(
+      'tracearr:library:sync:fullscan:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
+
+    // Structural gap: local active count sits 5 below the server total, before and after the sync.
+    vi.mocked(db.execute).mockResolvedValue({ rows: [{ count: 95 }] } as never);
+
+    await service.syncServer('srv-1', undefined, 'scheduled');
+
+    // No accepted shortfall yet, so the gap (5) exceeds tolerance (3) and escalates to a full scan.
+    expect(client1.getLibraryItems).toHaveBeenCalledWith('1', { offset: 0, limit: 200 });
+
+    // Second sync: same structural gap, nothing new - must stay incremental.
+    // Re-arm lastSyncedAt outside the drift-check cooldown, as if the
+    // scheduled cadence had passed, so the check actually runs.
+    setupDbSelectMocks(TEST_SERVER);
+    await mockRedis.set(
+      'tracearr:library:sync:last:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
+    const client2 = makeMockClient({ totalCount: 100, itemsSinceCount: 0 });
+    mockCreateClient.mockReturnValue(client2);
+
+    await service.syncServer('srv-1', undefined, 'scheduled');
+
+    expect(client2.getLibraryItemsSince).toHaveBeenCalled();
+    expect(client2.getLibraryItems).not.toHaveBeenCalledWith('1', { offset: 0, limit: 200 });
+  });
+
+  it('still escalates when a new wrong tombstone widens the gap beyond the accepted shortfall', async () => {
+    const client1 = makeMockClient({ totalCount: 100, itemsSinceCount: 0 });
+    mockCreateClient.mockReturnValue(client1);
+
+    await mockRedis.set(
+      'tracearr:library:sync:last:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
+    await mockRedis.set('tracearr:library:sync:count:srv-1:1', '100');
+    await mockRedis.set(
+      'tracearr:library:sync:fullscan:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
+
+    vi.mocked(db.execute).mockResolvedValue({ rows: [{ count: 95 }] } as never);
+    await service.syncServer('srv-1', undefined, 'scheduled');
+    expect(client1.getLibraryItems).toHaveBeenCalledWith('1', { offset: 0, limit: 200 });
+
+    // Second sync: a NEW wrong tombstone widens the gap to 10 - beyond the accepted shortfall (5) plus tolerance.
+    // Re-arm lastSyncedAt outside the drift-check cooldown so the check runs.
+    setupDbSelectMocks(TEST_SERVER);
+    await mockRedis.set(
+      'tracearr:library:sync:last:srv-1:1',
+      new Date(Date.now() - 3600000).toISOString()
+    );
+    const client2 = makeMockClient({ totalCount: 100, itemsSinceCount: 0 });
+    mockCreateClient.mockReturnValue(client2);
+    vi.mocked(db.execute).mockResolvedValue({ rows: [{ count: 90 }] } as never);
+
+    await service.syncServer('srv-1', undefined, 'scheduled');
+
+    expect(client2.getLibraryItemsSince).toHaveBeenCalled();
+    expect(client2.getLibraryItems).toHaveBeenCalledWith('1', { offset: 0, limit: 200 });
   });
 });

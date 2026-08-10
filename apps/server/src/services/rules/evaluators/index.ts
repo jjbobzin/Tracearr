@@ -7,7 +7,9 @@ import type {
   TranscodingConditionValue,
   VideoResolution,
 } from '@tracearr/shared';
-import { isIpInCidr, toNetworkKey } from '../../../utils/ip.js';
+import { isIpInCidr, toNetworkKey, unmapIpv4Mapped } from '../../../utils/ip.js';
+import { rulesLogger } from '../../../utils/logger.js';
+import { LOCAL_NETWORK_COUNTRY, normalizeToCountryCode } from '../../../utils/country.js';
 import { normalizeResolution } from '../../../utils/resolutionNormalizer.js';
 import { geoipService } from '../../geoip.js';
 import { compare } from '../comparisons.js';
@@ -77,23 +79,38 @@ function resolutionToNumber(resolution: VideoResolution): number {
 
 /**
  * Normalize device type from session device/platform/product info.
+ * Callers decide whether playerName participates: on Jellyfin/Emby it holds
+ * DeviceName ("iPad", "SHIELD Android TV"), the only authoritative device
+ * string those servers send (normalizeClient synthesizes device/platform
+ * from the client name, so field absence cannot be used as the signal). On
+ * Plex it holds the user-editable player title ("Living Room TV PC"), which
+ * must not steer classification, so Plex callers pass null. The bare 'tv'
+ * token is word-boundary matched against playerName because DeviceName can
+ * be a hostname ("MATVEY-PC"); controlled fields keep substring matching so
+ * 'tvOS' and 'Apple TV' hold.
  */
 function normalizeDeviceType(
   device: string | null,
   platform: string | null,
-  product?: string | null
+  product?: string | null,
+  playerName?: string | null
 ): DeviceType {
-  const haystack = `${device ?? ''} ${platform ?? ''} ${product ?? ''}`.toLowerCase();
+  const fieldHaystack = `${device ?? ''} ${platform ?? ''} ${product ?? ''}`.toLowerCase();
+  const nameHaystack = (playerName ?? '').toLowerCase();
+  const haystack = `${fieldHaystack} ${nameHaystack}`;
 
-  // tv before browser: 'chromecast' contains 'chrome', 'webos' contains 'web'
+  // tv before browser: 'chromecast' contains 'chrome', 'webos' contains 'web'.
+  // dlna: renderers announced through Emby/Jellyfin DLNA are TVs in practice.
   if (
-    haystack.includes('tv') ||
+    fieldHaystack.includes('tv') ||
+    /\btv\b/.test(nameHaystack) ||
     haystack.includes('roku') ||
     haystack.includes('webos') ||
     haystack.includes('tizen') ||
     haystack.includes('firetv') ||
     haystack.includes('chromecast') ||
-    haystack.includes('androidtv')
+    haystack.includes('androidtv') ||
+    haystack.includes('dlna')
   ) {
     return 'tv';
   }
@@ -124,6 +141,8 @@ function normalizeDeviceType(
     return 'browser';
   }
 
+  // 'desktop' catches Windows hostnames ('DESKTOP-ABC123'); the named clients
+  // are desktop-only apps that carry no OS substring in any field.
   if (
     haystack.includes('windows') ||
     haystack.includes('macos') ||
@@ -132,7 +151,10 @@ function normalizeDeviceType(
     haystack.includes('os x') ||
     haystack.includes('darwin') ||
     haystack.includes('linux') ||
-    haystack.includes('mac')
+    haystack.includes('mac') ||
+    haystack.includes('desktop') ||
+    haystack.includes('jellyfin media player') ||
+    haystack.includes('emby theater')
   ) {
     return 'desktop';
   }
@@ -178,11 +200,22 @@ function normalizePlatform(platform: string | null): Platform {
  */
 function belongsToIdentity(context: EvaluationContext): (s: Session) => boolean {
   const ids = context.identityServerUserIds;
+  let matchesUser: (s: Session) => boolean;
   if (ids && ids.length > 0) {
     const idSet = new Set(ids);
-    return (s) => idSet.has(s.serverUserId);
+    matchesUser = (s) => idSet.has(s.serverUserId);
+  } else {
+    matchesUser = (s) => s.serverUserId === context.serverUser.id;
   }
-  return (s) => s.serverUserId === context.serverUser.id;
+
+  // A server-scoped rule aggregates only that server's sessions. Without this
+  // a Plex-scoped rule counts a merged identity's Jellyfin streams and can
+  // kill the Plex stream over activity the rule was never scoped to see.
+  const serverScope = context.rule.serverId;
+  if (!serverScope) {
+    return matchesUser;
+  }
+  return (s) => s.serverId === serverScope && matchesUser(s);
 }
 
 // ============================================================================
@@ -204,9 +237,20 @@ const evaluateConcurrentStreams: ConditionEvaluator = (
 
   // When count_device_types is set, only count sessions from those device types.
   // Unlike the exclusions below, the triggering session is NOT exempt.
+  // playerName inclusion follows the trigger server's type; counted sessions
+  // from another server type in a cross-server identity are the accepted
+  // imprecision here (rows carry no server type).
   if (countDeviceTypes?.length) {
+    const includePlayerName = context.server.type !== 'plex';
     userActiveSessions = userActiveSessions.filter((s) =>
-      countDeviceTypes.includes(normalizeDeviceType(s.device, s.platform, s.product))
+      countDeviceTypes.includes(
+        normalizeDeviceType(
+          s.device,
+          s.platform,
+          s.product,
+          includePlayerName ? s.playerName : null
+        )
+      )
     );
   }
 
@@ -396,7 +440,15 @@ const evaluateUniqueIpsInWindow: ConditionEvaluator = (
 
   // Include the current session. Count by network key; keep original IPs for details.
   const ipsByNetwork = new Map<string, string>();
-  const addIp = (ip: string) => {
+  const addIp = (rawIp: string) => {
+    // Unmap v4-mapped v6 first so isPrivateIP and toNetworkKey agree on the
+    // same address (isPrivateIP only strips the dotted ::ffff: form itself).
+    const ip = unmapIpv4Mapped(rawIp);
+    // LAN addresses are one household, not evidence of sharing, so they are
+    // never counted. Deliberately stricter than v1, which counted them
+    // unless excludePrivateIps was explicitly set; that default is what
+    // flagged single households as sharers.
+    if (geoipService.isPrivateIP(ip)) return;
     const key = toNetworkKey(ip);
     if (!ipsByNetwork.has(key)) ipsByNetwork.set(key, ip);
   };
@@ -599,32 +651,52 @@ const evaluateIsTranscoding: ConditionEvaluator = (
     audioDecision: session.audioDecision,
   };
 
-  // Handle new string values
-  if (typeof value === 'string') {
-    let matched: boolean;
-    let actual: string;
-    switch (value as TranscodingConditionValue) {
-      case 'video':
-        matched = session.videoDecision === 'transcode';
-        actual = session.videoDecision ?? 'unknown';
-        break;
-      case 'audio':
-        matched = session.audioDecision === 'transcode';
-        actual = session.audioDecision ?? 'unknown';
-        break;
-      case 'video_or_audio':
-        matched = session.isTranscode;
-        actual = session.isTranscode ? 'transcoding' : 'direct';
-        break;
-      case 'neither':
-        matched = !session.isTranscode;
-        actual = session.isTranscode ? 'transcoding' : 'direct';
-        break;
-      default:
-        matched = false;
-        actual = 'unknown';
+  // Handle new string values, single or array (in/not_in accept arrays)
+  if (typeof value === 'string' || Array.isArray(value)) {
+    const rawValues = Array.isArray(value) ? value : [value];
+    const known = rawValues.filter(
+      (v): v is TranscodingConditionValue =>
+        v === 'video' || v === 'audio' || v === 'video_or_audio' || v === 'neither'
+    );
+    // Unrecognized values never match under ANY operator, same as evaluateCountry
+    if (known.length === 0) {
+      return { matched: false, actual: 'unknown', details };
     }
-    return { matched, actual, details };
+
+    const matchesOne = (v: TranscodingConditionValue): boolean => {
+      switch (v) {
+        case 'video':
+          return session.videoDecision === 'transcode';
+        case 'audio':
+          return session.audioDecision === 'transcode';
+        case 'video_or_audio':
+          return session.isTranscode;
+        case 'neither':
+          return !session.isTranscode;
+      }
+    };
+    const actualFor = (v: TranscodingConditionValue): string => {
+      switch (v) {
+        case 'video':
+          return session.videoDecision ?? 'unknown';
+        case 'audio':
+          return session.audioDecision ?? 'unknown';
+        case 'video_or_audio':
+        case 'neither':
+          return session.isTranscode ? 'transcoding' : 'direct';
+      }
+    };
+
+    const anyMatch = known.some(matchesOne);
+    // some() computes the eq/in sense; neq/not_in invert it. Without this a
+    // "not transcoding video" rule fires exactly when video IS transcoding.
+    const inverted = condition.operator === 'neq' || condition.operator === 'not_in';
+    const actual = Array.isArray(value)
+      ? session.isTranscode
+        ? 'transcoding'
+        : 'direct'
+      : actualFor(known[0]!);
+    return { matched: inverted ? !anyMatch : anyMatch, actual, details };
   }
 
   // Backwards compatibility: handle boolean values
@@ -669,9 +741,10 @@ const evaluateSourceBitrateMbps: ConditionEvaluator = (
 ): EvaluatorResult => {
   const { session } = context;
 
-  // Use source video details bitrate if available, otherwise fall back to session bitrate
-  const bitrateBps = session.sourceVideoDetails?.bitrate ?? session.bitrate ?? 0;
-  const bitrateMbps = bitrateBps / 1_000_000;
+  // Use source video details bitrate if available, otherwise fall back to
+  // session bitrate. Both are stored in kbps (see mediaServer/types.ts).
+  const bitrateKbps = session.sourceVideoDetails?.bitrate ?? session.bitrate ?? 0;
+  const bitrateMbps = bitrateKbps / 1000;
 
   return {
     matched: compare(bitrateMbps, condition.operator, condition.value),
@@ -690,8 +763,20 @@ const evaluateUserId: ConditionEvaluator = (
   const { serverUser } = context;
   const displayName = serverUser.identityName ?? serverUser.username;
 
+  // Person semantics: the builder stores one representative account id per
+  // person, so the condition matches when that account belongs to the same
+  // identity as the triggering account. A plain id compare would let a
+  // merged person's other accounts escape a rule the UI labels with the
+  // person's name.
+  const identityIds = new Set(context.identityServerUserIds ?? []);
+  identityIds.add(serverUser.id);
+
+  const values = Array.isArray(condition.value) ? condition.value : [condition.value];
+  const anyMember = values.some((v) => typeof v === 'string' && identityIds.has(v));
+  const inverted = condition.operator === 'neq' || condition.operator === 'not_in';
+
   return {
-    matched: compare(serverUser.id, condition.operator, condition.value),
+    matched: inverted ? !anyMember : anyMember,
     actual: displayName,
     details: {
       userId: serverUser.id,
@@ -735,9 +820,14 @@ const evaluateDeviceType: ConditionEvaluator = (
   context: EvaluationContext,
   condition: Condition
 ): EvaluatorResult => {
-  const { session } = context;
+  const { session, server } = context;
 
-  const deviceType = normalizeDeviceType(session.device, session.platform, session.product);
+  const deviceType = normalizeDeviceType(
+    session.device,
+    session.platform,
+    session.product,
+    server.type === 'plex' ? null : session.playerName
+  );
 
   return {
     matched: compare(deviceType, condition.operator, condition.value),
@@ -792,16 +882,53 @@ const evaluateIsLocalNetwork: ConditionEvaluator = (
   };
 };
 
+/**
+ * Normalize the rule's country value(s) to ISO codes so a rule authored as
+ * "Germany" still matches a session stored as "DE" and vice versa.
+ */
+function normalizeCountryConditionValue(value: Condition['value']): Condition['value'] {
+  if (typeof value === 'string') {
+    return normalizeToCountryCode(value) ?? value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) =>
+      typeof v === 'string' ? (normalizeToCountryCode(v) ?? v) : v
+    ) as Condition['value'];
+  }
+  return value;
+}
+
 const evaluateCountry: ConditionEvaluator = (
   context: EvaluationContext,
   condition: Condition
 ): EvaluatorResult => {
   const { session } = context;
+  const raw = session.geoCountry;
 
-  const country = session.geoCountry ?? '';
+  // LAN sessions store the 'Local Network' sentinel and sessions without geo
+  // data store null; neither has a meaningful country, so never match - a
+  // "country neq US" rule must not fire on them regardless of operator.
+  if (!raw || raw === LOCAL_NETWORK_COUNTRY) {
+    if (!raw) {
+      rulesLogger.debug(
+        `country condition skipped: session ${session.id} has no geo data (ip: ${session.ipAddress ?? 'unknown'})`
+      );
+    }
+    return { matched: false, actual: raw ?? null };
+  }
+
+  // geoCountry stores countryCode ?? country, so full names appear whenever
+  // the geo lookup had no code; normalize both sides to ISO before comparing.
+  const country = normalizeToCountryCode(raw);
+  if (!country) {
+    rulesLogger.debug(
+      `country condition skipped: session ${session.id} country '${raw}' did not normalize to an ISO code`
+    );
+    return { matched: false, actual: raw };
+  }
 
   return {
-    matched: compare(country, condition.operator, condition.value),
+    matched: compare(country, condition.operator, normalizeCountryConditionValue(condition.value)),
     actual: country,
   };
 };
@@ -861,20 +988,6 @@ const evaluateServerId: ConditionEvaluator = (
   };
 };
 
-const evaluateLibraryId: ConditionEvaluator = (
-  _context: EvaluationContext,
-  condition: Condition
-): EvaluatorResult => {
-  // Note: Session type doesn't have libraryId based on the types.ts file
-  // This would need to be added to the Session type or fetched separately
-  // For now, this is a placeholder that always returns false
-  // TODO: Add libraryId to Session type or context
-  return {
-    matched: compare('', condition.operator, condition.value),
-    actual: '',
-  };
-};
-
 const evaluateMediaType: ConditionEvaluator = (
   context: EvaluationContext,
   condition: Condition
@@ -926,7 +1039,6 @@ export const evaluatorRegistry: Record<ConditionField, ConditionEvaluator> = {
 
   // Scope
   server_id: evaluateServerId,
-  library_id: evaluateLibraryId,
   media_type: evaluateMediaType,
 };
 

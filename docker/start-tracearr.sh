@@ -54,5 +54,34 @@ for i in $(seq 1 $MAX_RETRIES); do
     sleep $RETRY_INTERVAL
 done
 
+# Cap Node's heap to fit the container's Node/Redis reserve. Node sizes its
+# default max-old-space from HOST memory (it can't see the cgroup), so on a
+# big host it balloons past the reserve the entrypoint carved out of the
+# limit and the whole container gets OOM-killed. Reserve math mirrors the
+# entrypoint's tuning split: max(1024MB, limit/4), minus slack for Redis and
+# Node's non-heap memory. A user-supplied --max-old-space-size wins.
+if [[ "${NODE_OPTIONS:-}" != *"--max-old-space-size"* ]]; then
+    CGROUP_MB=""
+    if [ -f /sys/fs/cgroup/memory.max ]; then
+        CGROUP_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "max")
+        if [ "$CGROUP_LIMIT" != "max" ] && [ -n "$CGROUP_LIMIT" ]; then
+            CGROUP_MB=$((CGROUP_LIMIT / 1024 / 1024))
+        fi
+    elif [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        CGROUP_LIMIT=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "0")
+        if [ -n "$CGROUP_LIMIT" ] && [ "$CGROUP_LIMIT" -gt 0 ] && [ "$CGROUP_LIMIT" -lt 9223372036854771712 ]; then
+            CGROUP_MB=$((CGROUP_LIMIT / 1024 / 1024))
+        fi
+    fi
+    if [ -n "$CGROUP_MB" ]; then
+        NODE_RESERVE_MB=1024
+        [ $((CGROUP_MB / 4)) -gt "$NODE_RESERVE_MB" ] && NODE_RESERVE_MB=$((CGROUP_MB / 4))
+        NODE_HEAP_MB=$((NODE_RESERVE_MB - 256))
+        [ "$NODE_HEAP_MB" -lt 512 ] && NODE_HEAP_MB=512
+        export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=${NODE_HEAP_MB}"
+        echo "[Tracearr] Node heap capped at ${NODE_HEAP_MB}MB (container limit ${CGROUP_MB}MB; set --max-old-space-size in NODE_OPTIONS to override)"
+    fi
+fi
+
 echo "[Tracearr] Starting application..."
 exec node /app/apps/server/dist/index.js

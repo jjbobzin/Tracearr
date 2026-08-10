@@ -370,16 +370,6 @@ export const FIELD_DEFINITIONS: Record<ConditionField, FieldDefinition> = {
     valueType: 'multi-select',
     placeholder: 'Select servers...',
   },
-  library_id: {
-    field: 'library_id',
-    label: 'Library',
-    description: 'Specific library',
-    category: 'scope',
-    operators: [...EQUALITY_OPERATORS, ...ARRAY_OPERATORS],
-    valueType: 'multi-select',
-    placeholder: 'Select libraries...',
-    hidden: true, // TODO: Backend doesn't support library_id yet
-  },
   media_type: {
     field: 'media_type',
     label: 'Media Type',

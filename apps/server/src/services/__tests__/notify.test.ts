@@ -71,6 +71,12 @@ describe('NotificationManager', () => {
     backupRetentionCount: 7,
     pluginUpdateCheckEnabled: true,
     pluginManifestUrl: null,
+    watchedThresholdMovie: 85,
+    watchedThresholdTv: 85,
+    watchedThresholdMusic: 85,
+    publicApiRateLimitPerMinute: 240,
+    imagePrecacheEnabled: true,
+    preferredPosterServerId: null,
     ...overrides,
   });
 
@@ -453,6 +459,102 @@ describe('NotificationManager', () => {
       expect(body.get('message')).toContain('Test User');
       expect(body.get('message')).toContain('Test Movie');
       expect(body.get('priority')).toBe('-1');
+    });
+
+    it('sends json webhook with media identity block for session start', async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse(true));
+
+      const settings = createMockSettings({
+        customWebhookUrl: 'https://example.com/webhook',
+        webhookFormat: 'json',
+      });
+
+      const session = createMockActiveSession({
+        mediaTitle: 'Test Movie',
+        mediaType: 'movie',
+        year: 2024,
+        ratingKey: 'media-123',
+        parentRatingKey: 'parent-456',
+        grandparentRatingKey: 'grandparent-789',
+        mediaId: 'media-uuid-1',
+        imdbId: 'tt1234567',
+        tmdbId: 111,
+        tvdbId: 222,
+      });
+      await manager.notifySessionStarted(session, settings);
+
+      const callArgs = mockFetch.mock.calls[0]!;
+      const body = JSON.parse(callArgs[1].body);
+      expect(body.data.media).toEqual({
+        title: 'Test Movie',
+        subtitle: '2024',
+        type: 'movie',
+        year: 2024,
+        mediaId: 'media-uuid-1',
+        imdbId: 'tt1234567',
+        tmdbId: 111,
+        tvdbId: 222,
+        ratingKey: 'media-123',
+        parentRatingKey: 'parent-456',
+        grandparentRatingKey: 'grandparent-789',
+      });
+    });
+
+    it('normalizes an empty ratingKey to null in the json webhook media block', async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse(true));
+
+      const settings = createMockSettings({
+        customWebhookUrl: 'https://example.com/webhook',
+        webhookFormat: 'json',
+      });
+
+      const session = createMockActiveSession({ ratingKey: '' });
+      await manager.notifySessionStarted(session, settings);
+
+      const callArgs = mockFetch.mock.calls[0]!;
+      const body = JSON.parse(callArgs[1].body);
+      expect(body.data.media.ratingKey).toBeNull();
+    });
+  });
+
+  describe('notifySessionStopped', () => {
+    it('sends json webhook with media identity block for session stop', async () => {
+      mockFetch.mockResolvedValueOnce(createMockResponse(true));
+
+      const settings = createMockSettings({
+        customWebhookUrl: 'https://example.com/webhook',
+        webhookFormat: 'json',
+      });
+
+      const session = createMockActiveSession({
+        mediaTitle: 'Test Movie',
+        mediaType: 'movie',
+        durationMs: 5000,
+        ratingKey: 'media-123',
+        parentRatingKey: 'parent-456',
+        grandparentRatingKey: 'grandparent-789',
+        mediaId: 'media-uuid-1',
+        imdbId: 'tt1234567',
+        tmdbId: 111,
+        tvdbId: 222,
+      });
+      await manager.notifySessionStopped(session, settings);
+
+      const callArgs = mockFetch.mock.calls[0]!;
+      const body = JSON.parse(callArgs[1].body);
+      expect(body.data.media).toEqual({
+        title: 'Test Movie',
+        subtitle: '2024',
+        type: 'movie',
+        mediaId: 'media-uuid-1',
+        imdbId: 'tt1234567',
+        tmdbId: 111,
+        tvdbId: 222,
+        ratingKey: 'media-123',
+        parentRatingKey: 'parent-456',
+        grandparentRatingKey: 'grandparent-789',
+      });
+      expect(body.data.session).toEqual({ durationMs: 5000 });
     });
   });
 });

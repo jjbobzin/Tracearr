@@ -1,0 +1,1 @@
+CREATE INDEX "idx_library_items_server_thumb" ON "library_items" USING btree ("server_id","thumb_path");

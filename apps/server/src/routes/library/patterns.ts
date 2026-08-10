@@ -286,6 +286,7 @@ export const libraryPatternsRoute: FastifyPluginAsync = async (app) => {
                 FROM sessions sess
                 JOIN library_items li ON sess.rating_key = li.rating_key
                   AND sess.server_id = li.server_id
+                  AND li.removed_at IS NULL
                 WHERE sess.duration_ms >= 120000
                   AND sess.started_at >= NOW() - INTERVAL '1 week' * ${periodWeeks}
                   ${serverFragmentLi}
@@ -324,6 +325,7 @@ export const libraryPatternsRoute: FastifyPluginAsync = async (app) => {
                  FROM sessions sess
                  JOIN library_items li ON sess.rating_key = li.rating_key
                    AND sess.server_id = li.server_id
+                   AND li.removed_at IS NULL
                  WHERE sess.duration_ms >= 120000
                    AND sess.started_at >= NOW() - INTERVAL '1 week' * ${periodWeeks}
                    ${serverFragmentLi}
@@ -356,6 +358,7 @@ export const libraryPatternsRoute: FastifyPluginAsync = async (app) => {
                 FROM sessions sess
                 JOIN library_items li ON sess.rating_key = li.rating_key
                   AND sess.server_id = li.server_id
+                  AND li.removed_at IS NULL
                 WHERE sess.duration_ms >= 120000
                   AND sess.started_at >= NOW() - INTERVAL '1 week' * ${periodWeeks}
                   ${serverFragmentLi}
@@ -403,6 +406,7 @@ export const libraryPatternsRoute: FastifyPluginAsync = async (app) => {
               FROM sessions sess
               JOIN library_items li ON sess.rating_key = li.rating_key
                 AND sess.server_id = li.server_id
+                AND li.removed_at IS NULL
               WHERE sess.duration_ms >= 120000
                 AND sess.started_at >= NOW() - INTERVAL '1 week' * ${periodWeeks}
                 ${serverFragmentLi}
@@ -413,6 +417,7 @@ export const libraryPatternsRoute: FastifyPluginAsync = async (app) => {
               FROM sessions sess
               JOIN library_items li ON sess.rating_key = li.rating_key
                 AND sess.server_id = li.server_id
+                AND li.removed_at IS NULL
               WHERE sess.duration_ms >= 120000
                 AND sess.started_at >= NOW() - INTERVAL '1 week' * ${periodWeeks}
                 ${serverFragmentLi}

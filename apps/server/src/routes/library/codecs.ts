@@ -13,13 +13,17 @@ import { sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { REDIS_KEYS, CACHE_TTL, uuidSchema } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { validateServerAccess } from '../../utils/serverFiltering.js';
+import {
+  validateServerAccess,
+  resolveServerIds,
+  buildMultiServerFragment,
+} from '../../utils/serverFiltering.js';
 import {
   normalizeVideoCodec,
   normalizeAudioCodec,
   normalizeAudioChannels,
 } from '../../utils/codecNormalizer.js';
-import { buildLibraryServerFilter, buildLibraryCacheKey } from './utils.js';
+import { buildLibraryCacheKey } from './utils.js';
 
 /** Query schema for codecs endpoint */
 const codecsQuerySchema = z.object({
@@ -124,10 +128,14 @@ export const libraryCodecsRoute: FastifyPluginAsync = async (app) => {
         }
       }
 
+      const resolvedIds = resolveServerIds(authUser, serverId, undefined, { strict: false });
+      const serverCacheSegment =
+        resolvedIds !== undefined ? resolvedIds.slice().sort().join(',') : 'all';
+
       // Build cache key
       const cacheKey = buildLibraryCacheKey(
         REDIS_KEYS.LIBRARY_CODECS ?? 'library:codecs',
-        serverId,
+        serverCacheSegment,
         libraryId ?? 'all'
       );
 
@@ -142,56 +150,68 @@ export const libraryCodecsRoute: FastifyPluginAsync = async (app) => {
       }
 
       // Build server filter
-      const serverFilter = buildLibraryServerFilter(serverId, authUser);
+      const serverFilter = buildMultiServerFragment(resolvedIds);
 
       // Library filter
       const libraryFilter = libraryId ? sql`AND library_id = ${libraryId}` : sql``;
 
       // Query video codecs for movies and episodes
       const videoCodecsResult = await db.execute(sql`
-        SELECT video_codec AS codec, COUNT(*)::int AS count
+        SELECT v.video_codec AS codec, COUNT(DISTINCT library_items.id)::int AS count
         FROM library_items
+        JOIN library_item_versions v
+          ON v.library_item_id = library_items.id AND v.removed_at IS NULL
         WHERE media_type IN ('movie', 'episode')
-          AND video_codec IS NOT NULL
+          AND v.video_codec IS NOT NULL
+          AND library_items.removed_at IS NULL
           ${serverFilter}
           ${libraryFilter}
-        GROUP BY video_codec
+        GROUP BY v.video_codec
         ORDER BY count DESC
       `);
 
       // Query audio codecs for movies and episodes
       const audioCodecsResult = await db.execute(sql`
-        SELECT audio_codec AS codec, COUNT(*)::int AS count
+        SELECT v.audio_codec AS codec, COUNT(DISTINCT library_items.id)::int AS count
         FROM library_items
+        JOIN library_item_versions v
+          ON v.library_item_id = library_items.id AND v.removed_at IS NULL
         WHERE media_type IN ('movie', 'episode')
-          AND audio_codec IS NOT NULL
+          AND v.audio_codec IS NOT NULL
+          AND library_items.removed_at IS NULL
           ${serverFilter}
           ${libraryFilter}
-        GROUP BY audio_codec
+        GROUP BY v.audio_codec
         ORDER BY count DESC
       `);
 
       // Query audio channels for movies and episodes
       const channelsResult = await db.execute(sql`
-        SELECT audio_channels AS channels, COUNT(*)::int AS count
+        SELECT v.audio_channels AS channels, COUNT(DISTINCT library_items.id)::int AS count
         FROM library_items
+        JOIN library_item_versions v
+          ON v.library_item_id = library_items.id AND v.removed_at IS NULL
         WHERE media_type IN ('movie', 'episode')
-          AND audio_channels IS NOT NULL
+          AND v.audio_channels IS NOT NULL
+          AND library_items.removed_at IS NULL
           ${serverFilter}
           ${libraryFilter}
-        GROUP BY audio_channels
+        GROUP BY v.audio_channels
         ORDER BY count DESC
       `);
 
       // Query audio codecs for music tracks
       const musicCodecsResult = await db.execute(sql`
-        SELECT audio_codec AS codec, COUNT(*)::int AS count
+        SELECT v.audio_codec AS codec, COUNT(DISTINCT library_items.id)::int AS count
         FROM library_items
+        JOIN library_item_versions v
+          ON v.library_item_id = library_items.id AND v.removed_at IS NULL
         WHERE media_type = 'track'
-          AND audio_codec IS NOT NULL
+          AND v.audio_codec IS NOT NULL
+          AND library_items.removed_at IS NULL
           ${serverFilter}
           ${libraryFilter}
-        GROUP BY audio_codec
+        GROUP BY v.audio_codec
         ORDER BY count DESC
       `);
 

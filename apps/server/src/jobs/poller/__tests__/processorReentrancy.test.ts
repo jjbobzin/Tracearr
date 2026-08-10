@@ -19,6 +19,10 @@ vi.mock('../../../db/client.js', () => ({
   db: { select: (...args: unknown[]) => mockDbSelect(...args) },
 }));
 
+vi.mock('../../../services/leaderLease.js', () => ({
+  isLeader: () => true,
+}));
+
 vi.mock('../../../db/schema.js', async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>();
   return { ...actual };
@@ -26,6 +30,10 @@ vi.mock('../../../db/schema.js', async (importOriginal) => {
 
 vi.mock('../../../routes/settings.js', () => ({
   getGeoIPSettings: vi.fn().mockResolvedValue({ usePlexGeoip: false }),
+}));
+
+vi.mock('../../../services/settings.js', () => ({
+  getWatchedThreshold: vi.fn().mockResolvedValue(0.85),
 }));
 
 vi.mock('../../../serverState.js', () => ({
@@ -57,8 +65,10 @@ vi.mock('../../notificationQueue.js', () => ({
 }));
 
 vi.mock('../database.js', () => ({
+  getCachedServers: () => mockDbSelect().from(),
   getActiveRulesV2: mockGetActiveRulesV2,
   batchGetIdentityServerUserIds: vi.fn().mockResolvedValue(new Map()),
+  batchGetLibraryItemIdentity: vi.fn().mockResolvedValue(new Map()),
   batchGetRecentUserSessions: vi.fn().mockResolvedValue(new Map()),
   widenRecentSessionsForMergedIdentities: vi.fn(),
 }));

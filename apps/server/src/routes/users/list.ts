@@ -31,7 +31,7 @@ import {
   buildMultiServerCondition,
   buildMultiServerFragment,
 } from '../../utils/serverFiltering.js';
-import { updateUser, recalculateAggregateTrustScore } from '../../services/userService.js';
+import { updateUser, recomputeIdentityAggregates } from '../../services/userService.js';
 import { representativeAccountOrderSql } from '../../utils/representativeAccount.js';
 import { PLAY_COUNT } from '../../constants/index.js';
 
@@ -155,7 +155,6 @@ export const listRoutes: FastifyPluginAsync = async (app) => {
         thumbUrl: serverUsers.thumbUrl,
         isServerAdmin: serverUsers.isServerAdmin,
         trustScore: serverUsers.trustScore,
-        sessionCount: serverUsers.sessionCount,
         joinedAt: serverUsers.joinedAt,
         lastActivityAt: serverUsers.lastActivityAt,
         removedAt: serverUsers.removedAt,
@@ -275,7 +274,6 @@ export const listRoutes: FastifyPluginAsync = async (app) => {
         thumbUrl: serverUsers.thumbUrl,
         isServerAdmin: serverUsers.isServerAdmin,
         trustScore: serverUsers.trustScore,
-        sessionCount: serverUsers.sessionCount,
         joinedAt: serverUsers.joinedAt,
         lastActivityAt: serverUsers.lastActivityAt,
         removedAt: serverUsers.removedAt,
@@ -388,7 +386,6 @@ export const listRoutes: FastifyPluginAsync = async (app) => {
           thumbUrl: serverUsers.thumbUrl,
           isServerAdmin: serverUsers.isServerAdmin,
           trustScore: serverUsers.trustScore,
-          sessionCount: serverUsers.sessionCount,
           joinedAt: serverUsers.joinedAt,
           lastActivityAt: serverUsers.lastActivityAt,
           updatedAt: serverUsers.updatedAt,
@@ -396,7 +393,7 @@ export const listRoutes: FastifyPluginAsync = async (app) => {
 
       const row = updated[0];
       if (row && updateData.trustScore !== undefined) {
-        await recalculateAggregateTrustScore(row.userId, tx);
+        await recomputeIdentityAggregates(row.userId, tx);
       }
       return row;
     });
@@ -569,7 +566,7 @@ export const listRoutes: FastifyPluginAsync = async (app) => {
         .where(inArray(serverUsers.id, accountIds));
 
       for (const userId of affectedIdentityIds) {
-        await recalculateAggregateTrustScore(userId, tx);
+        await recomputeIdentityAggregates(userId, tx);
       }
     });
 

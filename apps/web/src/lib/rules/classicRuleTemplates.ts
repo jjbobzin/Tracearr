@@ -25,23 +25,23 @@ export interface ClassicRuleTemplate {
 }
 
 /**
- * Create a condition group with optional is_local_network filter
+ * Build the groups array for a template. Groups AND together while conditions
+ * inside a group OR, so the is_local_network filter must be its own group;
+ * inside the main group it would satisfy the rule for every remote session.
  */
-function createConditionGroup(
+function buildConditionGroups(
   mainCondition: Condition,
   excludePrivateIps: boolean
-): ConditionGroup {
-  const conditions: Condition[] = [mainCondition];
+): ConditionGroup[] {
+  const groups: ConditionGroup[] = [{ conditions: [mainCondition] }];
 
   if (excludePrivateIps) {
-    conditions.push({
-      field: 'is_local_network',
-      operator: 'eq',
-      value: false,
+    groups.push({
+      conditions: [{ field: 'is_local_network', operator: 'eq', value: false }],
     });
   }
 
-  return { conditions };
+  return groups;
 }
 
 /**
@@ -68,17 +68,15 @@ export function createImpossibleTravelTemplate(
     defaultName: 'Impossible Travel Detection',
     severity: 'warning',
     conditions: {
-      groups: [
-        createConditionGroup(
-          {
-            field: 'travel_speed_kmh',
-            operator: 'gt',
-            value: maxSpeedKmh,
-            params: { exclude_same_device: true },
-          },
-          excludePrivateIps
-        ),
-      ],
+      groups: buildConditionGroups(
+        {
+          field: 'travel_speed_kmh',
+          operator: 'gt',
+          value: maxSpeedKmh,
+          params: { exclude_same_device: true },
+        },
+        excludePrivateIps
+      ),
     },
     actions: DEFAULT_ACTIONS,
   };
@@ -101,17 +99,15 @@ export function createSimultaneousLocationsTemplate(
     defaultName: 'Simultaneous Location Detection',
     severity: 'warning',
     conditions: {
-      groups: [
-        createConditionGroup(
-          {
-            field: 'active_session_distance_km',
-            operator: 'gte',
-            value: minDistanceKm,
-            params: { exclude_same_device: true },
-          },
-          excludePrivateIps
-        ),
-      ],
+      groups: buildConditionGroups(
+        {
+          field: 'active_session_distance_km',
+          operator: 'gte',
+          value: minDistanceKm,
+          params: { exclude_same_device: true },
+        },
+        excludePrivateIps
+      ),
     },
     actions: DEFAULT_ACTIONS,
   };
@@ -132,17 +128,15 @@ export function createDeviceVelocityTemplate(
     defaultName: 'Device Velocity Detection',
     severity: 'warning',
     conditions: {
-      groups: [
-        createConditionGroup(
-          {
-            field: 'unique_ips_in_window',
-            operator: 'gt',
-            value: maxIps,
-            params: { window_hours: windowHours },
-          },
-          excludePrivateIps
-        ),
-      ],
+      groups: buildConditionGroups(
+        {
+          field: 'unique_ips_in_window',
+          operator: 'gt',
+          value: maxIps,
+          params: { window_hours: windowHours },
+        },
+        excludePrivateIps
+      ),
     },
     actions: DEFAULT_ACTIONS,
   };
@@ -165,17 +159,15 @@ export function createConcurrentStreamsTemplate(
     defaultName: 'Concurrent Stream Limit',
     severity: 'warning',
     conditions: {
-      groups: [
-        createConditionGroup(
-          {
-            field: 'concurrent_streams',
-            operator: 'gt',
-            value: maxStreams,
-            params: { exclude_same_device: true },
-          },
-          excludePrivateIps
-        ),
-      ],
+      groups: buildConditionGroups(
+        {
+          field: 'concurrent_streams',
+          operator: 'gt',
+          value: maxStreams,
+          params: { exclude_same_device: true },
+        },
+        excludePrivateIps
+      ),
     },
     actions: DEFAULT_ACTIONS,
   };
@@ -207,13 +199,10 @@ export function createGeoRestrictionTemplate(
     severity: 'warning',
     conditions: {
       groups: [
-        {
-          conditions: [
-            { field: 'country', operator, value: countries },
-            // Always exclude local network - matches V1 behavior where local IPs are never blocked
-            { field: 'is_local_network', operator: 'eq', value: false },
-          ],
-        },
+        { conditions: [{ field: 'country', operator, value: countries }] },
+        // Own group so it ANDs with the country check - matches V1, where
+        // local IPs are never blocked
+        { conditions: [{ field: 'is_local_network', operator: 'eq', value: false }] },
       ],
     },
     actions: DEFAULT_ACTIONS,

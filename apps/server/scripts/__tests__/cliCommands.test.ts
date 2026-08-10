@@ -73,6 +73,23 @@ describe('admin cli commands', () => {
       ).rejects.toThrow(/no user named/i);
     });
 
+    it('finds legacy mixed-case usernames regardless of input case', async () => {
+      const owner = await createTestUser({ role: 'owner', username: 'owner', passwordHash: null });
+      await db.update(users).set({ username: 'Gallapagos' }).where(eq(users.id, owner.id));
+
+      await resetPasswordCommand({ username: 'gallapagos', password: 'lowerInput123' });
+      const [account] = await db
+        .select()
+        .from(authAccounts)
+        .where(and(eq(authAccounts.userId, owner.id), eq(authAccounts.providerId, 'credential')));
+      expect(await verifyPassword('lowerInput123', account!.password!)).toBe(true);
+
+      await resetPasswordCommand({ username: 'Gallapagos', password: 'exactInput123' });
+      await setEmailCommand({ username: 'GALLAPAGOS', newEmail: 'legacy@example.com' });
+      const [row] = await db.select().from(users).where(eq(users.id, owner.id));
+      expect(row?.email).toBe('legacy@example.com');
+    });
+
     it('invalidates existing Better Auth sessions on reset', async () => {
       const owner = await createTestUser({ role: 'owner', username: 'owner', passwordHash: null });
       const token = 'test-session-token-123';

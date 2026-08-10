@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { serverScopeFromIds, serverScopeKey } from '@tracearr/shared';
 import type {
   ViolationWithDetails,
   PaginatedResponse,
@@ -27,7 +28,7 @@ interface ViolationsParams {
 
 export function useViolations(params: ViolationsParams = {}) {
   const { enabled = true, ...listParams } = params;
-  const serverIdsKey = params.serverIds?.length ? [...params.serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(params.serverIds));
   const userIdsKey = params.userIds?.length ? [...params.userIds].sort().join(',') : 'none';
   return useQuery({
     queryKey: [

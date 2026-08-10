@@ -5,16 +5,24 @@
 import type { FastifyPluginAsync } from 'fastify';
 import multipart from '@fastify/multipart';
 import { eq } from 'drizzle-orm';
-import { tautulliImportSchema, jellystatImportBodySchema } from '@tracearr/shared';
+import {
+  tautulliImportSchema,
+  jellystatImportBodySchema,
+  playbackReportingImportSchema,
+  playbackReportingTestSchema,
+} from '@tracearr/shared';
 import { TautulliService } from '../services/tautulli.js';
 import { importJellystatBackup } from '../services/jellystat.js';
+import { importPlaybackReporting } from '../services/playbackReporting.js';
 import { getPubSubService } from '../services/cache.js';
 import { syncServer } from '../services/sync.js';
+import { JellyfinClient, EmbyClient } from '../services/mediaServer/index.js';
 import { db } from '../db/client.js';
 import { servers } from '../db/schema.js';
 import {
   enqueueImport,
   enqueueJellystatImport,
+  enqueuePlaybackReportingImport,
   getImportStatus,
   getJellystatImportStatus,
   cancelImport,
@@ -22,6 +30,7 @@ import {
   getImportQueueStats,
   getActiveImportForServer,
   getActiveJellystatImportForServer,
+  getActivePlaybackReportingImportForServer,
 } from '../jobs/importQueue.js';
 
 export const importRoutes: FastifyPluginAsync = async (app) => {
@@ -436,6 +445,219 @@ export const importRoutes: FastifyPluginAsync = async (app) => {
 
       const { jobId } = request.params;
       const cancelled = await cancelJellystatImport(jobId);
+
+      if (!cancelled) {
+        return reply.badRequest('Cannot cancel job (may be active or not found)');
+      }
+
+      return { status: 'cancelled', jobId };
+    }
+  );
+
+  // ==========================================================================
+  // Playback Reporting Import Routes (for Jellyfin/Emby servers)
+  // ==========================================================================
+
+  /**
+   * POST /import/playback-reporting - Start Playback Reporting import (enqueues job)
+   */
+  app.post('/playback-reporting', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const authUser = request.user;
+
+    if (authUser.role !== 'owner') {
+      return reply.forbidden('Only server owners can import data');
+    }
+
+    const parsed = playbackReportingImportSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.badRequest('Invalid request body');
+    }
+
+    const { serverId, timezone, enrichMedia, importFullRange } = parsed.data;
+
+    const [server] = await db.select().from(servers).where(eq(servers.id, serverId)).limit(1);
+    if (!server) {
+      return reply.notFound('Server not found');
+    }
+    if (server.type !== 'jellyfin' && server.type !== 'emby') {
+      return reply.badRequest('Playback Reporting import only supports Jellyfin/Emby servers');
+    }
+
+    try {
+      app.log.info({ serverId }, 'Syncing server before Playback Reporting import');
+      await syncServer(serverId, { syncUsers: true, syncLibraries: false });
+      app.log.info({ serverId }, 'Server sync completed, enqueueing import');
+    } catch (error) {
+      app.log.error({ err: error, serverId }, 'Failed to sync server before import');
+      return reply.internalServerError('Failed to sync server users before import');
+    }
+
+    try {
+      const jobId = await enqueuePlaybackReportingImport(
+        serverId,
+        authUser.userId,
+        timezone,
+        enrichMedia,
+        importFullRange
+      );
+
+      return {
+        status: 'queued',
+        jobId,
+        message:
+          'Import queued. Use jobId to track progress via WebSocket or GET /import/playback-reporting/:jobId',
+      };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('already in progress')) {
+        return reply.conflict(error.message);
+      }
+
+      // Fallback to direct execution if queue is not available
+      app.log.warn({ err: error }, 'Import queue unavailable, falling back to direct execution');
+
+      const pubSubService = getPubSubService();
+
+      importPlaybackReporting(
+        serverId,
+        { timezone, enrichMedia, importFullRange },
+        pubSubService ?? undefined
+      )
+        .then((result) => {
+          console.log(`[Import] Playback Reporting import completed:`, result);
+        })
+        .catch((err: unknown) => {
+          console.error(`[Import] Playback Reporting import failed:`, err);
+        });
+
+      return {
+        status: 'started',
+        message: 'Import started (direct execution). Watch for progress updates via WebSocket.',
+      };
+    }
+  });
+
+  /**
+   * POST /import/playback-reporting/test - Check Playback Reporting plugin availability
+   */
+  app.post(
+    '/playback-reporting/test',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      const authUser = request.user;
+
+      if (authUser.role !== 'owner') {
+        return reply.forbidden('Only server owners can test the Playback Reporting connection');
+      }
+
+      const parsed = playbackReportingTestSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.badRequest('Invalid request body: serverId is required');
+      }
+
+      const [server] = await db
+        .select()
+        .from(servers)
+        .where(eq(servers.id, parsed.data.serverId))
+        .limit(1);
+      if (!server) {
+        return reply.notFound('Server not found');
+      }
+      if (server.type !== 'jellyfin' && server.type !== 'emby') {
+        return reply.badRequest('Playback Reporting import only supports Jellyfin/Emby servers');
+      }
+
+      const clientConfig = {
+        url: server.url,
+        token: server.token,
+        id: server.id,
+        name: server.name,
+      };
+      const client: JellyfinClient | EmbyClient =
+        server.type === 'emby' ? new EmbyClient(clientConfig) : new JellyfinClient(clientConfig);
+
+      try {
+        const info = await client.getPlaybackReportingInfo();
+        if (!info.installed) {
+          return {
+            success: true,
+            installed: false,
+            message: 'Playback Reporting plugin is not installed on this server',
+          };
+        }
+
+        return {
+          success: true,
+          installed: true,
+          message: 'Playback Reporting plugin detected',
+          records: info.totalRecords,
+          oldestDate: info.oldestDate,
+          newestDate: info.newestDate,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          installed: false,
+          message: error instanceof Error ? error.message : 'Connection failed',
+        };
+      }
+    }
+  );
+
+  /**
+   * GET /import/playback-reporting/active/:serverId - Get active Playback Reporting import for a server
+   */
+  app.get<{ Params: { serverId: string } }>(
+    '/playback-reporting/active/:serverId',
+    { preHandler: [app.authenticate] },
+    async (request, _reply) => {
+      const { serverId } = request.params;
+
+      const jobId = await getActivePlaybackReportingImportForServer(serverId);
+      if (!jobId) {
+        return { active: false };
+      }
+
+      const status = await getImportStatus(jobId);
+      if (!status) {
+        return { active: false };
+      }
+
+      return { active: true, ...status };
+    }
+  );
+
+  /**
+   * GET /import/playback-reporting/:jobId - Get Playback Reporting import job status
+   */
+  app.get<{ Params: { jobId: string } }>(
+    '/playback-reporting/:jobId',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      const { jobId } = request.params;
+
+      const status = await getImportStatus(jobId);
+      if (!status) {
+        return reply.notFound('Import job not found');
+      }
+
+      return status;
+    }
+  );
+
+  /**
+   * DELETE /import/playback-reporting/:jobId - Cancel Playback Reporting import job
+   */
+  app.delete<{ Params: { jobId: string } }>(
+    '/playback-reporting/:jobId',
+    { preHandler: [app.authenticate] },
+    async (request, reply) => {
+      const authUser = request.user;
+      if (authUser.role !== 'owner') {
+        return reply.forbidden('Only server owners can cancel imports');
+      }
+
+      const { jobId } = request.params;
+      const cancelled = await cancelImport(jobId);
 
       if (!cancelled) {
         return reply.badRequest('Cannot cancel job (may be active or not found)');

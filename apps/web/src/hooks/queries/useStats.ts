@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
+import { serverScopeFromIds, serverScopeKey } from '@tracearr/shared';
 import type { MediaType, DeviceCompatibilityMatrix } from '@tracearr/shared';
 import { api, type StatsTimeRange, getBrowserTimezone } from '@/lib/api';
 
@@ -8,7 +9,7 @@ export type { StatsTimeRange };
 export function useDashboardStats(serverIds: string[]) {
   // Include timezone in cache key since "today" varies by timezone
   const timezone = getBrowserTimezone();
-  const serverIdsKey = serverIds.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'dashboard', serverIdsKey, timezone],
     queryFn: () => api.stats.dashboard(serverIds.length ? serverIds : undefined),
@@ -20,7 +21,7 @@ export function useDashboardStats(serverIds: string[]) {
 export function usePlaysStats(timeRange?: StatsTimeRange, serverIds?: string[]) {
   // Include timezone in cache key since plays are grouped by local day
   const timezone = getBrowserTimezone();
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'plays', timeRange, serverIdsKey, timezone],
     queryFn: () => api.stats.plays(timeRange ?? { period: 'week' }, serverIds),
@@ -45,7 +46,7 @@ export interface LocationStatsFilters {
 }
 
 export function useLocationStats(filters?: LocationStatsFilters) {
-  const serverIdsKey = filters?.serverIds?.length ? [...filters.serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(filters?.serverIds));
   const serverUserIdsKey = filters?.serverUserIds?.length
     ? [...filters.serverUserIds].sort().join(',')
     : undefined;
@@ -67,7 +68,7 @@ export function useLocationStats(filters?: LocationStatsFilters) {
 export function usePlaysByDayOfWeek(timeRange?: StatsTimeRange, serverIds?: string[]) {
   // Include timezone in cache key since day-of-week varies by timezone
   const timezone = getBrowserTimezone();
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'plays-by-dayofweek', timeRange, serverIdsKey, timezone],
     queryFn: () => api.stats.playsByDayOfWeek(timeRange ?? { period: 'month' }, serverIds),
@@ -78,7 +79,7 @@ export function usePlaysByDayOfWeek(timeRange?: StatsTimeRange, serverIds?: stri
 export function usePlaysByHourOfDay(timeRange?: StatsTimeRange, serverIds?: string[]) {
   // Include timezone in cache key since hour-of-day varies by timezone
   const timezone = getBrowserTimezone();
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'plays-by-hourofday', timeRange, serverIdsKey, timezone],
     queryFn: () => api.stats.playsByHourOfDay(timeRange ?? { period: 'month' }, serverIds),
@@ -87,7 +88,7 @@ export function usePlaysByHourOfDay(timeRange?: StatsTimeRange, serverIds?: stri
 }
 
 export function usePlatformStats(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'platforms', timeRange, serverIdsKey],
     queryFn: () => api.stats.platforms(timeRange ?? { period: 'month' }, serverIds),
@@ -96,7 +97,7 @@ export function usePlatformStats(timeRange?: StatsTimeRange, serverIds?: string[
 }
 
 export function useQualityStats(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'quality', timeRange, serverIdsKey],
     queryFn: () => api.stats.quality(timeRange ?? { period: 'month' }, serverIds),
@@ -105,7 +106,7 @@ export function useQualityStats(timeRange?: StatsTimeRange, serverIds?: string[]
 }
 
 export function useTopUsers(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'top-users', timeRange, serverIdsKey],
     queryFn: () => api.stats.topUsers(timeRange ?? { period: 'month' }, serverIds),
@@ -114,7 +115,7 @@ export function useTopUsers(timeRange?: StatsTimeRange, serverIds?: string[]) {
 }
 
 export function useTopContent(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'top-content', timeRange, serverIdsKey],
     queryFn: () => api.stats.topContent(timeRange ?? { period: 'month' }, serverIds),
@@ -123,7 +124,7 @@ export function useTopContent(timeRange?: StatsTimeRange, serverIds?: string[]) 
 }
 
 export function useConcurrentStats(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'concurrent', timeRange, serverIdsKey],
     queryFn: () => api.stats.concurrent(timeRange ?? { period: 'month' }, serverIds),
@@ -141,7 +142,7 @@ export function useEngagementStats(
   serverIds?: string[],
   options?: EngagementStatsOptions
 ) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'engagement', timeRange, serverIdsKey, options],
     queryFn: () => api.stats.engagement(timeRange ?? { period: 'week' }, serverIds, options),
@@ -159,7 +160,7 @@ export function useShowStats(
   serverIds?: string[],
   options?: ShowStatsOptions
 ) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'shows', timeRange, serverIdsKey, options],
     queryFn: () => api.stats.shows(timeRange ?? { period: 'month' }, serverIds, options),
@@ -173,7 +174,7 @@ export function useDeviceCompatibility(
   serverIds?: string[],
   minSessions = 5
 ) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'device-compatibility', timeRange, serverIdsKey, minSessions],
     queryFn: () =>
@@ -203,7 +204,7 @@ export function useDeviceCompatibilityMatrix(
   timeRange?: StatsTimeRange,
   minSessions = 5
 ): DeviceMatrixFanOut {
-  const serverIdsKey = serverIds.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   const query = useQuery({
     queryKey: ['stats', 'device-compatibility-matrix', serverIdsKey, timeRange, minSessions],
     queryFn: () =>
@@ -237,7 +238,7 @@ export function useDeviceCompatibilityMatrix(
 }
 
 export function useDeviceHealth(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'device-health', timeRange, serverIdsKey],
     queryFn: () => api.stats.deviceHealth(timeRange ?? { period: 'month' }, serverIds),
@@ -246,7 +247,7 @@ export function useDeviceHealth(timeRange?: StatsTimeRange, serverIds?: string[]
 }
 
 export function useTranscodeHotspots(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'transcode-hotspots', timeRange, serverIdsKey],
     queryFn: () => api.stats.transcodeHotspots(timeRange ?? { period: 'month' }, serverIds),
@@ -255,7 +256,7 @@ export function useTranscodeHotspots(timeRange?: StatsTimeRange, serverIds?: str
 }
 
 export function useTopTranscodingUsers(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'top-transcoding-users', timeRange, serverIdsKey],
     queryFn: () => api.stats.topTranscodingUsers(timeRange ?? { period: 'month' }, serverIds),
@@ -271,7 +272,7 @@ export function useBandwidthDaily(
 ) {
   // Include timezone in cache key since bandwidth is grouped by local day
   const timezone = getBrowserTimezone();
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'bandwidth-daily', timeRange, serverIdsKey, serverUserId, timezone],
     queryFn: () =>
@@ -281,7 +282,7 @@ export function useBandwidthDaily(
 }
 
 export function useBandwidthTopUsers(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'bandwidth-top-users', timeRange, serverIdsKey],
     queryFn: () => api.stats.bandwidthTopUsers(timeRange ?? { period: 'month' }, serverIds),
@@ -290,7 +291,7 @@ export function useBandwidthTopUsers(timeRange?: StatsTimeRange, serverIds?: str
 }
 
 export function useBandwidthSummary(timeRange?: StatsTimeRange, serverIds?: string[]) {
-  const serverIdsKey = serverIds?.length ? [...serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['stats', 'bandwidth-summary', timeRange, serverIdsKey],
     queryFn: () => api.stats.bandwidthSummary(timeRange ?? { period: 'month' }, serverIds),

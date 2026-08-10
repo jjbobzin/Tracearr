@@ -1,13 +1,19 @@
 /**
  * Library Duplicates Route
  *
- * GET /duplicates - Cross-server duplicate detection with multi-ID matching hierarchy
+ * GET /duplicates - a duplicate is a title with two or more DISTINCT
+ * physical files (distinct byte size, the same mirror heuristic the storage
+ * totals use). Mirror-only groups never ship, which keeps mirrored
+ * multi-server deployments from drowning real duplicates in zero-savings
+ * noise; the single-server case matches Plex's own Duplicates filter.
  *
- * Matching hierarchy (confidence scores):
- * 1. IMDB ID match: 100%
- * 2. TMDB ID match: 95% (items without IMDB)
- * 3. TVDB ID match: 90% (items without IMDB/TMDB)
- * 4. Fuzzy title match: 60-100% (items without any external IDs)
+ * Matching hierarchy: imdb 100 > tmdb 95 > tvdb 90 > fuzzy 60-100;
+ * single-item groups present as 'version' at 100. Reclaimable = deduped
+ * total minus the best-quality file.
+ *
+ * Grouping, the gate, and the summary run in one SQL statement and the route
+ * hydrates one page only - building every group in Node exceeded postgres's
+ * 65535 bind-parameter cap on large mirrored installs.
  */
 
 import type { FastifyPluginAsync } from 'fastify';
@@ -17,6 +23,12 @@ import {
   CACHE_TTL,
   libraryDuplicatesQuerySchema,
   type LibraryDuplicatesQueryInput,
+  type MatchType,
+  type DuplicateItem,
+  type DuplicateItemVersion,
+  type DuplicateGroup,
+  type DuplicatesSummary,
+  type DuplicatesResponse,
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
 import {
@@ -24,68 +36,28 @@ import {
   resolveServerIds,
   buildMultiServerFragment,
 } from '../../utils/serverFiltering.js';
+import { resolutionRankSql } from '../../utils/resolutionBuckets.js';
 import { buildLibraryCacheKey } from './utils.js';
 
-/** Match type for duplicate groups */
-type MatchType = 'imdb' | 'tmdb' | 'tvdb' | 'fuzzy';
-
-/** Individual item in a duplicate group */
-interface DuplicateItem {
-  id: string;
-  serverId: string;
-  serverName: string;
-  title: string;
-  year: number | null;
-  mediaType: string;
-  fileSize: number | null;
-  resolution: string | null;
-}
-
-/** Group of duplicate items across servers */
-interface DuplicateGroup {
-  matchKey: string;
-  matchType: MatchType;
-  confidence: number;
-  serverCount: number;
-  items: DuplicateItem[];
-  totalStorageBytes: number;
-  potentialSavingsBytes: number;
-}
-
-/** Summary statistics for duplicate detection */
-interface DuplicatesSummary {
-  totalGroups: number;
-  totalDuplicateItems: number;
-  totalPotentialSavingsBytes: number;
-  byMatchType: { imdb: number; tmdb: number; tvdb: number; fuzzy: number };
-}
-
-/** Full response for duplicates endpoint */
-interface DuplicatesResponse {
-  duplicates: DuplicateGroup[];
-  summary: DuplicatesSummary;
-  pagination: { page: number; pageSize: number; total: number };
-}
-
-/** Raw match row from database */
-interface RawMatchRow {
-  match_key: string;
+/** One group row from the paginated group query, window summary included */
+interface RawGroupRow {
+  group_key: string;
   match_type: MatchType;
   confidence: number;
-  server_ids: string[];
   item_ids: string[];
+  item_count: number;
   server_count: number;
-}
-
-/** Raw fuzzy match row from database */
-interface RawFuzzyRow {
-  item_a_id: string;
-  item_b_id: string;
-  server_a_id: string;
-  server_b_id: string;
-  title_a: string;
-  title_b: string;
-  confidence: number;
+  unique_file_count: number;
+  total_bytes: string;
+  savings_bytes: string;
+  total_groups: number;
+  total_duplicate_items: number;
+  total_savings_bytes: string;
+  imdb_groups: number;
+  tmdb_groups: number;
+  tvdb_groups: number;
+  fuzzy_groups: number;
+  version_groups: number;
 }
 
 /** Raw item details row */
@@ -93,6 +65,8 @@ interface ItemDetailsRow {
   id: string;
   server_id: string;
   server_name: string;
+  library_id: string | null;
+  library_name: string | null;
   title: string;
   year: number | null;
   media_type: string;
@@ -100,13 +74,45 @@ interface ItemDetailsRow {
   video_resolution: string | null;
 }
 
+interface VersionRow {
+  library_item_id: string;
+  video_resolution: string | null;
+  video_codec: string | null;
+  file_size: string | null;
+  file_path: string | null;
+}
+
+interface GroupFile {
+  itemId: string;
+  fileSize: number | null;
+}
+
+/**
+ * Mirror flags over every physical file in a group, parallel to the input:
+ * true where a file repeats a byte size already counted. The group's storage
+ * math (distinct count, total, reclaimable) comes from the SQL group query so
+ * page rows always agree with the gate and the summary; this only marks which
+ * listings are repeats for display.
+ */
+function computeMirrorFlags(files: GroupFile[]): boolean[] {
+  const seenSizes = new Set<number>();
+  const mirrorFlags: boolean[] = [];
+  for (const file of files) {
+    if (file.fileSize === null) {
+      mirrorFlags.push(false);
+      continue;
+    }
+    if (seenSizes.has(file.fileSize)) {
+      mirrorFlags.push(true);
+      continue;
+    }
+    seenSizes.add(file.fileSize);
+    mirrorFlags.push(false);
+  }
+  return mirrorFlags;
+}
+
 export const libraryDuplicatesRoute: FastifyPluginAsync = async (app) => {
-  /**
-   * GET /duplicates - Cross-server duplicate detection
-   *
-   * Returns groups of duplicate content detected across servers using
-   * multi-ID matching hierarchy: IMDB (100%) -> TMDB (95%) -> TVDB (90%) -> fuzzy.
-   */
   app.get<{ Querystring: LibraryDuplicatesQueryInput }>(
     '/duplicates',
     { preHandler: [app.authenticate] },
@@ -137,11 +143,14 @@ export const libraryDuplicatesRoute: FastifyPluginAsync = async (app) => {
 
       const resolvedIds = resolveServerIds(authUser, undefined, rawServerIds);
 
-      // Build cache key with all varying params
+      // Build cache key with all varying params. serverId here is an involvement
+      // filter, not the scope filter, so it must be a separate segment from
+      // resolvedIds or two differently-scoped users requesting the same
+      // involvement filter would collide.
       const serverCacheSegment = resolvedIds ? resolvedIds.slice().sort().join(',') : 'all';
       const cacheKey = buildLibraryCacheKey(
         REDIS_KEYS.LIBRARY_DUPLICATES,
-        serverId ?? serverCacheSegment,
+        `${serverCacheSegment}:${serverId ?? 'any'}`,
         `${mediaType ?? 'all'}-${minConfidence}-${includeFuzzy}-${page}-${pageSize}`
       );
 
@@ -157,137 +166,180 @@ export const libraryDuplicatesRoute: FastifyPluginAsync = async (app) => {
 
       // resolvedIds already intersects user access with any requested serverIds
       const serverFilterSql = buildMultiServerFragment(resolvedIds);
-
-      // Optional media type filter
       const mediaTypeFilter = mediaType ? sql`AND media_type = ${mediaType}` : sql``;
 
-      // Optional server involvement filter (show duplicates involving this server)
-      // This is applied after grouping to find groups where at least one item is on the server
-      const serverInvolvementFilter = serverId
-        ? sql`HAVING ${serverId} = ANY(array_agg(DISTINCT server_id))`
-        : sql`HAVING COUNT(DISTINCT server_id) > 1`;
+      const fuzzyEnabled = includeFuzzy && minConfidence <= 70;
 
-      // Query for ID-based matches using CTEs with cascading exclusion
-      const idMatchesResult = await db.execute(sql`
-        WITH imdb_matches AS (
-          SELECT
-            imdb_id AS match_key,
-            'imdb'::text AS match_type,
-            100 AS confidence,
-            array_agg(DISTINCT server_id) AS server_ids,
-            array_agg(id ORDER BY server_id) AS item_ids,
-            COUNT(DISTINCT server_id) AS server_count
-          FROM library_items
-          WHERE imdb_id IS NOT NULL
-            ${serverFilterSql}
-            ${mediaTypeFilter}
-          GROUP BY imdb_id
-          ${serverInvolvementFilter}
-        ),
-        tmdb_matches AS (
-          SELECT
-            tmdb_id::text AS match_key,
-            'tmdb'::text AS match_type,
-            95 AS confidence,
-            array_agg(DISTINCT server_id) AS server_ids,
-            array_agg(id ORDER BY server_id) AS item_ids,
-            COUNT(DISTINCT server_id) AS server_count
-          FROM library_items
-          WHERE tmdb_id IS NOT NULL
-            AND imdb_id IS NULL  -- Only items not already matched by IMDB
-            ${serverFilterSql}
-            ${mediaTypeFilter}
-          GROUP BY tmdb_id
-          ${serverInvolvementFilter}
-        ),
-        tvdb_matches AS (
-          SELECT
-            tvdb_id::text AS match_key,
-            'tvdb'::text AS match_type,
-            90 AS confidence,
-            array_agg(DISTINCT server_id) AS server_ids,
-            array_agg(id ORDER BY server_id) AS item_ids,
-            COUNT(DISTINCT server_id) AS server_count
-          FROM library_items
-          WHERE tvdb_id IS NOT NULL
-            AND imdb_id IS NULL
-            AND tmdb_id IS NULL
-            ${serverFilterSql}
-            ${mediaTypeFilter}
-          GROUP BY tvdb_id
-          ${serverInvolvementFilter}
-        ),
-        all_matches AS (
-          SELECT * FROM imdb_matches
-          UNION ALL
-          SELECT * FROM tmdb_matches
-          UNION ALL
-          SELECT * FROM tvdb_matches
-        )
-        SELECT * FROM all_matches
-        WHERE confidence >= ${minConfidence}
-        ORDER BY confidence DESC, match_type
-      `);
-
-      const idMatches = idMatchesResult.rows as unknown as RawMatchRow[];
-
-      // Fuzzy matching query (only if includeFuzzy=true)
-      let fuzzyMatches: RawFuzzyRow[] = [];
-      if (includeFuzzy && minConfidence <= 70) {
-        // Build server filter for fuzzy query (applied to both sides of the self-join)
-        const fuzzyServerFilterA = buildMultiServerFragment(resolvedIds, 'a.server_id');
-        const fuzzyServerFilterB = buildMultiServerFragment(resolvedIds, 'b.server_id');
-
-        // Fuzzy match for items without external IDs
-        const fuzzyResult = await db.execute(sql`
-          SELECT
-            a.id AS item_a_id,
-            b.id AS item_b_id,
-            a.server_id AS server_a_id,
-            b.server_id AS server_b_id,
-            a.title AS title_a,
-            b.title AS title_b,
-            ROUND(similarity(a.title, b.title) * 100)::int AS confidence
-          FROM library_items a
-          JOIN library_items b ON a.id < b.id  -- Avoid duplicate pairs
-          WHERE a.server_id != b.server_id  -- Different servers only
-            AND a.media_type = b.media_type  -- Same media type
-            AND a.year = b.year  -- Same year (reduces false positives)
-            AND similarity(a.title, b.title) >= 0.6  -- 60% threshold
-            AND a.imdb_id IS NULL AND a.tmdb_id IS NULL AND a.tvdb_id IS NULL
-            AND b.imdb_id IS NULL AND b.tmdb_id IS NULL AND b.tvdb_id IS NULL
-            ${fuzzyServerFilterA}
-            ${fuzzyServerFilterB}
-            ${mediaType ? sql`AND a.media_type = ${mediaType}` : sql``}
-          ORDER BY confidence DESC
-          LIMIT 100
+      /**
+       * One statement: membership -> per-group distinct-file math -> gate ->
+       * summary via window aggregates -> one ordered page. media_type is
+       * folded into the id key so a show and an episode sharing a TVDB id
+       * cannot collapse; fuzzy only feeds items with no external IDs.
+       */
+      const runGroupQuery = async (offset: number) => {
+        const result = await db.execute(sql`
+          WITH scoped AS (
+            SELECT id, server_id, media_type, title, year,
+                   imdb_id, tmdb_id, tvdb_id, file_size, video_resolution
+            FROM library_items
+            WHERE removed_at IS NULL
+              AND media_type != 'season'
+              ${serverFilterSql}
+              ${mediaTypeFilter}
+          ),
+          fuzzy_pairs AS (
+            ${
+              fuzzyEnabled
+                ? sql`
+            SELECT a.id AS item_a_id, b.id AS item_b_id, a.title AS title_a,
+                   ROUND(similarity(a.title, b.title) * 100)::int AS confidence
+            FROM scoped a
+            JOIN scoped b ON a.id < b.id
+              AND a.media_type = b.media_type
+              AND a.year = b.year
+            WHERE a.imdb_id IS NULL AND a.tmdb_id IS NULL AND a.tvdb_id IS NULL
+              AND b.imdb_id IS NULL AND b.tmdb_id IS NULL AND b.tvdb_id IS NULL
+              AND similarity(a.title, b.title) >= 0.6
+            ORDER BY confidence DESC
+            LIMIT 100`
+                : sql`
+            SELECT NULL::uuid AS item_a_id, NULL::uuid AS item_b_id,
+                   NULL::text AS title_a, NULL::int AS confidence
+            WHERE false`
+            }
+          ),
+          fuzzy_keys AS (
+            SELECT item_id, MIN(fuzzy_key) AS fuzzy_key, MAX(confidence) AS confidence
+            FROM (
+              SELECT item_a_id AS item_id,
+                     'fuzzy:' || lower(left(title_a, 50)) AS fuzzy_key, confidence
+              FROM fuzzy_pairs
+              UNION ALL
+              SELECT item_b_id, 'fuzzy:' || lower(left(title_a, 50)), confidence
+              FROM fuzzy_pairs
+            ) fp
+            GROUP BY item_id
+          ),
+          membership AS (
+            SELECT s.id, s.server_id, s.file_size, s.video_resolution,
+              CASE
+                WHEN s.imdb_id IS NOT NULL THEN 'imdb:' || s.media_type || ':' || s.imdb_id
+                WHEN s.tmdb_id IS NOT NULL THEN 'tmdb:' || s.media_type || ':' || s.tmdb_id::text
+                WHEN s.tvdb_id IS NOT NULL THEN 'tvdb:' || s.media_type || ':' || s.tvdb_id::text
+                WHEN fk.fuzzy_key IS NOT NULL THEN fk.fuzzy_key
+                ELSE 'version:' || s.id::text
+              END AS group_key,
+              CASE
+                WHEN s.imdb_id IS NOT NULL THEN 'imdb'
+                WHEN s.tmdb_id IS NOT NULL THEN 'tmdb'
+                WHEN s.tvdb_id IS NOT NULL THEN 'tvdb'
+                WHEN fk.fuzzy_key IS NOT NULL THEN 'fuzzy'
+                ELSE 'version'
+              END AS key_type,
+              fk.confidence AS fuzzy_confidence
+            FROM scoped s
+            LEFT JOIN fuzzy_keys fk ON fk.item_id = s.id
+          ),
+          files AS (
+            -- One row per (item, physical listing). Items with no version
+            -- rows fall back to their flat rollup columns; versions carrying
+            -- NULL sizes keep the NULL. Single-referenced so the planner
+            -- inlines it - no CTE fence, no stats cliff.
+            SELECT m.group_key, m.key_type, m.fuzzy_confidence, m.id, m.server_id,
+              CASE WHEN v.id IS NULL THEN m.file_size ELSE v.file_size END AS size,
+              ${resolutionRankSql(
+                'CASE WHEN v.id IS NULL THEN m.video_resolution ELSE v.video_resolution END'
+              )} AS res_rank
+            FROM membership m
+            LEFT JOIN library_item_versions v
+              ON v.library_item_id = m.id AND v.removed_at IS NULL
+          ),
+          groups AS (
+            -- One aggregation pass computes membership AND the mirror-deduped
+            -- storage math (SUM/COUNT DISTINCT size implement "equal byte
+            -- size = the same physical file"; repeats of a size never change
+            -- the best-file winner). Folding the math in here rather than
+            -- joining two aggregated CTEs matters: aggregate output sizes are
+            -- planner guesses, and the misestimated join nested-loops into
+            -- minutes at ~45k groups.
+            SELECT f.group_key,
+              MIN(f.key_type) AS key_type,
+              COUNT(DISTINCT f.id)::int AS item_count,
+              array_agg(DISTINCT f.id ORDER BY f.id) AS item_ids,
+              COUNT(DISTINCT f.server_id)::int AS server_count,
+              array_agg(DISTINCT f.server_id) AS server_ids,
+              MAX(f.fuzzy_confidence) AS fuzzy_confidence,
+              COUNT(DISTINCT f.size)::int AS unique_file_count,
+              SUM(DISTINCT f.size)::bigint AS total_bytes,
+              (array_agg(f.size ORDER BY f.res_rank DESC, f.size DESC)
+                FILTER (WHERE f.size IS NOT NULL))[1]::bigint AS best_size
+            FROM files f
+            GROUP BY f.group_key
+          ),
+          gated AS (
+            SELECT g.group_key,
+              CASE WHEN g.item_count = 1 THEN 'version' ELSE g.key_type END AS match_type,
+              CASE
+                WHEN g.item_count = 1 THEN 100
+                WHEN g.key_type = 'imdb' THEN 100
+                WHEN g.key_type = 'tmdb' THEN 95
+                WHEN g.key_type = 'tvdb' THEN 90
+                ELSE COALESCE(g.fuzzy_confidence, 70)
+              END AS confidence,
+              g.item_ids, g.item_count, g.server_count,
+              g.unique_file_count, g.total_bytes,
+              GREATEST(g.total_bytes - g.best_size, 0)::bigint AS savings_bytes
+            FROM groups g
+            WHERE g.unique_file_count >= 2
+              ${serverId ? sql`AND ${serverId} = ANY(g.server_ids)` : sql``}
+          ),
+          filtered AS (
+            SELECT * FROM gated WHERE confidence >= ${minConfidence}
+          )
+          SELECT group_key, match_type, confidence, item_ids, item_count,
+            server_count, unique_file_count,
+            total_bytes::text, savings_bytes::text,
+            COUNT(*) OVER ()::int AS total_groups,
+            SUM(item_count) OVER ()::int AS total_duplicate_items,
+            SUM(savings_bytes) OVER ()::text AS total_savings_bytes,
+            (COUNT(*) FILTER (WHERE match_type = 'imdb') OVER ())::int AS imdb_groups,
+            (COUNT(*) FILTER (WHERE match_type = 'tmdb') OVER ())::int AS tmdb_groups,
+            (COUNT(*) FILTER (WHERE match_type = 'tvdb') OVER ())::int AS tvdb_groups,
+            (COUNT(*) FILTER (WHERE match_type = 'fuzzy') OVER ())::int AS fuzzy_groups,
+            (COUNT(*) FILTER (WHERE match_type = 'version') OVER ())::int AS version_groups
+          FROM filtered
+          ORDER BY savings_bytes DESC, group_key
+          LIMIT ${pageSize} OFFSET ${offset}
         `);
-        fuzzyMatches = fuzzyResult.rows as unknown as RawFuzzyRow[];
+        return result.rows as unknown as RawGroupRow[];
+      };
+
+      let groupRows = await runGroupQuery((page - 1) * pageSize);
+      // A page past the end returns no rows and loses the window summary;
+      // refetch page 1 for the totals and serve an empty page honestly
+      if (groupRows.length === 0 && page > 1) {
+        const firstPage = await runGroupQuery(0);
+        groupRows = [];
+        const summarySource = firstPage[0];
+        const response = buildResponse([], summarySource, page, pageSize);
+        await app.redis.setex(cacheKey, CACHE_TTL.LIBRARY_DUPLICATES, JSON.stringify(response));
+        return response;
       }
 
-      // Collect all unique item IDs
-      const allItemIds = new Set<string>();
-      for (const match of idMatches) {
-        for (const id of match.item_ids) {
-          allItemIds.add(id);
-        }
-      }
-      for (const fuzzy of fuzzyMatches) {
-        allItemIds.add(fuzzy.item_a_id);
-        allItemIds.add(fuzzy.item_b_id);
-      }
-
-      // Fetch item details if we have any items
+      // Hydrate details for this page's items only
+      const pageItemIds = Array.from(new Set(groupRows.flatMap((row) => row.item_ids)));
       const itemDetailsMap = new Map<string, ItemDetailsRow>();
-      if (allItemIds.size > 0) {
-        const itemIdArray = Array.from(allItemIds);
-        const itemIdsSql = itemIdArray.map((id) => sql`${id}`);
+      const versionsByItem = new Map<string, DuplicateItemVersion[]>();
+      if (pageItemIds.length > 0) {
+        const idsArray = `{${pageItemIds.join(',')}}`;
 
         const itemsResult = await db.execute(sql`
           SELECT
             li.id,
             li.server_id,
             s.name AS server_name,
+            li.library_id,
+            l.name AS library_name,
             li.title,
             li.year,
             li.media_type,
@@ -295,150 +347,107 @@ export const libraryDuplicatesRoute: FastifyPluginAsync = async (app) => {
             li.video_resolution
           FROM library_items li
           JOIN servers s ON li.server_id = s.id
-          WHERE li.id IN (${sql.join(itemIdsSql, sql`, `)})
+          LEFT JOIN libraries l ON l.server_id = li.server_id AND l.library_id = li.library_id
+          WHERE li.id = ANY(${idsArray}::uuid[])
+            AND li.removed_at IS NULL
         `);
-
         for (const row of itemsResult.rows as unknown as ItemDetailsRow[]) {
           itemDetailsMap.set(row.id, row);
         }
-      }
 
-      // Build duplicate groups from ID matches
-      const duplicateGroups: DuplicateGroup[] = [];
-
-      for (const match of idMatches) {
-        const items: DuplicateItem[] = [];
-        let totalSize = 0;
-        let minSize = Infinity;
-
-        for (const itemId of match.item_ids) {
-          const details = itemDetailsMap.get(itemId);
-          if (details) {
-            const fileSize = details.file_size ? parseInt(details.file_size, 10) : null;
-            items.push({
-              id: details.id,
-              serverId: details.server_id,
-              serverName: details.server_name,
-              title: details.title,
-              year: details.year,
-              mediaType: details.media_type,
-              fileSize,
-              resolution: details.video_resolution,
-            });
-            if (fileSize !== null) {
-              totalSize += fileSize;
-              minSize = Math.min(minSize, fileSize);
-            }
-          }
-        }
-
-        if (items.length >= 2) {
-          duplicateGroups.push({
-            matchKey: match.match_key,
-            matchType: match.match_type,
-            confidence: match.confidence,
-            serverCount: match.server_count,
-            items,
-            totalStorageBytes: totalSize,
-            potentialSavingsBytes: minSize !== Infinity ? totalSize - minSize : 0,
+        // Sentinel rows count too: they carry the real file's size and path
+        // for items not yet re-scanned into observed versions
+        const versionsResult = await db.execute(sql`
+          SELECT
+            library_item_id,
+            video_resolution,
+            video_codec,
+            file_size::text AS file_size,
+            file_path
+          FROM library_item_versions
+          WHERE library_item_id = ANY(${idsArray}::uuid[])
+            AND removed_at IS NULL
+          ORDER BY file_size DESC NULLS LAST
+        `);
+        for (const row of versionsResult.rows as unknown as VersionRow[]) {
+          const list = versionsByItem.get(row.library_item_id) ?? [];
+          list.push({
+            resolution: row.video_resolution,
+            videoCodec: row.video_codec,
+            fileSize: row.file_size ? parseInt(row.file_size, 10) : null,
+            filePath: row.file_path,
           });
+          versionsByItem.set(row.library_item_id, list);
         }
       }
 
-      // Add fuzzy matches as duplicate groups
-      // Group fuzzy matches by combining item pairs into groups
-      const fuzzyGroupsMap = new Map<string, Set<string>>();
-      for (const fuzzy of fuzzyMatches) {
-        if (fuzzy.confidence >= minConfidence) {
-          // Use the lower-confidence item's ID as the group key for consistency
-          const groupKey = `fuzzy:${fuzzy.title_a.toLowerCase().substring(0, 50)}`;
-          if (!fuzzyGroupsMap.has(groupKey)) {
-            fuzzyGroupsMap.set(groupKey, new Set());
+      const toDuplicateItem = (details: ItemDetailsRow): DuplicateItem => ({
+        id: details.id,
+        serverId: details.server_id,
+        serverName: details.server_name,
+        libraryId: details.library_id,
+        libraryName: details.library_name,
+        title: details.title,
+        year: details.year,
+        mediaType: details.media_type,
+        fileSize: details.file_size ? parseInt(details.file_size, 10) : null,
+        resolution: details.video_resolution,
+        versions: versionsByItem.get(details.id) ?? [],
+      });
+
+      /** Every physical file across the group's items, for the mirror flags */
+      const groupFiles = (items: DuplicateItem[]): GroupFile[] =>
+        items.flatMap((item) =>
+          item.versions.length > 0
+            ? item.versions.map((v) => ({ itemId: item.id, fileSize: v.fileSize }))
+            : [{ itemId: item.id, fileSize: item.fileSize }]
+        );
+
+      const buildGroup = (row: RawGroupRow, items: DuplicateItem[]): DuplicateGroup => {
+        const mirrorFlags = computeMirrorFlags(groupFiles(items));
+
+        // Copy version lists while attaching mirror flags: versionsByItem
+        // arrays are shared across groups, so flags must never mutate them.
+        // groupFiles flattened in item order, one entry per version (or one
+        // fallback entry for version-less items), so the flags line up.
+        let fileIndex = 0;
+        const flaggedItems = items.map((item) => {
+          if (item.versions.length === 0) {
+            fileIndex += 1;
+            return item;
           }
-          fuzzyGroupsMap.get(groupKey)!.add(fuzzy.item_a_id);
-          fuzzyGroupsMap.get(groupKey)!.add(fuzzy.item_b_id);
-        }
-      }
-
-      // Convert fuzzy groups to DuplicateGroup objects
-      for (const [groupKey, itemIdSet] of fuzzyGroupsMap) {
-        const items: DuplicateItem[] = [];
-        let totalSize = 0;
-        let minSize = Infinity;
-        let avgConfidence = 70; // Default fuzzy confidence
-
-        // Find the actual confidence for items in this group
-        for (const fuzzy of fuzzyMatches) {
-          if (itemIdSet.has(fuzzy.item_a_id) && itemIdSet.has(fuzzy.item_b_id)) {
-            avgConfidence = Math.max(avgConfidence, fuzzy.confidence);
-          }
-        }
-
-        const serverIds = new Set<string>();
-        for (const itemId of itemIdSet) {
-          const details = itemDetailsMap.get(itemId);
-          if (details) {
-            const fileSize = details.file_size ? parseInt(details.file_size, 10) : null;
-            items.push({
-              id: details.id,
-              serverId: details.server_id,
-              serverName: details.server_name,
-              title: details.title,
-              year: details.year,
-              mediaType: details.media_type,
-              fileSize,
-              resolution: details.video_resolution,
-            });
-            serverIds.add(details.server_id);
-            if (fileSize !== null) {
-              totalSize += fileSize;
-              minSize = Math.min(minSize, fileSize);
-            }
-          }
-        }
-
-        if (items.length >= 2 && serverIds.size >= 2) {
-          duplicateGroups.push({
-            matchKey: groupKey,
-            matchType: 'fuzzy',
-            confidence: avgConfidence,
-            serverCount: serverIds.size,
-            items,
-            totalStorageBytes: totalSize,
-            potentialSavingsBytes: minSize !== Infinity ? totalSize - minSize : 0,
+          const versions = item.versions.map((version) => {
+            const isMirror = mirrorFlags[fileIndex] === true;
+            fileIndex += 1;
+            return isMirror ? { ...version, isMirror: true } : { ...version };
           });
-        }
-      }
+          return { ...item, versions };
+        });
 
-      // Sort by confidence descending
-      duplicateGroups.sort((a, b) => b.confidence - a.confidence);
-
-      // Calculate pagination
-      const total = duplicateGroups.length;
-      const offset = (page - 1) * pageSize;
-      const paginatedGroups = duplicateGroups.slice(offset, offset + pageSize);
-
-      // Calculate summary
-      const summary: DuplicatesSummary = {
-        totalGroups: total,
-        totalDuplicateItems: duplicateGroups.reduce((sum, g) => sum + g.items.length, 0),
-        totalPotentialSavingsBytes: duplicateGroups.reduce(
-          (sum, g) => sum + g.potentialSavingsBytes,
-          0
-        ),
-        byMatchType: {
-          imdb: duplicateGroups.filter((g) => g.matchType === 'imdb').length,
-          tmdb: duplicateGroups.filter((g) => g.matchType === 'tmdb').length,
-          tvdb: duplicateGroups.filter((g) => g.matchType === 'tvdb').length,
-          fuzzy: duplicateGroups.filter((g) => g.matchType === 'fuzzy').length,
-        },
+        return {
+          matchKey: row.group_key,
+          matchType: row.match_type,
+          confidence: row.confidence,
+          serverCount: row.server_count,
+          sameServer: row.server_count === 1,
+          items: flaggedItems,
+          uniqueFileCount: row.unique_file_count,
+          totalStorageBytes: Number(row.total_bytes),
+          potentialSavingsBytes: Number(row.savings_bytes),
+        };
       };
 
-      const response: DuplicatesResponse = {
-        duplicates: paginatedGroups,
-        summary,
-        pagination: { page, pageSize, total },
-      };
+      const duplicateGroups = groupRows.map((row) =>
+        buildGroup(
+          row,
+          row.item_ids
+            .map((id) => itemDetailsMap.get(id))
+            .filter((details): details is ItemDetailsRow => details !== undefined)
+            .map(toDuplicateItem)
+        )
+      );
+
+      const response = buildResponse(duplicateGroups, groupRows[0], page, pageSize);
 
       // Cache for 1 hour (duplicates change slowly)
       await app.redis.setex(cacheKey, CACHE_TTL.LIBRARY_DUPLICATES, JSON.stringify(response));
@@ -447,3 +456,30 @@ export const libraryDuplicatesRoute: FastifyPluginAsync = async (app) => {
     }
   );
 };
+
+/** Assemble the response from page groups and the window summary of any row */
+function buildResponse(
+  duplicateGroups: DuplicateGroup[],
+  summarySource: RawGroupRow | undefined,
+  page: number,
+  pageSize: number
+): DuplicatesResponse {
+  const summary: DuplicatesSummary = {
+    totalGroups: summarySource?.total_groups ?? 0,
+    totalDuplicateItems: summarySource?.total_duplicate_items ?? 0,
+    totalPotentialSavingsBytes: Number(summarySource?.total_savings_bytes ?? 0),
+    byMatchType: {
+      imdb: summarySource?.imdb_groups ?? 0,
+      tmdb: summarySource?.tmdb_groups ?? 0,
+      tvdb: summarySource?.tvdb_groups ?? 0,
+      fuzzy: summarySource?.fuzzy_groups ?? 0,
+      version: summarySource?.version_groups ?? 0,
+    },
+  };
+
+  return {
+    duplicates: duplicateGroups,
+    summary,
+    pagination: { page, pageSize, total: summary.totalGroups },
+  };
+}

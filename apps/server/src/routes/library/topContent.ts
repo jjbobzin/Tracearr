@@ -120,7 +120,7 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
    * GET /top-movies - Top movies by engagement metrics
    *
    * Single-server: delegates to get_content_engagement() for exact main parity.
-   * Multi-server: inlined CTE with cross-server dedup by external ID match key;
+   * Multi-server: inlined CTE with cross-server dedup by media identity;
    *   each result includes serverIds[] for all servers that contributed plays.
    */
   app.get<{ Querystring: TopContentQueryInput }>(
@@ -245,12 +245,14 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
         total = parseInt(summaryRow.total_movies, 10) || 0;
         totalWatchHours = parseFloat(summaryRow.total_watch_hours) || 0;
       } else {
-        // Multi-server path: inlined CTE with dedup by external ID match key.
+        // Multi-server path: inlined CTE with dedup by media identity.
         //
-        // Dedup approach: join daily_content_engagement -> library_items to build a
-        // COALESCE match key (imdb->tmdb->tvdb->title). Rows sharing a match key
-        // (same movie on multiple servers) collapse into one row; play counts and
-        // watch time are summed. ARRAY_AGG collects all contributing server IDs.
+        // Dedup approach: the media_id stamped on sessions (surfaced through the
+        // cagg) keys the collapse, falling back to a normalized-title key for
+        // unidentified content, then to the server-scoped rating key for titleless
+        // rows (rating keys are only unique per server). Rows sharing a key (same
+        // movie on multiple servers) collapse into one row; play counts and watch
+        // time are summed. ARRAY_AGG collects all contributing server IDs.
         //
         // unique_viewers is counted by identity (server_users.user_id), computed
         // separately from the matched titles' raw viewer rows - summing each
@@ -268,23 +270,31 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
               MAX(d.content_duration_ms) AS content_duration_ms,
               MAX(d.thumb_path) AS thumb_path,
               MAX(d.server_id::text)::uuid AS server_id,
+              -- Fold a merged-loser id to its winner so a duplicate merged after
+              -- the fact still collapses with the winner's rows, mirroring
+              -- value_rollup's alias fold in catalog.ts. am is only null for
+              -- unstamped rows, which fall through to the title/rk keys below.
+              MAX(COALESCE(am.merged_into_id, d.media_id)::text)::uuid AS media_id,
               MAX(d.year) AS year,
               SUM(d.watched_ms) AS watched_ms,
               MAX(d.max_progress_ms) AS max_progress_ms
             FROM daily_content_engagement d
             JOIN server_users su ON su.id = d.server_user_id
+            LEFT JOIN media am ON am.id = d.media_id
             WHERE d.day >= ${effectiveStartDate}::timestamptz
               AND d.day < ${endDate}::timestamptz
               AND d.media_type = 'movie'
+              AND (am.id IS NULL OR am.media_type = 'movie')
               ${serverFilter}
             GROUP BY d.rating_key, d.server_user_id, su.user_id
           ),
           content_agg AS (
             SELECT
+              uc.server_id,
               uc.rating_key,
               MAX(uc.media_title) AS media_title,
               MAX(uc.thumb_path) AS thumb_path,
-              MAX(uc.server_id::text)::uuid AS server_id,
+              MAX(uc.media_id::text)::uuid AS media_id,
               MAX(uc.year) AS year,
               SUM(CASE
                 WHEN uc.content_duration_ms > 0 THEN
@@ -303,36 +313,83 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
                        OR uc.watched_ms >= uc.content_duration_ms * 0.85)
               ) / NULLIF(COUNT(DISTINCT uc.server_user_id), 0), 1) AS completion_rate
             FROM user_content uc
-            GROUP BY uc.rating_key
+            GROUP BY uc.server_id, uc.rating_key
           ),
           with_match_key AS (
             SELECT
               ca.*,
+              LOWER(REGEXP_REPLACE(COALESCE(ca.media_title, ''), '[^a-zA-Z0-9]', '', 'g')) AS norm_title,
               COALESCE(
-                CASE WHEN li.imdb_id IS NOT NULL AND li.imdb_id <> '' THEN 'imdb:' || li.imdb_id END,
-                CASE WHEN li.tmdb_id IS NOT NULL THEN 'tmdb:' || li.tmdb_id::text END,
-                CASE WHEN li.tvdb_id IS NOT NULL THEN 'tvdb:' || li.tvdb_id::text END,
-                NULLIF('title:' || LOWER(REGEXP_REPLACE(COALESCE(ca.media_title, ''), '[^a-zA-Z0-9]', '', 'g')), 'title:')
+                ca.media_id::text,
+                NULLIF('title:' || LOWER(REGEXP_REPLACE(COALESCE(ca.media_title, ''), '[^a-zA-Z0-9]', '', 'g')), 'title:'),
+                'rk:' || ca.server_id::text || ':' || ca.rating_key
               ) AS match_key
             FROM content_agg ca
-            LEFT JOIN library_items li
-              ON li.server_id = ca.server_id
-              AND li.rating_key = ca.rating_key
-              AND li.media_type = 'movie'
+          ),
+          -- Per (title, year) bucket, hopping to the media_id stamped on ANY row
+          -- sharing that bucket so a stamped and an unstamped copy of the same
+          -- movie collapse together (mirrors show_dedup_map, keyed by year too
+          -- since two different movies can share a title).
+          title_year_raw AS (
+            SELECT norm_title, year, MAX(media_id::text) AS raw_media_id
+            FROM with_match_key
+            WHERE norm_title <> ''
+            GROUP BY norm_title, year
+          ),
+          title_year_counts AS (
+            SELECT
+              norm_title,
+              COUNT(*) FILTER (WHERE year IS NOT NULL) AS non_null_year_count,
+              MAX(year) FILTER (WHERE year IS NOT NULL) AS sole_year
+            FROM title_year_raw
+            GROUP BY norm_title
+          ),
+          -- A null-year bucket folds into the title's one non-null-year bucket;
+          -- with zero or 2+ non-null buckets it stays on its own.
+          title_year_effective AS (
+            SELECT
+              tyr.norm_title,
+              tyr.year AS raw_year,
+              CASE
+                WHEN tyr.year IS NULL AND tyc.non_null_year_count = 1 THEN tyc.sole_year
+                ELSE tyr.year
+              END AS effective_year,
+              tyr.raw_media_id
+            FROM title_year_raw tyr
+            JOIN title_year_counts tyc ON tyc.norm_title = tyr.norm_title
+          ),
+          movie_dedup_map AS (
+            SELECT
+              norm_title,
+              raw_year,
+              COALESCE(
+                MAX(raw_media_id) OVER (PARTITION BY norm_title, effective_year),
+                'title:' || norm_title || ':' || COALESCE(effective_year::text, 'null')
+              ) AS dedup_key
+            FROM title_year_effective
+          ),
+          with_dedup_key AS (
+            SELECT
+              wmk.*,
+              COALESCE(mdm.dedup_key, wmk.match_key) AS dedup_key
+            FROM with_match_key wmk
+            LEFT JOIN movie_dedup_map mdm
+              ON mdm.norm_title = wmk.norm_title AND mdm.raw_year IS NOT DISTINCT FROM wmk.year
           ),
           rating_key_dedup_map AS (
-            SELECT rating_key, COALESCE(match_key, rating_key) AS dedup_key
-            FROM with_match_key
+            SELECT server_id, rating_key, dedup_key
+            FROM with_dedup_key
           ),
           identity_counts AS (
             SELECT rkm.dedup_key, COUNT(DISTINCT uc.identity_user_id)::bigint AS unique_viewers
             FROM user_content uc
-            JOIN rating_key_dedup_map rkm ON rkm.rating_key = uc.rating_key
+            JOIN rating_key_dedup_map rkm
+              ON rkm.server_id = uc.server_id AND rkm.rating_key = uc.rating_key
             GROUP BY rkm.dedup_key
           ),
           deduped AS (
             SELECT
-              COALESCE(match_key, rating_key) AS dedup_key,
+              dedup_key,
               MAX(media_title) AS media_title,
               MAX(year) AS year,
               MAX(thumb_path) AS thumb_path,
@@ -341,9 +398,9 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
               SUM(total_plays) AS total_plays,
               ROUND(SUM(total_watch_hours), 1) AS total_watch_hours,
               ROUND(AVG(completion_rate), 1) AS completion_rate
-            FROM with_match_key
+            FROM with_dedup_key
             WHERE media_title IS NOT NULL
-            GROUP BY COALESCE(match_key, rating_key)
+            GROUP BY dedup_key
           )
           SELECT
             d.dedup_key AS match_key,
@@ -380,49 +437,96 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
             SELECT
               d.rating_key,
               d.server_user_id,
+              MAX(d.media_title) AS media_title,
               MAX(d.content_duration_ms) AS content_duration_ms,
               MAX(d.server_id::text)::uuid AS server_id,
+              MAX(COALESCE(am.merged_into_id, d.media_id)::text)::uuid AS media_id,
+              MAX(d.year) AS year,
               SUM(d.watched_ms) AS watched_ms,
               MAX(d.max_progress_ms) AS max_progress_ms
             FROM daily_content_engagement d
+            LEFT JOIN media am ON am.id = d.media_id
             WHERE d.day >= ${effectiveStartDate}::timestamptz
               AND d.day < ${endDate}::timestamptz
               AND d.media_type = 'movie'
+              AND (am.id IS NULL OR am.media_type = 'movie')
               ${serverFilter}
             GROUP BY d.rating_key, d.server_user_id
           ),
           content_agg AS (
             SELECT
+              uc.server_id,
               uc.rating_key,
-              MAX(uc.server_id::text)::uuid AS server_id,
+              MAX(uc.media_title) AS media_title,
+              MAX(uc.media_id::text)::uuid AS media_id,
+              MAX(uc.year) AS year,
               ROUND(SUM(uc.watched_ms) / 3600000.0, 1) AS total_watch_hours
             FROM user_content uc
-            GROUP BY uc.rating_key
+            GROUP BY uc.server_id, uc.rating_key
           ),
           with_match_key AS (
             SELECT
-              ca.rating_key,
               ca.total_watch_hours,
+              ca.media_id,
+              ca.year,
+              LOWER(REGEXP_REPLACE(COALESCE(ca.media_title, ''), '[^a-zA-Z0-9]', '', 'g')) AS norm_title,
               COALESCE(
-                CASE WHEN li.imdb_id IS NOT NULL AND li.imdb_id <> '' THEN 'imdb:' || li.imdb_id END,
-                CASE WHEN li.tmdb_id IS NOT NULL THEN 'tmdb:' || li.tmdb_id::text END,
-                CASE WHEN li.tvdb_id IS NOT NULL THEN 'tvdb:' || li.tvdb_id::text END,
-                NULLIF('title:' || LOWER(REGEXP_REPLACE(
-                  COALESCE((SELECT MAX(d2.media_title) FROM daily_content_engagement d2 WHERE d2.rating_key = ca.rating_key LIMIT 1), ''),
-                  '[^a-zA-Z0-9]', '', 'g')), 'title:')
+                ca.media_id::text,
+                NULLIF('title:' || LOWER(REGEXP_REPLACE(COALESCE(ca.media_title, ''), '[^a-zA-Z0-9]', '', 'g')), 'title:'),
+                'rk:' || ca.server_id::text || ':' || ca.rating_key
               ) AS match_key
             FROM content_agg ca
-            LEFT JOIN library_items li
-              ON li.server_id = ca.server_id
-              AND li.rating_key = ca.rating_key
-              AND li.media_type = 'movie'
+          ),
+          title_year_raw AS (
+            SELECT norm_title, year, MAX(media_id::text) AS raw_media_id
+            FROM with_match_key
+            WHERE norm_title <> ''
+            GROUP BY norm_title, year
+          ),
+          title_year_counts AS (
+            SELECT
+              norm_title,
+              COUNT(*) FILTER (WHERE year IS NOT NULL) AS non_null_year_count,
+              MAX(year) FILTER (WHERE year IS NOT NULL) AS sole_year
+            FROM title_year_raw
+            GROUP BY norm_title
+          ),
+          title_year_effective AS (
+            SELECT
+              tyr.norm_title,
+              tyr.year AS raw_year,
+              CASE
+                WHEN tyr.year IS NULL AND tyc.non_null_year_count = 1 THEN tyc.sole_year
+                ELSE tyr.year
+              END AS effective_year,
+              tyr.raw_media_id
+            FROM title_year_raw tyr
+            JOIN title_year_counts tyc ON tyc.norm_title = tyr.norm_title
+          ),
+          movie_dedup_map AS (
+            SELECT
+              norm_title,
+              raw_year,
+              COALESCE(
+                MAX(raw_media_id) OVER (PARTITION BY norm_title, effective_year),
+                'title:' || norm_title || ':' || COALESCE(effective_year::text, 'null')
+              ) AS dedup_key
+            FROM title_year_effective
+          ),
+          with_dedup_key AS (
+            SELECT
+              wmk.total_watch_hours,
+              COALESCE(mdm.dedup_key, wmk.match_key) AS dedup_key
+            FROM with_match_key wmk
+            LEFT JOIN movie_dedup_map mdm
+              ON mdm.norm_title = wmk.norm_title AND mdm.raw_year IS NOT DISTINCT FROM wmk.year
           ),
           deduped AS (
             SELECT
-              COALESCE(match_key, rating_key) AS dedup_key,
+              dedup_key,
               ROUND(SUM(total_watch_hours), 1) AS total_watch_hours
-            FROM with_match_key
-            GROUP BY COALESCE(match_key, rating_key)
+            FROM with_dedup_key
+            GROUP BY dedup_key
           )
           SELECT
             COUNT(*) AS total_movies,
@@ -454,7 +558,7 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
    * GET /top-shows - Top TV shows by engagement metrics
    *
    * Single-server: delegates to get_show_engagement() for exact main parity.
-   * Multi-server: inlined CTE with cross-server dedup by normalized show title;
+   * Multi-server: inlined CTE with cross-server dedup by show media identity;
    *   each result includes serverIds[] for all servers that contributed views.
    */
   app.get<{ Querystring: TopContentQueryInput }>(
@@ -574,17 +678,19 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
         total = parseInt(summaryRow.total_shows, 10) || 0;
         totalWatchHours = parseFloat(summaryRow.total_watch_hours) || 0;
       } else {
-        // Multi-server path: inlined CTE with dedup by normalized show title.
+        // Multi-server path: inlined CTE with dedup by show media identity.
         //
-        // Dedup approach: LOWER + strip non-alphanumeric applied to show_title produces
-        // the same key that buildExternalIdMatchKey uses for its title fallback. Shows
-        // sharing the same normalized title across servers collapse into one row;
-        // episode views and watch hours are summed.
+        // Dedup approach: the show_media_id stamped on sessions (surfaced through
+        // the cagg) keys the collapse, falling back to LOWER + strip non-alphanumeric
+        // on show_title for unidentified shows. Shows sharing a key across servers
+        // collapse into one row; episode views and watch hours are summed.
         //
         // unique_viewers is counted by identity (server_users.user_id) via a
         // separate identity_counts CTE - summing each server's per-show viewer
         // count would double-count a merged person watching the same show on
-        // two servers.
+        // two servers. Its keys come from show_dedup_map (per-title, after the
+        // MAX(show_media_id) hop) so they always line up with deduped's keys,
+        // even when a show mixes stamped and unstamped episode rows.
         const serverFilter = buildMultiServerFragment(resolvedIds, 'd.server_id');
 
         const itemsResult = await db.execute(sql`
@@ -593,6 +699,9 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
               d.rating_key,
               d.server_user_id,
               MAX(d.show_title) AS show_title,
+              -- Fold a merged-loser show id to its winner, same as the movie
+              -- branch above; am is only null for unstamped episodes.
+              MAX(COALESCE(am.merged_into_id, d.show_media_id)::text)::uuid AS show_media_id,
               MAX(d.content_duration_ms) AS content_duration_ms,
               MAX(d.thumb_path) AS thumb_path,
               MAX(d.server_id::text)::uuid AS server_id,
@@ -601,25 +710,36 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
               MAX(d.max_progress_ms) AS max_progress_ms,
               COUNT(DISTINCT d.day) AS viewing_days
             FROM daily_content_engagement d
+            LEFT JOIN media am ON am.id = d.show_media_id
             WHERE d.day >= ${effectiveStartDate}::timestamptz
               AND d.day < ${endDate}::timestamptz
               AND d.show_title IS NOT NULL
               AND d.media_type = 'episode'
+              AND (am.id IS NULL OR am.media_type = 'show')
               ${serverFilter}
             GROUP BY d.rating_key, d.server_user_id
           ),
+          show_dedup_map AS (
+            SELECT
+              ue.show_title,
+              COALESCE(MAX(ue.show_media_id::text), LOWER(REGEXP_REPLACE(COALESCE(ue.show_title, ''), '[^a-zA-Z0-9]', '', 'g'))) AS dedup_key
+            FROM user_episodes ue
+            GROUP BY ue.show_title
+          ),
           identity_counts AS (
             SELECT
-              LOWER(REGEXP_REPLACE(COALESCE(ue.show_title, ''), '[^a-zA-Z0-9]', '', 'g')) AS dedup_key,
+              sdm.dedup_key,
               COUNT(DISTINCT su.user_id)::bigint AS unique_viewers
             FROM user_episodes ue
+            JOIN show_dedup_map sdm ON sdm.show_title = ue.show_title
             JOIN server_users su ON su.id = ue.server_user_id
-            GROUP BY LOWER(REGEXP_REPLACE(COALESCE(ue.show_title, ''), '[^a-zA-Z0-9]', '', 'g'))
+            GROUP BY sdm.dedup_key
           ),
           user_shows AS (
             SELECT
               ue.server_user_id,
               ue.show_title,
+              MAX(ue.show_media_id::text)::uuid AS show_media_id,
               MAX(ue.thumb_path) AS thumb_path,
               MAX(ue.server_id::text)::uuid AS server_id,
               MAX(ue.year) AS year,
@@ -637,6 +757,7 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
           show_agg AS (
             SELECT
               us.show_title,
+              MAX(us.show_media_id::text)::uuid AS show_media_id,
               MAX(us.server_id::text)::uuid AS server_id,
               MAX(us.thumb_path) AS thumb_path,
               MAX(us.year) AS year,
@@ -653,7 +774,7 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
           ),
           deduped AS (
             SELECT
-              LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g')) AS dedup_key,
+              COALESCE(sa.show_media_id::text, LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g'))) AS dedup_key,
               MAX(sa.show_title) AS show_title,
               MAX(sa.year) AS year,
               MAX(sa.thumb_path) AS thumb_path,
@@ -665,7 +786,7 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
               ROUND(AVG(sa.binge_score), 0) AS binge_score
             FROM show_agg sa
             WHERE sa.show_title IS NOT NULL
-            GROUP BY LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g'))
+            GROUP BY COALESCE(sa.show_media_id::text, LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g')))
           )
           SELECT
             d.show_title,
@@ -703,16 +824,19 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
               d.rating_key,
               d.server_user_id,
               MAX(d.show_title) AS show_title,
+              MAX(COALESCE(am.merged_into_id, d.show_media_id)::text)::uuid AS show_media_id,
               MAX(d.content_duration_ms) AS content_duration_ms,
               MAX(d.server_id::text)::uuid AS server_id,
               SUM(d.watched_ms) AS watched_ms,
               MAX(d.max_progress_ms) AS max_progress_ms,
               COUNT(DISTINCT d.day) AS viewing_days
             FROM daily_content_engagement d
+            LEFT JOIN media am ON am.id = d.show_media_id
             WHERE d.day >= ${effectiveStartDate}::timestamptz
               AND d.day < ${endDate}::timestamptz
               AND d.show_title IS NOT NULL
               AND d.media_type = 'episode'
+              AND (am.id IS NULL OR am.media_type = 'show')
               ${serverFilter}
             GROUP BY d.rating_key, d.server_user_id
           ),
@@ -720,6 +844,7 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
             SELECT
               ue.server_user_id,
               ue.show_title,
+              MAX(ue.show_media_id::text)::uuid AS show_media_id,
               MAX(ue.server_id::text)::uuid AS server_id,
               SUM(ue.watched_ms) AS total_watched_ms,
               COUNT(DISTINCT ue.rating_key) AS episodes_watched,
@@ -734,17 +859,18 @@ export const libraryTopContentRoute: FastifyPluginAsync = async (app) => {
           show_agg AS (
             SELECT
               us.show_title,
+              MAX(us.show_media_id::text)::uuid AS show_media_id,
               ROUND(SUM(us.total_watched_ms) / 3600000.0, 1) AS total_watch_hours
             FROM user_shows us
             GROUP BY us.show_title
           ),
           deduped AS (
             SELECT
-              LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g')) AS dedup_key,
+              COALESCE(sa.show_media_id::text, LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g'))) AS dedup_key,
               ROUND(SUM(sa.total_watch_hours), 1) AS total_watch_hours
             FROM show_agg sa
             WHERE sa.show_title IS NOT NULL
-            GROUP BY LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g'))
+            GROUP BY COALESCE(sa.show_media_id::text, LOWER(REGEXP_REPLACE(COALESCE(sa.show_title, ''), '[^a-zA-Z0-9]', '', 'g')))
           )
           SELECT
             COUNT(*) AS total_shows,

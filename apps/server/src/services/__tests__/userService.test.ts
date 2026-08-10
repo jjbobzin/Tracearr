@@ -71,7 +71,6 @@ function createMockServerUser(overrides: Record<string, unknown> = {}) {
     thumbUrl: null,
     isServerAdmin: false,
     trustScore: 100,
-    sessionCount: 0,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -140,10 +139,7 @@ describe('getServerUserByExternalId', () => {
     const mockServerUser = createMockServerUser();
     mockSelectChain([mockServerUser]);
 
-    const result = await getServerUserByExternalId(
-      mockServerUser.serverId,
-      'external-123'
-    );
+    const result = await getServerUserByExternalId(mockServerUser.serverId, 'external-123');
 
     expect(result).toEqual(mockServerUser);
   });
@@ -230,7 +226,6 @@ describe('getServerUserWithDetails', () => {
       thumbUrl: null,
       isServerAdmin: false,
       trustScore: 100,
-      sessionCount: 5,
       createdAt: new Date(),
       updatedAt: new Date(),
       userName: 'Test User',
@@ -286,7 +281,6 @@ describe('getUserWithStats', () => {
       username: 'testuser',
       thumbUrl: null,
       trustScore: 100,
-      sessionCount: 5,
     };
     const stats = { totalSessions: 42, totalWatchTime: BigInt(3600000) };
 
@@ -586,7 +580,8 @@ describe('updateServerUserTrustScore', () => {
     });
     const txSelect = vi.fn().mockReturnValue({
       from: vi.fn().mockReturnThis(),
-      where: vi.fn().mockResolvedValue([{ weightedSum: 80, totalSessions: 1 }]),
+      innerJoin: vi.fn().mockReturnThis(),
+      where: vi.fn().mockResolvedValue([{ trust: 80, count: 0 }]),
     });
     vi.mocked(db.transaction).mockImplementation(async (callback) => {
       return callback({ update: txUpdate, select: txSelect } as never);

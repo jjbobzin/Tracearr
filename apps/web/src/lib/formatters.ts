@@ -203,3 +203,46 @@ export function formatPercent(
   const percent = isDecimal ? value * 100 : value;
   return `${percent.toFixed(decimals)}%`;
 }
+
+const HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * Compact relative age for library-freshness UI: "14h", "3d", "15w", "11mo",
+ * "2y". Plain elapsed-time math rather than date-fns calendar helpers, so
+ * results don't shift with local midnight/week-start boundaries. Shared by
+ * the poster card meta line and the hover tile so both read off one clock.
+ */
+export function formatCompactAge(dateStr: string | null): string {
+  const addedAt = dateStr ? new Date(dateStr).getTime() : NaN;
+  if (!dateStr || Number.isNaN(addedAt)) return '-';
+  const hours = Math.max(Math.floor((Date.now() - addedAt) / HOUR_MS), 0);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 60) return `${days}d`;
+  const weeks = Math.floor(days / 7);
+  if (weeks < 52) return `${weeks}w`;
+  const months = Math.floor(days / 30.44);
+  if (months < 12) return `${months}mo`;
+  return `${Math.floor(days / 365.25)}y`;
+}
+
+const COMPACT_COUNT_UNITS: [number, string][] = [
+  [1_000_000_000, 'B'],
+  [1_000_000, 'M'],
+  [1_000, 'k'],
+];
+
+/**
+ * Compact magnitude for counters: 1204 -> "1.2k", 3400000 -> "3.4M". Used
+ * where card space is tight and exact precision doesn't matter.
+ */
+export function compactCount(n: number): string {
+  const abs = Math.abs(n);
+  for (const [threshold, suffix] of COMPACT_COUNT_UNITS) {
+    if (abs >= threshold) {
+      const rounded = Math.round((n / threshold) * 10) / 10;
+      return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}${suffix}`;
+    }
+  }
+  return String(n);
+}

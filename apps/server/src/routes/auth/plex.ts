@@ -25,6 +25,7 @@ import {
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
 import { servers, serverUsers, plexAccounts } from '../../db/schema.js';
+import { invalidateServersCache } from '../../jobs/poller/database.js';
 import { PlexClient } from '../../services/mediaServer/index.js';
 import {
   testSingleConnection,
@@ -527,6 +528,7 @@ export const plexRoutes: FastifyPluginAsync = async (app) => {
           plexAccountId: plexAccountId, // Link to plex_account if available
         })
         .returning();
+      invalidateServersCache();
 
       if (!newServer) {
         return reply.internalServerError('Failed to create server');
@@ -654,6 +656,7 @@ export const plexRoutes: FastifyPluginAsync = async (app) => {
                 .update(servers)
                 .set({ plexAccountId: matchingAccount.id })
                 .where(eq(servers.id, server.id));
+              invalidateServersCache();
               app.log.info(
                 { serverId: server.id, accountId: matchingAccount.id },
                 'Auto-linked orphaned Plex server to account'

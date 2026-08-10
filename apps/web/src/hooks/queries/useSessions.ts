@@ -1,7 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import '@tracearr/shared';
+import { serverScopeFromIds, serverScopeKey } from '@tracearr/shared';
 import { api } from '@/lib/api';
 
 interface SessionsParams {
@@ -20,13 +20,14 @@ export function useSessions(params: SessionsParams = {}) {
   });
 }
 
-export function useActiveSessions(serverIds: string[]) {
-  const serverIdsKey = serverIds.length ? [...serverIds].sort().join(',') : 'all';
+export function useActiveSessions(serverIds: string[], socketConnected = false) {
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery({
     queryKey: ['sessions', 'active', serverIdsKey],
     queryFn: () => api.sessions.getActive(serverIds.length ? serverIds : undefined),
     staleTime: 1000 * 15, // 15 seconds
-    refetchInterval: 1000 * 30, // 30 seconds
+    // Socket events keep this fresh when connected; polling is the fallback
+    refetchInterval: socketConnected ? 1000 * 60 : 1000 * 30,
   });
 }
 

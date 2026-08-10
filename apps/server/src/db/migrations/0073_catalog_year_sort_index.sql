@@ -1,0 +1,1 @@
+CREATE INDEX "idx_media_type_year_id" ON "media" USING btree ("media_type","year" DESC NULLS LAST,"id" DESC NULLS LAST) WHERE "media"."merged_into_id" IS NULL;

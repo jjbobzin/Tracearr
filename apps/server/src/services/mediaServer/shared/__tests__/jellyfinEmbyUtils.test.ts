@@ -13,6 +13,8 @@ import {
   shouldFilterItem,
   extractStreamDetails,
   getBitrate,
+  getVideoDimensions,
+  findPlayingMediaSource,
 } from '../jellyfinEmbyUtils.js';
 import { calculateProgress } from '../parserUtils.js';
 
@@ -329,6 +331,17 @@ describe('shouldFilterItem', () => {
     expect(shouldFilterItem({ Type: 'Video', ExtraType: 'themevideo' })).toBe(true);
   });
 
+  it('filters any other extra type by ExtraType alone, even when Type matches primary content', () => {
+    // Local trailers/extras are sometimes scanned with the parent's own Type
+    // (e.g. Movie), so ExtraType is the only reliable signal.
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: 'Trailer' })).toBe(true);
+    expect(shouldFilterItem({ Type: 'Video', ExtraType: 'BehindTheScenes' })).toBe(true);
+    expect(shouldFilterItem({ Type: 'Video', ExtraType: 'Clip' })).toBe(true);
+    expect(shouldFilterItem({ Type: 'Video', ExtraType: 'Interview' })).toBe(true);
+    expect(shouldFilterItem({ Type: 'Video', ExtraType: 'Scene' })).toBe(true);
+    expect(shouldFilterItem({ Type: 'Video', ExtraType: 'Sample' })).toBe(true);
+  });
+
   it('filters preroll videos by provider ID', () => {
     expect(
       shouldFilterItem({
@@ -367,6 +380,28 @@ describe('shouldFilterItem', () => {
         ProviderIds: { tmdb: '12345', imdb: 'tt12345' },
       })
     ).toBe(false);
+  });
+
+  it('filters extras with a non-empty ExtraType string', () => {
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: 'Trailer' })).toBe(true);
+  });
+
+  it('does not filter empty or whitespace-only ExtraType', () => {
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: '' })).toBe(false);
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: '   ' })).toBe(false);
+  });
+
+  it('does not filter missing, null, or undefined ExtraType', () => {
+    expect(shouldFilterItem({ Type: 'Movie' })).toBe(false);
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: null })).toBe(false);
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: undefined })).toBe(false);
+  });
+
+  it('does not filter a non-string ExtraType (regression guard for library-emptying bug)', () => {
+    // A numeric enum value like 0 would coerce to the truthy string '0' under
+    // String(val), which would filter every item in the library.
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: 0 })).toBe(false);
+    expect(shouldFilterItem({ Type: 'Movie', ExtraType: {} })).toBe(false);
   });
 });
 
@@ -1012,5 +1047,100 @@ describe('getBitrate', () => {
   it('returns 0 when no bitrate info available', () => {
     const session = { NowPlayingItem: {} };
     expect(getBitrate(session)).toBe(0);
+  });
+});
+
+describe('findPlayingMediaSource', () => {
+  it('picks the MediaSource matching PlayState.MediaSourceId', () => {
+    const session = {
+      NowPlayingItem: {
+        MediaSources: [
+          { Id: 'src-primary', Bitrate: 50000000 },
+          { Id: 'src-alt', Bitrate: 12000000 },
+        ],
+      },
+      PlayState: { MediaSourceId: 'src-alt' },
+    };
+
+    expect(findPlayingMediaSource(session)?.Id).toBe('src-alt');
+  });
+
+  it('matches the Emby mediasource_-prefixed id format', () => {
+    // Emby formats both PlayState.MediaSourceId and MediaSource.Id as
+    // mediasource_{itemId}
+    const session = {
+      NowPlayingItem: {
+        MediaSources: [{ Id: 'mediasource_1656' }, { Id: 'mediasource_60643' }],
+      },
+      PlayState: { MediaSourceId: 'mediasource_60643' },
+    };
+
+    expect(findPlayingMediaSource(session)?.Id).toBe('mediasource_60643');
+  });
+
+  it('falls back to the first source when the id matches nothing', () => {
+    const session = {
+      NowPlayingItem: {
+        MediaSources: [{ Id: 'src-a' }, { Id: 'src-b' }],
+      },
+      PlayState: { MediaSourceId: 'gone' },
+    };
+
+    expect(findPlayingMediaSource(session)?.Id).toBe('src-a');
+  });
+
+  it('returns undefined when the session has no MediaSources', () => {
+    expect(findPlayingMediaSource({ NowPlayingItem: {} })).toBeUndefined();
+    expect(findPlayingMediaSource({})).toBeUndefined();
+  });
+});
+
+describe('version selection via PlayState.MediaSourceId', () => {
+  const multiVersionSession = {
+    NowPlayingItem: {
+      MediaSources: [
+        {
+          Id: 'src-4k',
+          Bitrate: 50000000,
+          MediaStreams: [{ Type: 'Video', Codec: 'hevc', Width: 3840, Height: 2160 }],
+        },
+        {
+          Id: 'src-1080p',
+          Bitrate: 12000000,
+          MediaStreams: [{ Type: 'Video', Codec: 'h264', Width: 1920, Height: 1080 }],
+        },
+      ],
+    },
+    PlayState: { MediaSourceId: 'src-1080p' },
+  };
+
+  it('getBitrate reads the playing MediaSource, not the first', () => {
+    expect(getBitrate(multiVersionSession)).toBe(12000);
+  });
+
+  it('getVideoDimensions reads the playing MediaSource, not the first', () => {
+    expect(getVideoDimensions(multiVersionSession)).toEqual({
+      videoWidth: 1920,
+      videoHeight: 1080,
+    });
+  });
+
+  it('extractStreamDetails reads streams from the playing MediaSource', () => {
+    expect(extractStreamDetails(multiVersionSession).sourceVideoCodec).toBe('H264');
+  });
+
+  it('getBitrate size fallback uses the playing MediaSource', () => {
+    const session = {
+      NowPlayingItem: {
+        RunTimeTicks: 36000000000,
+        MediaSources: [
+          { Id: 'src-4k', Size: 9000000000 },
+          { Id: 'src-1080p', Size: 4500000000 },
+        ],
+      },
+      PlayState: { MediaSourceId: 'src-1080p' },
+    };
+
+    expect(getBitrate(session)).toBe(10000);
   });
 });

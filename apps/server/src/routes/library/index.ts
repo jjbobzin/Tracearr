@@ -19,10 +19,20 @@ import { libraryTopContentRoute } from './topContent.js';
 import { libraryCodecsRoute } from './codecs.js';
 import { libraryResolutionRoute } from './resolution.js';
 import { libraryStatusRoute } from './status.js';
+import { libraryCatalogRoute } from './catalog.js';
+import { libraryShelvesRoute } from './shelves.js';
+import { libraryGenresRoute } from './genres.js';
+import { libraryMediaRoute } from './media.js';
+import { libraryLibrariesRoute } from './libraries.js';
 
 export const libraryStatsRoutes: FastifyPluginAsync = async (app) => {
   // Register all sub-route plugins
   // Each plugin defines its own paths (no additional prefix needed)
+  await app.register(libraryCatalogRoute);
+  await app.register(libraryShelvesRoute);
+  await app.register(libraryGenresRoute);
+  await app.register(libraryMediaRoute);
+  await app.register(libraryLibrariesRoute);
   await app.register(libraryStatsRoute);
   await app.register(libraryGrowthRoute);
   await app.register(libraryQualityRoute);
@@ -40,4 +50,4 @@ export const libraryStatsRoutes: FastifyPluginAsync = async (app) => {
 };
 
 // Re-export utilities for potential use by other modules
-export { buildLibraryServerFilter, buildLibraryCacheKey } from './utils.js';
+export { buildLibraryCacheKey } from './utils.js';

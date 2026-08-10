@@ -2,41 +2,12 @@
  * Poller Utility Functions Tests
  *
  * Tests pure utility functions from poller/utils.ts:
- * - formatQualityString: Format bitrate for display
  * - isPrivateIP: Detect private/local IP addresses
  * - parseJellyfinClient: Extract client info from Jellyfin user agent
  */
 
 import { describe, it, expect } from 'vitest';
-import { formatQualityString, isPrivateIP, parseJellyfinClient } from '../utils.js';
-
-describe('formatQualityString', () => {
-  describe('bitrate formatting', () => {
-    it('should format transcode bitrate in Mbps', () => {
-      expect(formatQualityString(8000000, 0, false)).toBe('8 Mbps');
-      expect(formatQualityString(10000000, 0, true)).toBe('10 Mbps');
-    });
-
-    it('should fall back to source bitrate when transcode bitrate is 0', () => {
-      expect(formatQualityString(0, 12000000, false)).toBe('12 Mbps');
-    });
-
-    it('should show decimal only when fractional', () => {
-      expect(formatQualityString(8500000, 0, false)).toBe('8.5 Mbps');
-      expect(formatQualityString(8000000, 0, false)).toBe('8 Mbps');
-    });
-  });
-
-  describe('fallback labels', () => {
-    it('should return "Transcoding" when no bitrate but is transcoding', () => {
-      expect(formatQualityString(0, 0, true)).toBe('Transcoding');
-    });
-
-    it('should return "Direct" when no bitrate and not transcoding', () => {
-      expect(formatQualityString(0, 0, false)).toBe('Direct');
-    });
-  });
-});
+import { isPrivateIP, parseJellyfinClient } from '../utils.js';
 
 describe('isPrivateIP', () => {
   describe('IPv4 private ranges', () => {

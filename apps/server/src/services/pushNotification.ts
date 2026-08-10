@@ -528,11 +528,7 @@ export class PushNotificationService {
     }
 
     // Apply quiet hours filtering (violations use severity for bypass)
-    const activeSessions = applyQuietHours(
-      rateLimitedSessions,
-      severity,
-      'violation'
-    );
+    const activeSessions = applyQuietHours(rateLimitedSessions, severity, 'violation');
     if (activeSessions.length === 0) {
       console.log(`[Push] All sessions in quiet hours for violation notification`);
       return;

@@ -137,8 +137,9 @@ export const users = pgTable(
     banReason: text('ban_reason'),
     banExpires: timestamp('ban_expires', { withTimezone: true }),
 
-    // Aggregated metrics (cached, recomputed in-app by recalculateAggregateTrustScore
-    // after every serverUsers.trustScore write - no database trigger exists)
+    // Aggregated metrics (cached, recomputed in-app by recomputeIdentityAggregates
+    // after every serverUsers.trustScore write and violation insert - no
+    // database trigger exists)
     aggregateTrustScore: integer('aggregate_trust_score').notNull().default(100),
     totalViolations: integer('total_violations').notNull().default(0),
 
@@ -232,7 +233,6 @@ export const serverUsers = pgTable(
 
     // Per-server trust
     trustScore: integer('trust_score').notNull().default(100),
-    sessionCount: integer('session_count').notNull().default(0), // For aggregate weighting
 
     // Removal tracking - set when user no longer exists on media server
     removedAt: timestamp('removed_at', { withTimezone: true }),
@@ -287,6 +287,18 @@ export const sessions = pgTable(
     year: integer('year'), // Release year
     thumbPath: varchar('thumb_path', { length: 500 }), // Poster path (e.g., /library/metadata/123/thumb)
     ratingKey: varchar('rating_key', { length: 255 }), // Plex/Jellyfin media identifier
+    // Which file/version of the item was played (Plex Media.id, JF/Emby
+    // MediaSource id). Soft reference like ratingKey: server-scoped, no FK,
+    // de-references gracefully after a library rebuild.
+    serverVersionKey: varchar('server_version_key', { length: 255 }),
+    parentRatingKey: varchar('parent_rating_key', { length: 255 }),
+    grandparentRatingKey: varchar('grandparent_rating_key', { length: 255 }),
+    // Identity stamped at insert from library_items/media; survives item deletion
+    mediaId: uuid('media_id'),
+    showMediaId: uuid('show_media_id'),
+    imdbId: varchar('imdb_id', { length: 20 }),
+    tmdbId: integer('tmdb_id'),
+    tvdbId: integer('tvdb_id'),
     externalSessionId: varchar('external_session_id', { length: 255 }), // External reference for deduplication
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
     stoppedAt: timestamp('stopped_at', { withTimezone: true }),
@@ -365,7 +377,8 @@ export const sessions = pgTable(
     index('sessions_server_user_time_idx').on(table.serverUserId, table.startedAt),
     index('sessions_server_time_idx').on(table.serverId, table.startedAt),
     index('sessions_state_idx').on(table.state),
-    index('sessions_external_session_idx').on(table.serverId, table.externalSessionId),
+    // sessions_external_session_idx removed - the only predicates on external_session_id
+    // (import cursor CAST, dedup regex) are non-sargable for a btree
     index('sessions_active_lookup_idx').on(table.serverId, table.sessionKey, table.stoppedAt),
     index('sessions_device_idx').on(table.serverUserId, table.deviceId),
     index('sessions_reference_idx').on(table.referenceId), // For session grouping queries
@@ -379,16 +392,18 @@ export const sessions = pgTable(
       table.startedAt
     ),
     // Indexes for stats queries
-    index('sessions_geo_idx').on(table.geoLat, table.geoLon), // For /stats/locations basic geo lookup
-    // sessions_geo_time_idx removed - superseded by idx_sessions_geo_partial in timescale.ts
+    // sessions_geo_idx and sessions_geo_time_idx removed - every geo predicate carries
+    // IS NOT NULL, so idx_sessions_geo_partial in timescale.ts covers them all
     index('sessions_media_type_idx').on(table.mediaType), // For media type aggregations
     index('sessions_transcode_idx').on(table.isTranscode), // For quality stats
     index('sessions_platform_idx').on(table.platform), // For platform stats
     // sessions_top_movies_idx and sessions_top_shows_idx removed - superseded by time-prefixed variants in timescale.ts
     // Covering index for history aggregates queries (server + date range + reference_id for COUNT DISTINCT)
     index('idx_sessions_server_date_ref').on(table.serverId, table.startedAt, table.referenceId),
-    // Index for stale session detection (active sessions that haven't been seen recently)
-    index('sessions_stale_detection_idx').on(table.lastSeenAt, table.stoppedAt),
+    // sessions_stale_detection_idx removed - the stale sweep is the only last_seen_at
+    // predicate and idx_sessions_open_last_seen (partial, timescale.ts) matches it exactly
+    index('sessions_media_idx').on(table.mediaId, table.startedAt),
+    index('sessions_show_media_idx').on(table.showMediaId, table.startedAt),
   ]
 );
 
@@ -452,6 +467,12 @@ export const violations = pgTable(
     data: jsonb('data').notNull().$type<Record<string, unknown>>(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     acknowledgedAt: timestamp('acknowledged_at', { withTimezone: true }),
+    // Soft delete. Dismiss keeps the row so dedup still sees it and the same
+    // violation can never re-arm (the inactivity worker recreated dismissed
+    // violations hourly when dismiss was a hard delete). Read paths filter on
+    // dismissedAt IS NULL; the partial unique index below still blocks
+    // re-inserts because dismissed rows keep acknowledgedAt null.
+    dismissedAt: timestamp('dismissed_at', { withTimezone: true }),
   },
   (table) => [
     index('violations_server_user_id_idx').on(table.serverUserId),
@@ -808,6 +829,7 @@ export const serversRelations = relations(servers, ({ one, many }) => ({
   sessions: many(sessions),
   libraryItems: many(libraryItems),
   librarySnapshots: many(librarySnapshots),
+  libraries: many(libraries),
   plexAccount: one(plexAccounts, {
     fields: [servers.plexAccountId],
     references: [plexAccounts.id],
@@ -1003,6 +1025,17 @@ export const libraryItems = pgTable(
     audioCodec: varchar('audio_codec', { length: 50 }),
     audioChannels: integer('audio_channels'), // 2 (stereo), 6 (5.1), 8 (7.1)
     fileSize: bigint('file_size', { mode: 'number' }), // Bytes
+    // Normalized dynamic range token (see @tracearr/shared normalizeDynamicRange),
+    // e.g. 'sdr', 'hdr10', 'dolby vision'. Newly tracked: copies synced before this
+    // column existed show no value until their server's next sync.
+    videoDynamicRange: varchar('video_dynamic_range', { length: 20 }),
+
+    // Quality columns above are rollups over library_item_versions: file_size
+    // is the SUM of active versions, the rest come from the best version.
+    versionCount: integer('version_count').notNull().default(1),
+    // Hash over the sorted active-version tuples, computed at parse time.
+    // Joins the upsert's setWhere guard so version-only changes update the row.
+    versionsFingerprint: text('versions_fingerprint'),
 
     // Debug only - never used for matching (file paths differ across servers)
     filePath: text('file_path'),
@@ -1017,7 +1050,18 @@ export const libraryItems = pgTable(
     parentIndex: integer('parent_index'), // season number for episodes
     itemIndex: integer('item_index'), // episode number or track number
 
+    // Canonical identity (media.id); resolved during library sync
+    mediaId: uuid('media_id'),
+    genres: text('genres').array(),
+    // Soft delete - set when the item disappears from the server; upsert clears it
+    removedAt: timestamp('removed_at', { withTimezone: true }),
+
+    // Browsing UI: cached poster thumbnail path and dominant color accent
+    thumbPath: text('thumb_path'),
+    dominantColor: varchar('dominant_color', { length: 7 }),
+
     // Timestamps
+    // Holds the SERVER-reported added date (sync overwrites it), not Tracearr first-sync time
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1042,11 +1086,159 @@ export const libraryItems = pgTable(
     // Composite index for media type filtering (used by nearly all library routes)
     index('idx_library_items_server_media_type').on(table.serverId, table.mediaType),
 
+    // The image pipeline's dominant-color persist and stored-color read both
+    // filter on (server_id, thumb_path); without this they seq-scan the table
+    // once per poster during a cache warm
+    index('idx_library_items_server_thumb').on(table.serverId, table.thumbPath),
+
     // Composite index for growth queries (created_at range filtering with server context)
     index('idx_library_items_server_created').on(table.serverId, table.createdAt),
 
     // GIN trigram index for fuzzy duplicate detection (requires pg_trgm extension)
     index('idx_library_items_title_trgm').using('gin', sql`${table.title} gin_trgm_ops`),
+
+    index('idx_library_items_media').on(table.mediaId),
+    index('idx_library_items_removed')
+      .on(table.removedAt)
+      .where(sql`${table.removedAt} IS NOT NULL`),
+
+    // Ascending so a backward scan matches the recently-added ORDER BY created_at DESC, id DESC
+    index('idx_library_items_added_active')
+      .on(table.createdAt, table.id)
+      .where(sql`${table.removedAt} IS NULL`),
+
+    index('idx_library_items_type_added_active')
+      .on(table.mediaType, table.createdAt)
+      .where(sql`${table.removedAt} IS NULL`),
+
+    index('idx_library_items_resolution_active')
+      .on(table.videoResolution)
+      .where(sql`${table.removedAt} IS NULL`),
+
+    index('idx_library_items_dynamic_range_active')
+      .on(table.videoDynamicRange)
+      .where(sql`${table.removedAt} IS NULL`),
+  ]
+);
+
+/**
+ * Physical file versions of a library item. One row per Plex Media child /
+ * Jellyfin-Emby MediaSource; a single-file item has exactly one. Soft-deleted
+ * via removed_at so an upgrade or deletion leaves history; the 'legacy:1'
+ * sentinel rows seeded by the migration are the one exception and are hard
+ * deleted when real versions replace them.
+ */
+export const libraryItemVersions = pgTable(
+  'library_item_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+
+    libraryItemId: uuid('library_item_id')
+      .notNull()
+      .references(() => libraryItems.id, { onDelete: 'cascade' }),
+
+    // Plex Media.id / JF MediaSource.Id / Emby mediasource_{id}, stored as the
+    // server reports it. Server-scoped and unstable across library rebuilds.
+    serverVersionKey: varchar('server_version_key', { length: 255 }).notNull(),
+
+    videoResolution: varchar('video_resolution', { length: 20 }),
+    videoCodec: varchar('video_codec', { length: 50 }),
+    videoDynamicRange: varchar('video_dynamic_range', { length: 20 }),
+    audioCodec: varchar('audio_codec', { length: 50 }),
+    audioChannels: integer('audio_channels'),
+    container: varchar('container', { length: 50 }),
+    bitrate: integer('bitrate'), // kbps
+
+    fileSize: bigint('file_size', { mode: 'number' }), // SUM of this version's Parts, bytes
+    partCount: integer('part_count').notNull().default(1),
+    filePath: text('file_path'),
+
+    // Our own observation timestamp; no server reports when a version was added
+    firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    removedAt: timestamp('removed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('library_item_versions_item_key_unique').on(
+      table.libraryItemId,
+      table.serverVersionKey
+    ),
+    index('idx_liv_item_active')
+      .on(table.libraryItemId)
+      .where(sql`${table.removedAt} IS NULL`),
+    index('idx_liv_resolution_active')
+      .on(table.videoResolution)
+      .where(sql`${table.removedAt} IS NULL`),
+    // Backfill-completion signal: shrinks to empty as sentinels are replaced
+    index('idx_liv_legacy_sentinel')
+      .on(table.libraryItemId)
+      .where(sql`${table.serverVersionKey} = 'legacy:1'`),
+  ]
+);
+
+export const media = pgTable(
+  'media',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    mediaType: varchar('media_type', { length: 20 }).notNull(),
+    // Type-namespaced identity key, e.g. movie:imdb:tt0322259 (see mediaMatchKey.ts)
+    matchKey: text('match_key').notNull(),
+    imdbId: varchar('imdb_id', { length: 20 }),
+    tmdbId: integer('tmdb_id'),
+    tvdbId: integer('tvdb_id'),
+    title: text('title').notNull(),
+    normalizedTitle: text('normalized_title'),
+    // Browse ordering key: like normalized_title but with a leading English
+    // article (the/a/an) stripped, so "The Matrix" sorts and buckets under M.
+    // Computed in app code (buildSortTitle) alongside every title write; the
+    // old DB-generated expression used normalize(), which Postgres rejects on
+    // non-UTF8 clusters (supervised installs used to initdb as SQL_ASCII).
+    sortTitle: text('sort_title'),
+    year: integer('year'),
+    parentMediaId: uuid('parent_media_id'),
+    showMediaId: uuid('show_media_id'),
+    genres: text('genres').array(),
+    mergedIntoId: uuid('merged_into_id'),
+    // Newest library_items.created_at across all copies; drives recently-added browsing order
+    latestAddedAt: timestamp('latest_added_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('media_match_key_unique').on(table.matchKey),
+    index('idx_media_type_imdb')
+      .on(table.mediaType, table.imdbId)
+      .where(sql`${table.imdbId} IS NOT NULL`),
+    index('idx_media_type_tmdb')
+      .on(table.mediaType, table.tmdbId)
+      .where(sql`${table.tmdbId} IS NOT NULL`),
+    index('idx_media_type_tvdb')
+      .on(table.mediaType, table.tvdbId)
+      .where(sql`${table.tvdbId} IS NOT NULL`),
+    index('idx_media_type_title_year').on(table.mediaType, table.normalizedTitle, table.year),
+    index('idx_media_show').on(table.showMediaId),
+    index('idx_media_parent').on(table.parentMediaId),
+    index('idx_media_merged_into')
+      .on(table.mergedIntoId)
+      .where(sql`${table.mergedIntoId} IS NOT NULL`),
+
+    // Keyset pagination for recently-added browsing; both columns DESC for a uniform ROW comparison
+    index('idx_media_type_added_active')
+      .on(table.mediaType, table.latestAddedAt.desc(), table.id.desc())
+      .where(sql`${table.mergedIntoId} IS NULL`),
+    index('idx_media_title_trgm').using('gin', sql`${table.normalizedTitle} gin_trgm_ops`),
+    index('idx_media_type_title_id')
+      .on(table.mediaType, table.normalizedTitle, table.id)
+      .where(sql`${table.mergedIntoId} IS NULL`),
+    // Keyset/offset walking order for the title-sorted catalog (article-aware)
+    index('idx_media_type_sort_title_id')
+      .on(table.mediaType, table.sortTitle, table.id)
+      .where(sql`${table.mergedIntoId} IS NULL`),
+    // Offset walking order for the year-sorted catalog
+    index('idx_media_type_year_id')
+      .on(table.mediaType, table.year.desc(), table.id.desc())
+      .where(sql`${table.mergedIntoId} IS NULL`),
   ]
 );
 
@@ -1097,13 +1289,21 @@ export const librarySnapshots = pgTable(
     h264Count: integer('h264_count').notNull().default(0),
     av1Count: integer('av1_count').notNull().default(0),
 
-    // Enrichment status tracking
-    enrichmentPending: integer('enrichment_pending').notNull().default(0),
-    enrichmentComplete: integer('enrichment_complete').notNull().default(0),
+    // Multi-version rollups, nullable: NULL means "written before versions
+    // existed", distinct from a genuine zero. Buckets above are overlapping
+    // (a 4K+1080p title counts in both), so their sums can exceed item_count;
+    // count_high_quality is titles with any version at 1080p or better and
+    // cannot be derived from overlapping buckets.
+    countHighQuality: integer('count_high_quality'),
+    versionCount: integer('version_count'),
   },
   (table) => [
-    // Composite index for time-series queries by server and library
-    index('library_snapshots_server_library_time_idx').on(
+    // Unique (also covers the same composite time-series query pattern):
+    // one snapshot per server+library+time. Backfill relies on this at the
+    // database level (ON CONFLICT DO NOTHING) so a concurrent double-run
+    // can't create duplicate rows. Valid on a hypertable because it includes
+    // the partitioning column (snapshot_time).
+    uniqueIndex('library_snapshots_server_library_time_idx').on(
       table.serverId,
       table.libraryId,
       table.snapshotTime
@@ -1123,6 +1323,34 @@ export const librarySnapshotsRelations = relations(librarySnapshots, ({ one }) =
 export const libraryItemsRelations = relations(libraryItems, ({ one }) => ({
   server: one(servers, {
     fields: [libraryItems.serverId],
+    references: [servers.id],
+  }),
+}));
+
+/**
+ * Libraries - Names/media type for each server's libraries, keyed by the
+ * server's own library_id (the same id library_items.library_id carries).
+ * Populated during library sync; not present for library_ids synced before
+ * this table existed until their server's next sync.
+ */
+export const libraries = pgTable(
+  'libraries',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    serverId: uuid('server_id')
+      .notNull()
+      .references(() => servers.id, { onDelete: 'cascade' }),
+    libraryId: varchar('library_id', { length: 100 }).notNull(),
+    name: text('name').notNull(),
+    mediaType: varchar('media_type', { length: 20 }).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('libraries_server_library_unique').on(table.serverId, table.libraryId)]
+);
+
+export const librariesRelations = relations(libraries, ({ one }) => ({
+  server: one(servers, {
+    fields: [libraries.serverId],
     references: [servers.id],
   }),
 }));

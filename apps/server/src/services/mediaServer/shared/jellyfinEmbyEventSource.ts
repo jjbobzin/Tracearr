@@ -20,6 +20,12 @@ const UNSUPPORTED_REPROBE_MS = 3 * 60 * 1000;
 // Re-probe cadence once the reconnect budget is spent; polling covers data meanwhile
 const FALLBACK_RETRY_MS = 3 * 60 * 1000;
 
+// A 404 can come from a reverse proxy whose backend is restarting (Traefik 404s
+// while a container is down), not just from a missing plugin. Require this many
+// consecutive 404s before concluding the plugin is absent; anything less rides
+// the normal reconnect backoff.
+const UNSUPPORTED_404_THRESHOLD = 3;
+
 interface EventSourceMessage {
   data: string;
   lastEventId?: string;
@@ -54,8 +60,32 @@ export interface PluginSessionEvent {
   positionTicks: number | null;
 }
 
+// The Media-Server-SSE plugin emits these today: one event per changed item,
+// JSON body `{ "itemId": "...", "itemType": "...", "parentId": "..." }`. The
+// scheduled sync still runs as a backstop for anything missed here.
+const LIBRARY_ADDED_EVENT = 'library.item.added';
+const LIBRARY_REMOVED_EVENT = 'library.item.removed';
+
+export interface PluginLibraryEvent {
+  type: 'added' | 'removed';
+  itemId: string | null;
+}
+
+// Plugin v0.4+: CPU/RAM sample every 6s; host values omitted on non-Linux hosts
+const SERVER_STATS_EVENT = 'server.stats';
+
+export interface PluginServerStats {
+  at: number;
+  hostCpuUtilization: number | null;
+  processCpuUtilization: number | null;
+  hostMemoryUtilization: number | null;
+  processMemoryUtilization: number | null;
+}
+
 export interface JellyfinEmbyEventSourceEvents {
   'session:event': PluginSessionEvent;
+  'library:event': PluginLibraryEvent;
+  'stats:event': PluginServerStats;
   'connection:state': SSEConnectionState;
   'connection:error': Error;
 }
@@ -70,6 +100,7 @@ export class JellyfinEmbyEventSource extends EventEmitter {
   private eventSource: EventSource | null = null;
   private state: SSEConnectionState = 'disconnected';
   private reconnectAttempts = 0;
+  private consecutive404s = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private connectionTimer: NodeJS.Timeout | null = null;
@@ -80,8 +111,11 @@ export class JellyfinEmbyEventSource extends EventEmitter {
 
   private openListener: ((e: Event) => void) | null = null;
   private sessionEventListener: ((e: EventSourceMessage) => void) | null = null;
+  private libraryAddedListener: ((e: EventSourceMessage) => void) | null = null;
+  private libraryRemovedListener: ((e: EventSourceMessage) => void) | null = null;
   private pingListener: ((e: EventSourceMessage) => void) | null = null;
   private helloListener: ((ev: EventSourceMessage) => void) | null = null;
+  private statsListener: ((e: EventSourceMessage) => void) | null = null;
   private errorListener: ((e: Event) => void) | null = null;
 
   constructor(config: {
@@ -163,6 +197,7 @@ export class JellyfinEmbyEventSource extends EventEmitter {
         this.connectedAt = new Date();
         this.setState('connected');
         this.reconnectAttempts = 0;
+        this.consecutive404s = 0;
         this.lastError = null;
         this.startHeartbeatMonitor();
       };
@@ -186,7 +221,48 @@ export class JellyfinEmbyEventSource extends EventEmitter {
         }
       };
 
+      const handleLibraryEvent = (type: 'added' | 'removed') => (ev: EventSourceMessage) => {
+        this.lastEventTime = new Date();
+        this.resetHeartbeatMonitor();
+        if (!ev.data) return;
+        try {
+          const raw = JSON.parse(ev.data) as Record<string, unknown>;
+          const itemId = typeof raw.itemId === 'string' ? raw.itemId : null;
+          this.emit('library:event', { type, itemId });
+        } catch {
+          // malformed payload - ignore, the debounced sync still covers the change
+        }
+      };
+
+      const handleStatsEvent = (ev: EventSourceMessage) => {
+        this.lastEventTime = new Date();
+        this.resetHeartbeatMonitor();
+        if (!ev.data) return;
+        try {
+          const raw = JSON.parse(ev.data) as Record<string, unknown>;
+          if (typeof raw.at !== 'number') return;
+          this.emit('stats:event', {
+            at: raw.at,
+            hostCpuUtilization:
+              typeof raw.hostCpuUtilization === 'number' ? raw.hostCpuUtilization : null,
+            processCpuUtilization:
+              typeof raw.processCpuUtilization === 'number' ? raw.processCpuUtilization : null,
+            hostMemoryUtilization:
+              typeof raw.hostMemoryUtilization === 'number' ? raw.hostMemoryUtilization : null,
+            processMemoryUtilization:
+              typeof raw.processMemoryUtilization === 'number'
+                ? raw.processMemoryUtilization
+                : null,
+          });
+        } catch {
+          // malformed payload - drop the sample, the next one is 6s away
+        }
+      };
+
       this.sessionEventListener = handleSessionEvent;
+      this.libraryAddedListener = handleLibraryEvent('added');
+      this.libraryRemovedListener = handleLibraryEvent('removed');
+      this.statsListener = handleStatsEvent;
       this.pingListener = () => {
         this.lastEventTime = new Date();
         this.resetHeartbeatMonitor();
@@ -224,6 +300,9 @@ export class JellyfinEmbyEventSource extends EventEmitter {
       ]) {
         this.eventSource.addEventListener(eventName, this.sessionEventListener);
       }
+      this.eventSource.addEventListener(LIBRARY_ADDED_EVENT, this.libraryAddedListener);
+      this.eventSource.addEventListener(LIBRARY_REMOVED_EVENT, this.libraryRemovedListener);
+      this.eventSource.addEventListener(SERVER_STATS_EVENT, this.statsListener);
       this.eventSource.addEventListener('ping', this.pingListener);
       this.eventSource.addEventListener('hello', this.helloListener);
     } catch (error) {
@@ -240,8 +319,10 @@ export class JellyfinEmbyEventSource extends EventEmitter {
   }
 
   retryFromFallback(): void {
-    if (this.state !== 'fallback') return;
-    console.log(`[PluginSSE] Poll reached ${this.serverName}, retrying SSE from fallback`);
+    // 'unsupported' too: a wrong 404 verdict (proxy hiccup, plugin installed
+    // later) should heal as soon as a poll proves the server reachable.
+    if (this.state !== 'fallback' && this.state !== 'unsupported') return;
+    console.log(`[PluginSSE] Poll reached ${this.serverName}, retrying SSE from ${this.state}`);
     this.clearTimers();
     this.reconnectAttempts = 0;
     void this.connect();
@@ -266,6 +347,15 @@ export class JellyfinEmbyEventSource extends EventEmitter {
         this.eventSource.removeEventListener(eventName, this.sessionEventListener);
       }
     }
+    if (this.libraryAddedListener) {
+      this.eventSource.removeEventListener(LIBRARY_ADDED_EVENT, this.libraryAddedListener);
+    }
+    if (this.libraryRemovedListener) {
+      this.eventSource.removeEventListener(LIBRARY_REMOVED_EVENT, this.libraryRemovedListener);
+    }
+    if (this.statsListener) {
+      this.eventSource.removeEventListener(SERVER_STATS_EVENT, this.statsListener);
+    }
     if (this.pingListener) {
       this.eventSource.removeEventListener('ping', this.pingListener);
     }
@@ -277,10 +367,12 @@ export class JellyfinEmbyEventSource extends EventEmitter {
     this.eventSource = null;
     this.openListener = null;
     this.sessionEventListener = null;
+    this.libraryAddedListener = null;
+    this.libraryRemovedListener = null;
     this.pingListener = null;
     this.helloListener = null;
     this.errorListener = null;
-    this.pluginVersion = null;
+    // pluginVersion survives cleanup as "last seen"; the next hello overwrites it
   }
 
   private handleError(error: unknown): void {
@@ -312,10 +404,19 @@ export class JellyfinEmbyEventSource extends EventEmitter {
     this.lastError = error instanceof Error ? error : new Error(errorMessage);
     this.emit('connection:error', this.lastError);
 
-    // 404 means the Tracearr SSE plugin is not installed — don't hammer reconnects
+    // 404 suggests the plugin is not installed, but a proxy can 404 while its
+    // backend restarts, so only conclude unsupported after several in a row
     if (statusCode === 404) {
+      this.consecutive404s++;
+      if (this.consecutive404s < UNSUPPORTED_404_THRESHOLD) {
+        console.log(
+          `[PluginSSE] 404 from ${this.serverName} (${this.consecutive404s}/${UNSUPPORTED_404_THRESHOLD} before assuming plugin absent), retrying`
+        );
+        this.scheduleReconnect();
+        return;
+      }
       console.log(
-        `[PluginSSE] Plugin not found on ${this.serverName} (404), will re-probe in ${UNSUPPORTED_REPROBE_MS / 1000}s`
+        `[PluginSSE] Plugin endpoint 404 on ${this.serverName} (${this.consecutive404s} consecutive), will re-probe in ${UNSUPPORTED_REPROBE_MS / 1000}s`
       );
       this.setState('unsupported');
       this.reconnectTimer = setTimeout(() => {
@@ -326,6 +427,8 @@ export class JellyfinEmbyEventSource extends EventEmitter {
       }, UNSUPPORTED_REPROBE_MS);
       return;
     }
+
+    this.consecutive404s = 0;
 
     // 401/403 — auth issue, use standard reconnect but don't claim unsupported
     if (statusCode === 401 || statusCode === 403) {

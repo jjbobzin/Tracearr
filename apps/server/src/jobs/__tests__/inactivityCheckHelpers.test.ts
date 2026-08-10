@@ -7,6 +7,8 @@ import type { RuleConditions } from '@tracearr/shared';
 import {
   hasInactivityCondition,
   extractInactiveDaysFromConditions,
+  hasSessionOnlyGroup,
+  evaluateUserLevelConditions,
 } from '../inactivityCheckQueue.js';
 
 describe('hasInactivityCondition', () => {
@@ -143,12 +145,146 @@ describe('extractInactiveDaysFromConditions', () => {
     const conditions: RuleConditions = {
       groups: [
         {
-          conditions: [
-            { field: 'inactive_days', operator: 'eq', value: 'thirty' },
-          ],
+          conditions: [{ field: 'inactive_days', operator: 'eq', value: 'thirty' }],
         },
       ],
     };
     expect(extractInactiveDaysFromConditions(conditions)).toBeNull();
+  });
+});
+
+describe('hasSessionOnlyGroup', () => {
+  it('flags a group made entirely of session-only fields', () => {
+    const conditions: RuleConditions = {
+      groups: [
+        { conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] },
+        { conditions: [{ field: 'is_transcoding', operator: 'eq', value: true }] },
+      ],
+    };
+    expect(hasSessionOnlyGroup(conditions)).toBe(true);
+  });
+
+  it('passes when every group has at least one user-level field', () => {
+    const conditions: RuleConditions = {
+      groups: [
+        { conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] },
+        {
+          conditions: [
+            { field: 'is_transcoding', operator: 'eq', value: true },
+            { field: 'server_id', operator: 'eq', value: 'server-jf' },
+          ],
+        },
+      ],
+    };
+    expect(hasSessionOnlyGroup(conditions)).toBe(false);
+  });
+});
+
+describe('evaluateUserLevelConditions', () => {
+  const jellyfinUser = {
+    id: 'su-jf-1',
+    serverId: 'server-jf',
+    trustScore: 80,
+    createdAt: new Date(Date.now() - 120 * 24 * 60 * 60 * 1000),
+  };
+
+  it('applies a server-scoped condition group alongside inactivity', () => {
+    const conditions: RuleConditions = {
+      groups: [
+        { conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] },
+        { conditions: [{ field: 'server_id', operator: 'eq', value: 'server-jf' }] },
+      ],
+    };
+
+    expect(evaluateUserLevelConditions(conditions, jellyfinUser, 45)).toBe(true);
+    expect(
+      evaluateUserLevelConditions(conditions, { ...jellyfinUser, serverId: 'server-plex' }, 45)
+    ).toBe(false);
+  });
+
+  it('honors OR within a group', () => {
+    const conditions: RuleConditions = {
+      groups: [
+        {
+          conditions: [
+            { field: 'inactive_days', operator: 'gte', value: 30 },
+            { field: 'trust_score', operator: 'lt', value: 50 },
+          ],
+        },
+      ],
+    };
+
+    expect(evaluateUserLevelConditions(conditions, { ...jellyfinUser, trustScore: 30 }, 10)).toBe(
+      true
+    );
+    expect(evaluateUserLevelConditions(conditions, jellyfinUser, 10)).toBe(false);
+  });
+
+  it('evaluates account age in days', () => {
+    const conditions: RuleConditions = {
+      groups: [
+        { conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] },
+        { conditions: [{ field: 'account_age_days', operator: 'gte', value: 90 }] },
+      ],
+    };
+
+    expect(evaluateUserLevelConditions(conditions, jellyfinUser, 45)).toBe(true);
+    expect(
+      evaluateUserLevelConditions(
+        conditions,
+        { ...jellyfinUser, createdAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000) },
+        45
+      )
+    ).toBe(false);
+  });
+
+  it('never matches session-only fields without a session', () => {
+    const conditions: RuleConditions = {
+      groups: [{ conditions: [{ field: 'is_transcoding', operator: 'eq', value: true }] }],
+    };
+    expect(evaluateUserLevelConditions(conditions, jellyfinUser, 45)).toBe(false);
+  });
+
+  it('evaluates each inactive_days leaf with its own operator and threshold', () => {
+    const band: RuleConditions = {
+      groups: [
+        { conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] },
+        { conditions: [{ field: 'inactive_days', operator: 'lte', value: 60 }] },
+      ],
+    };
+
+    expect(evaluateUserLevelConditions(band, jellyfinUser, 45)).toBe(true);
+    expect(evaluateUserLevelConditions(band, jellyfinUser, 800)).toBe(false);
+    expect(evaluateUserLevelConditions(band, jellyfinUser, 10)).toBe(false);
+  });
+
+  it('matches user_id against any account of the merged identity', () => {
+    const conditions: RuleConditions = {
+      groups: [
+        { conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] },
+        { conditions: [{ field: 'user_id', operator: 'eq', value: 'su-plex-1' }] },
+      ],
+    };
+
+    expect(
+      evaluateUserLevelConditions(conditions, jellyfinUser, 45, ['su-plex-1', jellyfinUser.id])
+    ).toBe(true);
+    expect(evaluateUserLevelConditions(conditions, jellyfinUser, 45, [])).toBe(false);
+    expect(evaluateUserLevelConditions(conditions, jellyfinUser, 45, ['su-other'])).toBe(false);
+  });
+
+  it('treats never-active accounts as infinitely inactive per operator', () => {
+    const gte: RuleConditions = {
+      groups: [{ conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] }],
+    };
+    const band: RuleConditions = {
+      groups: [
+        { conditions: [{ field: 'inactive_days', operator: 'gte', value: 30 }] },
+        { conditions: [{ field: 'inactive_days', operator: 'lte', value: 60 }] },
+      ],
+    };
+
+    expect(evaluateUserLevelConditions(gte, jellyfinUser, null)).toBe(true);
+    expect(evaluateUserLevelConditions(band, jellyfinUser, null)).toBe(false);
   });
 });

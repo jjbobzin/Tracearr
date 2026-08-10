@@ -11,9 +11,12 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import sensible from '@fastify/sensible';
 import { randomUUID } from 'node:crypto';
 
-// Mock image proxy service
+// Mock image proxy service. posterVersionFor is fixed so tests control which
+// requests are a "matching" v vs a mismatch without depending on the real hash.
 vi.mock('../../services/imageProxy.js', () => ({
   proxyImage: vi.fn(),
+  POSTER_BUCKET_WIDTHS: [160, 240, 360],
+  posterVersionFor: vi.fn(() => 'abcd1234'),
 }));
 
 // Import mocked service and routes
@@ -285,6 +288,143 @@ describe('Image Routes', () => {
       });
 
       expect(response.statusCode).toBe(400);
+    });
+
+    it('sets an immutable long-lived Cache-Control when v is present with an allowed width', async () => {
+      app = await buildTestApp();
+
+      mockProxyImage.mockResolvedValue({
+        data: Buffer.from('image'),
+        contentType: 'image/webp',
+        cached: false,
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/images/proxy',
+        query: {
+          server: validServerId,
+          url: '/path',
+          width: '240',
+          height: '360',
+          v: 'abcd1234',
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['cache-control']).toBe('public, max-age=31536000, immutable');
+      expect(mockProxyImage).toHaveBeenCalledWith(
+        expect.objectContaining({ width: 240, height: 360, version: 'abcd1234' })
+      );
+    });
+
+    it('rejects v with a width outside the poster bucket allow-list', async () => {
+      app = await buildTestApp();
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/images/proxy',
+        query: {
+          server: validServerId,
+          url: '/path',
+          width: '300',
+          v: 'abcd1234',
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    it('lets a degraded LQIP result override the Cache-Control header', async () => {
+      app = await buildTestApp();
+
+      mockProxyImage.mockResolvedValue({
+        data: Buffer.from('lqip'),
+        contentType: 'image/webp',
+        cached: false,
+        cacheControl: 'public, max-age=60',
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/images/proxy',
+        query: {
+          server: validServerId,
+          url: '/path',
+          width: '240',
+          height: '360',
+          v: 'abcd1234',
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['cache-control']).toBe('public, max-age=60');
+    });
+
+    it('serves the fallback with a short, non-immutable Cache-Control on a versioned request when upstream errors', async () => {
+      app = await buildTestApp();
+
+      mockProxyImage.mockResolvedValue({
+        data: Buffer.from('<svg>fallback</svg>'),
+        contentType: 'image/svg+xml',
+        cached: false,
+        cacheControl: 'public, max-age=15',
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/images/proxy',
+        query: {
+          server: validServerId,
+          url: '/path',
+          width: '240',
+          height: '360',
+          v: 'abcd1234',
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toBe('image/svg+xml');
+      expect(response.headers['cache-control']).toBe('public, max-age=15');
+      expect(response.headers['cache-control']).not.toContain('immutable');
+    });
+
+    it('rejects a v that does not match the fingerprint for the given url', async () => {
+      app = await buildTestApp();
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/images/proxy',
+        query: {
+          server: validServerId,
+          url: '/path',
+          width: '240',
+          height: '360',
+          v: 'deadbeef',
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(mockProxyImage).not.toHaveBeenCalled();
+    });
+
+    it('rejects a versioned request whose height is not width * 1.5', async () => {
+      app = await buildTestApp();
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/images/proxy',
+        query: {
+          server: validServerId,
+          url: '/path',
+          width: '240',
+          height: '400',
+          v: 'abcd1234',
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(mockProxyImage).not.toHaveBeenCalled();
     });
   });
 

@@ -34,8 +34,8 @@ describe('findActiveSession with SessionIdentity', () => {
           let columnName = 'unknown';
           if (typeof column === 'object' && column !== null) {
             // Try different properties where drizzle might store the column name
-            if ('name' in column) columnName = String((column).name);
-            else if ('_' in column && typeof (column)._ === 'object') {
+            if ('name' in column) columnName = String(column.name);
+            else if ('_' in column && typeof column._ === 'object') {
               const inner = (column as { _: { name?: string } })._;
               if (inner?.name) columnName = inner.name;
             }
@@ -57,7 +57,9 @@ describe('findActiveSession with SessionIdentity', () => {
         select: () => ({
           from: () => ({
             where: () => ({
-              limit: () => Promise.resolve([{ id: 'session-1', ratingKey: 'episode-100' }]),
+              orderBy: () => ({
+                limit: () => Promise.resolve([{ id: 'session-1', ratingKey: 'episode-100' }]),
+              }),
             }),
           }),
         }),

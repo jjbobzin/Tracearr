@@ -47,9 +47,6 @@ export const FILTERED_ITEM_TYPES = new Set([
   'trailer', // Movie trailers
 ]);
 
-/** Extra types that should be filtered (prerolls, theme songs/videos) */
-export const FILTERED_EXTRA_TYPES = new Set(['themesong', 'themevideo']);
-
 /** Stream type constants matching Jellyfin/Emby API */
 const STREAM_TYPE = {
   VIDEO: 'Video',
@@ -72,6 +69,12 @@ const VIDEO_RANGE_TYPE_MAP: Record<string, string> = {
   DOVIWithHDR10: 'Dolby Vision',
   DOVIWithHLG: 'Dolby Vision',
   DOVIWithHDR10Plus: 'Dolby Vision',
+  DOVIWithSDR: 'Dolby Vision',
+  DOVIWithEL: 'Dolby Vision',
+  DOVIWithELHDR10Plus: 'Dolby Vision',
+  // Jellyfin's own enum doc: invalid DV configs (e.g. Profile 8 compat id 6) have their
+  // DV metadata stripped server-side and are then treated as HDR10, so we match that.
+  DOVIInvalid: 'HDR10',
 };
 
 // ============================================================================
@@ -111,6 +114,32 @@ export function parseMediaType(type: unknown): MediaSession['media']['type'] {
 }
 
 /**
+ * Resolve the MediaSource for the version actually playing.
+ * PlayState.MediaSourceId names the played version and is the only reliable
+ * identity when an item has several versions (NowPlayingItem.Path shows the
+ * primary version's file regardless of what plays). Modern servers (JF 12,
+ * Emby 4.9) omit MediaSources from /Sessions entirely, so callers must fall
+ * back to NowPlayingItem.MediaStreams, which describe the playing version.
+ */
+export function findPlayingMediaSource(
+  session: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const nowPlaying = getNestedObject(session, 'NowPlayingItem');
+  const mediaSources = nowPlaying?.MediaSources;
+  if (!Array.isArray(mediaSources) || mediaSources.length === 0) return undefined;
+
+  const playState = getNestedObject(session, 'PlayState');
+  const sourceId = parseOptionalString(playState?.MediaSourceId);
+  if (sourceId) {
+    const match = (mediaSources as unknown[]).find(
+      (source) => parseOptionalString((source as Record<string, unknown>)?.Id) === sourceId
+    ) as Record<string, unknown> | undefined;
+    if (match) return match;
+  }
+  return mediaSources[0] as Record<string, unknown>;
+}
+
+/**
  * Get bitrate from session in kbps
  * Both APIs return bitrate in bps, we convert to kbps for Plex consistency
  */
@@ -125,11 +154,10 @@ export function getBitrate(session: Record<string, unknown>): number {
   // Fall back to source media bitrate
   const nowPlaying = getNestedObject(session, 'NowPlayingItem');
 
-  // Jellyfin/Emby: NowPlayingItem.MediaSources[0].Bitrate (when available)
-  const mediaSources = nowPlaying?.MediaSources;
-  if (Array.isArray(mediaSources) && mediaSources.length > 0) {
-    const firstSource = mediaSources[0] as Record<string, unknown>;
-    const bitrate = parseNumber(firstSource?.Bitrate);
+  // Jellyfin/Emby: playing MediaSource's Bitrate (when /Sessions includes MediaSources)
+  const mediaSource = findPlayingMediaSource(session);
+  if (mediaSource) {
+    const bitrate = parseNumber(mediaSource.Bitrate);
     if (bitrate > 0) return Math.round(bitrate / 1000);
   }
 
@@ -152,10 +180,7 @@ export function getBitrate(session: Record<string, unknown>): number {
 
   // Final fallback: Calculate from file size and duration
   // This helps for Direct Play sessions where bitrate isn't explicitly provided
-  const fileSize =
-    Array.isArray(mediaSources) && mediaSources.length > 0
-      ? parseNumber((mediaSources[0] as Record<string, unknown>)?.Size)
-      : 0;
+  const fileSize = mediaSource ? parseNumber(mediaSource.Size) : 0;
   const runTimeTicks = parseNumber(nowPlaying?.RunTimeTicks);
   if (fileSize > 0 && runTimeTicks > 0) {
     // fileSize in bytes, runTimeTicks in ticks (10,000,000 ticks = 1 second)
@@ -178,14 +203,10 @@ export function getVideoDimensions(session: Record<string, unknown>): {
   // Get source media dimensions from MediaStreams (original file)
   const nowPlaying = getNestedObject(session, 'NowPlayingItem');
 
-  // Get MediaStreams - Jellyfin style or Emby style
-  const mediaSources = nowPlaying?.MediaSources;
-  let mediaStreams: unknown[] | undefined;
-  if (Array.isArray(mediaSources) && mediaSources.length > 0) {
-    const firstSource = mediaSources[0] as Record<string, unknown>;
-    mediaStreams = firstSource?.MediaStreams as unknown[] | undefined;
-  }
-  // Emby: NowPlayingItem.MediaStreams (directly on item)
+  // Get MediaStreams from the playing MediaSource, or directly on the item
+  // (modern servers omit MediaSources from /Sessions)
+  const mediaSource = findPlayingMediaSource(session);
+  let mediaStreams = mediaSource?.MediaStreams as unknown[] | undefined;
   if (!mediaStreams && Array.isArray(nowPlaying?.MediaStreams)) {
     mediaStreams = nowPlaying.MediaStreams as unknown[];
   }
@@ -390,20 +411,31 @@ export function extractMusicMetadata(nowPlaying: Record<string, unknown>): {
 }
 
 /**
- * Check if an item should be filtered (trailers, prerolls, theme songs)
+ * Check if an item is an extra (trailer, behind-the-scenes, clip, theme song/video, etc.)
+ * rather than primary playable content. Shared by session parsing (filters what shows up
+ * as "now playing") and library item parsing (filters what gets ingested into library_items).
+ *
+ * Jellyfin/Emby mark extras with a non-empty ExtraType field (Trailer, BehindTheScenes,
+ * Clip, ThemeVideo, ThemeSong, Interview, Scene, Sample, etc.) even when the item's own
+ * Type matches its parent's (e.g. a local trailer file scanned as Type: Movie). Any
+ * non-empty ExtraType means the item is an extra, not primary content.
  */
 export function shouldFilterItem(nowPlaying: Record<string, unknown>): boolean {
   const itemType = parseString(nowPlaying.Type).toLowerCase();
-  const extraType = parseOptionalString(nowPlaying.ExtraType)?.toLowerCase();
   const providerIds = getNestedObject(nowPlaying, 'ProviderIds');
 
-  // Filter trailers
+  // Filter trailers (item itself typed as Trailer, e.g. from an active playback session)
   if (FILTERED_ITEM_TYPES.has(itemType)) {
     return true;
   }
 
-  // Filter theme songs and theme videos
-  if (extraType && FILTERED_EXTRA_TYPES.has(extraType)) {
+  // ExtraType must be a real string here, not just non-nullish: parseOptionalString
+  // coerces any non-nullish value via String(), so a non-string ExtraType (e.g. a
+  // numeric enum 0) would come back as the truthy string '0' and filter every item.
+  const extraType = typeof nowPlaying.ExtraType === 'string' ? nowPlaying.ExtraType.trim() : '';
+
+  // Filter any extra (trailer, behind-the-scenes, clip, theme song/video, etc.)
+  if (extraType) {
     return true;
   }
 
@@ -458,8 +490,9 @@ function findStreamByType(
 /**
  * Map VideoRangeType to dynamic range string.
  * Falls back to color attribute detection if VideoRangeType not available.
+ * @internal Exported for reuse by library sync's extractQuality and for unit testing
  */
-function mapDynamicRange(stream: Record<string, unknown>): string {
+export function mapDynamicRange(stream: Record<string, unknown>): string {
   // Try direct VideoRangeType first (most accurate)
   const videoRangeType = parseOptionalString(stream.VideoRangeType);
   if (videoRangeType && VIDEO_RANGE_TYPE_MAP[videoRangeType]) {
@@ -513,9 +546,7 @@ function extractSourceVideoDetails(stream: Record<string, unknown> | undefined):
   const bitrate = parseOptionalNumber(stream.BitRate);
   if (bitrate) details.bitrate = Math.round(bitrate / 1000);
 
-  // Framerate - prefer RealFrameRate
-  const frameRate =
-    parseOptionalNumber(stream.RealFrameRate) ?? parseOptionalNumber(stream.AverageFrameRate);
+  const frameRate = getStreamFrameRate(stream);
   if (frameRate) details.framerate = frameRate.toString();
 
   // Dynamic range
@@ -600,13 +631,18 @@ function extractSubtitleInfo(
   return Object.keys(info).length > 0 ? info : undefined;
 }
 
+/** Preferred frame rate for a media stream */
+function getStreamFrameRate(stream: Record<string, unknown>): number | undefined {
+  return parseOptionalNumber(stream.RealFrameRate) ?? parseOptionalNumber(stream.AverageFrameRate);
+}
+
 /**
  * Extract transcode info from TranscodingInfo object
- * Note: Jellyfin/Emby don't expose hardware acceleration details
  */
 function extractTranscodeInfo(
   transcodingInfo: Record<string, unknown> | undefined,
-  mediaSource: Record<string, unknown> | undefined
+  mediaSource: Record<string, unknown> | undefined,
+  sourceFrameRate?: number
 ): TranscodeInfo | undefined {
   const info: TranscodeInfo = {};
 
@@ -633,9 +669,51 @@ function extractTranscodeInfo(
       info.reasons = Array.from(new Set(reasons));
     }
 
-    // Note: Jellyfin/Emby don't expose these fields:
-    // - hwRequested, hwDecoding, hwEncoding
-    // - speed, throttled
+    const progress = parseOptionalNumber(transcodingInfo.CompletionPercentage);
+    if (progress !== undefined) info.progress = progress;
+
+    // Framerate is the transcoder's output fps; against the source fps that
+    // is the x-realtime speed Plex reports natively
+    const transcodeFps = parseOptionalNumber(transcodingInfo.Framerate);
+    if (transcodeFps && sourceFrameRate && sourceFrameRate > 0) {
+      info.speed = Math.round((transcodeFps / sourceFrameRate) * 10) / 10;
+    }
+
+    // Emby: CurrentThrottle is the applied throttle rate; nonzero means active
+    const currentThrottle = parseOptionalNumber(transcodingInfo.CurrentThrottle);
+    if (currentThrottle !== undefined && currentThrottle > 0) info.throttled = true;
+
+    // Emby: absolute position the transcoder has reached in the file
+    const positionTicks = parseOptionalNumber(transcodingInfo.TranscodingPositionTicks);
+    if (positionTicks !== undefined && positionTicks > 0) {
+      info.maxOffsetAvailable = Math.round(ticksToMs(positionTicks) / 1000);
+    }
+
+    // Jellyfin: one pipeline-wide acceleration enum ('none' when software)
+    const jfAccel = parseOptionalString(transcodingInfo.HardwareAccelerationType);
+    if (jfAccel && jfAccel !== 'none') {
+      info.hwRequested = true;
+      info.hwEncoding = jfAccel;
+    }
+
+    // Emby: per-direction acceleration detail
+    const decoderHw =
+      transcodingInfo.VideoDecoderIsHardware === true
+        ? parseOptionalString(transcodingInfo.VideoDecoderHwAccel)
+        : undefined;
+    if (decoderHw) {
+      info.hwRequested = true;
+      info.hwDecoding = decoderHw;
+    }
+
+    const encoderHw =
+      transcodingInfo.VideoEncoderIsHardware === true
+        ? parseOptionalString(transcodingInfo.VideoEncoderHwAccel)
+        : undefined;
+    if (encoderHw) {
+      info.hwRequested = true;
+      info.hwEncoding = encoderHw;
+    }
   }
 
   return Object.keys(info).length > 0 ? info : undefined;
@@ -721,11 +799,9 @@ export function extractStreamDetails(session: Record<string, unknown>): StreamDe
   const nowPlaying = getNestedObject(session, 'NowPlayingItem');
   const transcodingInfo = getNestedObject(session, 'TranscodingInfo');
 
-  // Get MediaSources and MediaStreams
-  // Jellyfin: NowPlayingItem.MediaSources[0].MediaStreams
-  // Emby: NowPlayingItem.MediaStreams (directly on item)
-  const mediaSources = nowPlaying?.MediaSources as Array<Record<string, unknown>> | undefined;
-  const mediaSource = mediaSources?.[0];
+  // Streams come from the playing MediaSource when /Sessions includes the
+  // array, else directly off NowPlayingItem (JF 12 / Emby 4.9 shape)
+  const mediaSource = findPlayingMediaSource(session);
   const mediaStreams =
     (mediaSource?.MediaStreams as Array<Record<string, unknown>> | undefined) ??
     (nowPlaying?.MediaStreams as Array<Record<string, unknown>> | undefined);
@@ -757,7 +833,11 @@ export function extractStreamDetails(session: Record<string, unknown>): StreamDe
   );
   const streamAudio = extractStreamAudioDetails(transcodingInfo);
 
-  const transcodeInfo = extractTranscodeInfo(transcodingInfo, mediaSource);
+  const transcodeInfo = extractTranscodeInfo(
+    transcodingInfo,
+    mediaSource,
+    videoStream ? getStreamFrameRate(videoStream) : undefined
+  );
   const subtitleInfo = extractSubtitleInfo(subtitleStream);
 
   return {

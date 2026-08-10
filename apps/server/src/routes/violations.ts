@@ -27,10 +27,7 @@ import {
   resolveServerIds,
   buildMultiServerCondition,
 } from '../utils/serverFiltering.js';
-import {
-  getServerUserDisplayNames,
-  recalculateAggregateTrustScore,
-} from '../services/userService.js';
+import { getServerUserDisplayNames, recomputeIdentityAggregates } from '../services/userService.js';
 import { resolveAccessibleServerUserIdsForIdentities } from './users/queries.js';
 import { uuidArraySql } from '../utils/sqlArrays.js';
 
@@ -710,6 +707,8 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       conditions.push(isNull(violations.acknowledgedAt));
     }
 
+    conditions.push(isNull(violations.dismissedAt));
+
     if (startDate) {
       conditions.push(gte(violations.createdAt, startDate));
     }
@@ -808,6 +807,8 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       countConditions.push(sql`v.acknowledged_at IS NULL`);
     }
 
+    countConditions.push(sql`v.dismissed_at IS NULL`);
+
     if (startDate) {
       countConditions.push(sql`v.created_at >= ${startDate}`);
     }
@@ -899,7 +900,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       .leftJoin(users, eq(serverUsers.userId, users.id))
       .innerJoin(servers, eq(serverUsers.serverId, servers.id))
       .leftJoin(sessions, eq(violations.sessionId, sessions.id))
-      .where(eq(violations.id, id))
+      .where(and(eq(violations.id, id), isNull(violations.dismissedAt)))
       .limit(1);
 
     const violation = violationRows[0];
@@ -973,7 +974,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       })
       .from(violations)
       .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
-      .where(eq(violations.id, id))
+      .where(and(eq(violations.id, id), isNull(violations.dismissedAt)))
       .limit(1);
 
     const violation = violationRows[0];
@@ -992,7 +993,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       .set({
         acknowledgedAt: new Date(),
       })
-      .where(eq(violations.id, id))
+      .where(and(eq(violations.id, id), isNull(violations.dismissedAt)))
       .returning({
         id: violations.id,
         acknowledgedAt: violations.acknowledgedAt,
@@ -1010,11 +1011,11 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
   });
 
   /**
-   * DELETE /violations/:id - Dismiss (delete) a violation
+   * DELETE /violations/:id - Dismiss a violation
    *
    * Dismissing a violation:
    * 1. Reverses any trust score changes made by explicit rule actions (adjust_trust)
-   * 2. Deletes the violation record
+   * 2. Soft-deletes the row (dismissedAt) so dedup keeps blocking re-creation
    *
    * This treats dismiss as "false positive, undo everything".
    * For just marking as seen, use PATCH (acknowledge) instead.
@@ -1033,7 +1034,8 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       return reply.forbidden('Only server owners can dismiss violations');
     }
 
-    // Check violation exists and get info needed for trust reversal
+    // Check violation exists and get info needed for trust reversal. A
+    // dismissed violation 404s so trust can never be reversed twice.
     const violationRows = await db
       .select({
         id: violations.id,
@@ -1044,7 +1046,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       })
       .from(violations)
       .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
-      .where(eq(violations.id, id))
+      .where(and(eq(violations.id, id), isNull(violations.dismissedAt)))
       .limit(1);
 
     const violation = violationRows[0];
@@ -1076,10 +1078,20 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
-    // Delete violation and reverse trust score atomically
-    await db.transaction(async (tx) => {
-      // Delete the violation
-      await tx.delete(violations).where(eq(violations.id, id));
+    // Dismiss violation and reverse trust score atomically. Soft delete: the
+    // row stays so session and inactivity dedup keep blocking re-creation.
+    // The dismissedAt guard on the write makes a concurrent dismiss lose the
+    // race cleanly instead of reversing trust twice.
+    const dismissed = await db.transaction(async (tx) => {
+      const stamped = await tx
+        .update(violations)
+        .set({ dismissedAt: new Date() })
+        .where(and(eq(violations.id, id), isNull(violations.dismissedAt)))
+        .returning({ id: violations.id });
+
+      if (stamped.length === 0) {
+        return false;
+      }
 
       // Reverse trust score adjustment (if any was made)
       if (trustAdjustmentToReverse !== 0) {
@@ -1091,12 +1103,17 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
             updatedAt: new Date(),
           })
           .where(eq(serverUsers.id, violation.serverUserId));
-
-        // Keep the person's overall trust rollup current in the same
-        // transaction as the reversal.
-        await recalculateAggregateTrustScore(violation.userId, tx);
       }
+
+      // users.totalViolations counts non-dismissed rows, so the rollup must
+      // recompute on every dismiss, not only when trust was reversed.
+      await recomputeIdentityAggregates(violation.userId, tx);
+      return true;
     });
+
+    if (!dismissed) {
+      return reply.notFound('Violation not found');
+    }
 
     return { success: true };
   });
@@ -1166,11 +1183,13 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
         conditions.push(isNull(violations.acknowledgedAt));
       }
 
+      conditions.push(isNull(violations.dismissedAt));
+
       const matchingViolations = await db
         .select({ id: violations.id })
         .from(violations)
         .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
-        .where(conditions.length > 0 ? and(...conditions) : undefined);
+        .where(and(...conditions));
 
       violationIds = matchingViolations.map((v) => v.id);
     } else if (body.ids) {
@@ -1181,7 +1200,8 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       return { success: true, acknowledged: 0 };
     }
 
-    // Verify access to all violations
+    // Verify access to all violations. Filtering dismissed rows here keeps
+    // them out of accessibleIds so the acknowledged count stays honest.
     const accessibleViolations = await db
       .select({
         id: violations.id,
@@ -1189,7 +1209,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       })
       .from(violations)
       .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
-      .where(inArray(violations.id, violationIds));
+      .where(and(inArray(violations.id, violationIds), isNull(violations.dismissedAt)));
 
     // Filter to only accessible violations
     const accessibleIds = accessibleViolations
@@ -1204,7 +1224,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
     await db
       .update(violations)
       .set({ acknowledgedAt: new Date() })
-      .where(inArray(violations.id, accessibleIds));
+      .where(and(inArray(violations.id, accessibleIds), isNull(violations.dismissedAt)));
 
     return { success: true, acknowledged: accessibleIds.length };
   });
@@ -1276,11 +1296,13 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
         conditions.push(isNotNull(violations.acknowledgedAt));
       }
 
+      conditions.push(isNull(violations.dismissedAt));
+
       const matchingViolations = await db
         .select({ id: violations.id })
         .from(violations)
         .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
-        .where(conditions.length > 0 ? and(...conditions) : undefined);
+        .where(and(...conditions));
 
       violationIds = matchingViolations.map((v) => v.id);
     } else if (body.ids) {
@@ -1291,7 +1313,8 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       return { success: true, dismissed: 0 };
     }
 
-    // Get violation details including rule ID for trust reversal
+    // Get violation details including rule ID for trust reversal. Dismissed
+    // rows are excluded so re-sending their ids cannot re-reverse trust.
     const violationDetails = await db
       .select({
         id: violations.id,
@@ -1302,7 +1325,7 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       })
       .from(violations)
       .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
-      .where(inArray(violations.id, violationIds));
+      .where(and(inArray(violations.id, violationIds), isNull(violations.dismissedAt)));
 
     // Filter to only accessible violations
     const accessibleViolations = violationDetails.filter((v) =>
@@ -1335,30 +1358,32 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
       ruleAdjustments.set(rule.id, adjustment);
     }
 
-    // Calculate trust adjustments to reverse per server account, and track
-    // which identity each server account belongs to for the rollup recompute
-    const trustReverseByUser = new Map<string, number>();
-    const identityByServerUser = new Map<string, string>();
-    for (const v of accessibleViolations) {
-      identityByServerUser.set(v.serverUserId, v.userId);
-      const adjustment = ruleAdjustments.get(v.ruleId) ?? 0;
-      if (adjustment !== 0) {
-        trustReverseByUser.set(
-          v.serverUserId,
-          (trustReverseByUser.get(v.serverUserId) ?? 0) + adjustment
-        );
-      }
-    }
-
     const accessibleIds = accessibleViolations.map((v) => v.id);
 
-    // Delete violations and reverse trust scores atomically
-    await db.transaction(async (tx) => {
-      // Delete all violations
-      await tx.delete(violations).where(inArray(violations.id, accessibleIds));
+    // Dismiss violations and reverse trust scores atomically. Soft delete:
+    // the rows stay so session and inactivity dedup keep blocking re-creation.
+    // Reversals derive from the rows THIS request stamped, so a concurrent
+    // dismiss racing the same ids cannot reverse trust twice.
+    const dismissedCount = await db.transaction(async (tx) => {
+      const stamped = await tx
+        .update(violations)
+        .set({ dismissedAt: new Date() })
+        .where(and(inArray(violations.id, accessibleIds), isNull(violations.dismissedAt)))
+        .returning({ id: violations.id });
+      const stampedIds = new Set(stamped.map((row) => row.id));
+      const stampedViolations = accessibleViolations.filter((v) => stampedIds.has(v.id));
 
       // Reverse trust scores for each affected user
-      const affectedIdentityIds = new Set<string>();
+      const trustReverseByUser = new Map<string, number>();
+      for (const v of stampedViolations) {
+        const adjustment = ruleAdjustments.get(v.ruleId) ?? 0;
+        if (adjustment !== 0) {
+          trustReverseByUser.set(
+            v.serverUserId,
+            (trustReverseByUser.get(v.serverUserId) ?? 0) + adjustment
+          );
+        }
+      }
       for (const [serverUserId, totalAdjustment] of trustReverseByUser) {
         // Reverse by applying the opposite adjustment
         await tx
@@ -1368,21 +1393,19 @@ export const violationRoutes: FastifyPluginAsync = async (app) => {
             updatedAt: new Date(),
           })
           .where(eq(serverUsers.id, serverUserId));
-
-        const identityId = identityByServerUser.get(serverUserId);
-        if (identityId) {
-          affectedIdentityIds.add(identityId);
-        }
       }
 
-      // Keep every affected identity's overall trust rollup current in the
-      // same transaction as the reversals (once per identity, since a merged
-      // person can have more than one affected account here).
+      // users.totalViolations counts non-dismissed rows, so every affected
+      // identity recomputes, not only the trust-reversed ones. Once per
+      // identity, since a merged person can have several accounts here.
+      const affectedIdentityIds = new Set(stampedViolations.map((v) => v.userId));
       for (const identityId of affectedIdentityIds) {
-        await recalculateAggregateTrustScore(identityId, tx);
+        await recomputeIdentityAggregates(identityId, tx);
       }
+
+      return stamped.length;
     });
 
-    return { success: true, dismissed: accessibleIds.length };
+    return { success: true, dismissed: dismissedCount };
   });
 };

@@ -11,7 +11,11 @@
 
 import { Queue, Worker, type Job, type ConnectionOptions } from 'bullmq';
 import { getRedisPrefix, type Action } from '@tracearr/shared';
-import { getActionExecutorDeps, type ActionResult } from '../services/rules/executors/index.js';
+import {
+  getActionExecutorDeps,
+  cooldownTargetId,
+  type ActionResult,
+} from '../services/rules/executors/index.js';
 import { isMaintenance } from '../serverState.js';
 import {
   reverifyKillCondition,
@@ -200,7 +204,7 @@ export async function processKillJob(job: Job<KillJobData>): Promise<void> {
   ) {
     await getActionExecutorDeps().setCooldown(
       ruleId,
-      `${ruleId}:${triggeringServerUserId}`,
+      cooldownTargetId(ruleId, triggeringServerUserId, 'kill_stream'),
       cooldownMinutes
     );
   }

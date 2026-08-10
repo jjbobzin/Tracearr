@@ -140,7 +140,9 @@ function convertDeviceVelocity(params: DeviceVelocityParams): RuleConditions {
           operator: 'gt',
           value: params.maxIps,
           params: {
-            window_hours: params.windowHours,
+            // v1 accepted any windowHours; the v2 schema caps at 168 and a
+            // larger value would make the converted rule uneditable
+            window_hours: Math.min(params.windowHours || 24, 168),
           },
         },
       ],
@@ -273,7 +275,9 @@ function convertAccountInactivity(params: AccountInactivityParams): RuleConditio
         conditions: [
           {
             field: 'inactive_days',
-            operator: 'gt',
+            // v1's evaluateAccountInactivity compared with gte; gt here
+            // fired one day late for every converted rule
+            operator: 'gte',
             value: inactivityDays,
           },
         ],

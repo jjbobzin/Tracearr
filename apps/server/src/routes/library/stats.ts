@@ -14,7 +14,7 @@
  */
 
 import type { FastifyPluginAsync } from 'fastify';
-import { aliasedTable, sql } from 'drizzle-orm';
+import { sql } from 'drizzle-orm';
 import {
   REDIS_KEYS,
   CACHE_TTL,
@@ -22,10 +22,9 @@ import {
   type LibraryStatsQueryInput,
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { libraryItems } from '../../db/schema.js';
+import { hasVersionInBucket } from '../../utils/resolutionBuckets.js';
 import { resolveServerIds, buildMultiServerFragment } from '../../utils/serverFiltering.js';
-import { buildExternalIdMatchKey } from '../../services/library/buildExternalIdMatchKey.js';
-import { buildLibraryCacheKey } from './utils.js';
+import { buildLibraryCacheKey, dedupedStorageBytesSql } from './utils.js';
 
 /** Library stats response shape */
 interface LibraryStatsResponse {
@@ -85,6 +84,18 @@ export const libraryStatsRoute: FastifyPluginAsync = async (app) => {
 
       let stats: LibraryStatsResponse;
 
+      // Mirror-deduped bytes (#478): the same physical file in several
+      // libraries or servers counts once. Used by both paths below in place
+      // of snapshot/flat sums, which per-library-sum mirrored files.
+      const dedupedServerFilter = buildMultiServerFragment(resolvedIds, 'li.server_id');
+      const dedupedLibraryFilter = libraryId ? sql`AND li.library_id = ${libraryId}` : sql``;
+      const dedupedResult = await db.execute(sql`
+        SELECT ${dedupedStorageBytesSql(dedupedServerFilter, dedupedLibraryFilter)}::bigint AS total
+      `);
+      const dedupedBytes = String(
+        (dedupedResult.rows[0] as { total: string } | undefined)?.total ?? '0'
+      );
+
       if (singleServer) {
         // Single-server: query library_snapshots verbatim (matches main branch + growth charts)
         const serverFilter = sql`AND ls.server_id = ${resolvedIds[0]}::uuid`;
@@ -140,7 +151,7 @@ export const libraryStatsRoute: FastifyPluginAsync = async (app) => {
 
         stats = {
           totalItems: row?.total_items ?? 0,
-          totalSizeBytes: row?.total_size_bytes ?? '0',
+          totalSizeBytes: dedupedBytes,
           movieCount: row?.movie_count ?? 0,
           episodeCount: row?.episode_count ?? 0,
           showCount: row?.show_count ?? 0,
@@ -157,22 +168,23 @@ export const libraryStatsRoute: FastifyPluginAsync = async (app) => {
         const serverFilter = buildMultiServerFragment(resolvedIds, 'li.server_id');
         const libraryFilter = libraryId ? sql`AND li.library_id = ${libraryId}` : sql``;
 
-        const matchKey = buildExternalIdMatchKey(aliasedTable(libraryItems, 'li'));
+        const matchKey = sql`COALESCE(li.media_id::text, li.id::text)`;
 
         const result = await db.execute(sql`
           SELECT
             COUNT(DISTINCT CASE WHEN li.file_size > 0 OR li.media_type IN ('show', 'season') THEN ${matchKey} END)::int AS total_items,
-            COALESCE(SUM(COALESCE(li.file_size, 0)), 0)::bigint AS total_size_bytes,
+            0::bigint AS total_size_bytes,
             COUNT(DISTINCT CASE WHEN li.media_type = 'movie' THEN ${matchKey} END)::int AS movie_count,
             COUNT(DISTINCT CASE WHEN li.media_type = 'episode' THEN ${matchKey} END)::int AS episode_count,
             COUNT(DISTINCT CASE WHEN li.media_type = 'show' THEN ${matchKey} END)::int AS show_count,
-            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND li.video_resolution = '4k' THEN 1 END)::int AS count_4k,
-            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND li.video_resolution = '1080p' THEN 1 END)::int AS count_1080p,
-            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND li.video_resolution = '720p' THEN 1 END)::int AS count_720p,
-            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND li.video_resolution = 'sd' THEN 1 END)::int AS count_sd,
+            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND ${hasVersionInBucket('li.id', '4k')} THEN 1 END)::int AS count_4k,
+            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND ${hasVersionInBucket('li.id', '1080p')} THEN 1 END)::int AS count_1080p,
+            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND ${hasVersionInBucket('li.id', '720p')} THEN 1 END)::int AS count_720p,
+            COUNT(CASE WHEN (li.file_size > 0 OR li.media_type IN ('show', 'season')) AND ${hasVersionInBucket('li.id', 'sd')} THEN 1 END)::int AS count_sd,
             MAX(li.updated_at)::text AS as_of
           FROM library_items li
           WHERE 1=1
+            AND li.removed_at IS NULL
             ${serverFilter}
             ${libraryFilter}
         `);
@@ -194,7 +206,7 @@ export const libraryStatsRoute: FastifyPluginAsync = async (app) => {
 
         stats = {
           totalItems: row?.total_items ?? 0,
-          totalSizeBytes: row?.total_size_bytes ?? '0',
+          totalSizeBytes: dedupedBytes,
           movieCount: row?.movie_count ?? 0,
           episodeCount: row?.episode_count ?? 0,
           showCount: row?.show_count ?? 0,

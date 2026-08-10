@@ -5,14 +5,7 @@ import type { NotificationEventType, WebhookFormat } from '@tracearr/shared';
  * Available notification agent types
  */
 export type NotificationAgentType =
-  | 'webToast'
-  | 'discord'
-  | 'ntfy'
-  | 'gotify'
-  | 'apprise'
-  | 'pushover'
-  | 'json'
-  | 'push';
+  'webToast' | 'discord' | 'ntfy' | 'gotify' | 'apprise' | 'pushover' | 'json' | 'push';
 
 /**
  * Maps agent types to their routing column in notificationChannelRouting table

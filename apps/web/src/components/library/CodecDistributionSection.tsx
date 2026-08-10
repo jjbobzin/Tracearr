@@ -37,8 +37,8 @@ function CodecTabsContent({ serverId }: { serverId: string | null | undefined })
   const channelsData = toChartData(codecs.data?.channels);
   const musicData = toChartData(codecs.data?.music);
 
-  const hasVideoData = codecs.data?.video.total ?? 0 > 0;
-  const hasMusicData = codecs.data?.music.total ?? 0 > 0;
+  const hasVideoData = (codecs.data?.video.total ?? 0) > 0;
+  const hasMusicData = (codecs.data?.music.total ?? 0) > 0;
 
   return (
     <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'video' | 'music')}>

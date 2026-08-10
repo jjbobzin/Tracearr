@@ -113,7 +113,7 @@ jobs:
 
     services:
       timescale:
-        image: timescale/timescaledb:2.25.0-pg16@sha256:9e9f50161784dc57d3f547b89ded4af73553f9acb4677345ed05f45af7c7f664
+        image: timescale/timescaledb:2.29.1-pg18@sha256:373eb0fee9c0f8e0b4b0d4e74c7d0dd463dce05de6b49982701c4b540e94cba0
         ports:
           - 5433:5432
         env:
@@ -478,6 +478,48 @@ jobs:
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
 
+  # Publish @tracearr/shared and @tracearr/translations, version-locked to the
+  # release tag so the mobile repo can pin the exact release it targets.
+  # Auth is npm trusted publishing (OIDC) configured against this workflow file.
+  # setup-node deliberately has no registry-url: the .npmrc auth line it writes
+  # breaks the OIDC exchange when NODE_AUTH_TOKEN is unset.
+  publish-packages:
+    name: Publish npm Packages
+    runs-on: ubuntu-latest
+    needs: [check-release-type, merge-docker, merge-supervised]
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter @tracearr/shared --filter @tracearr/translations
+
+      - name: Publish to npm
+        run: |
+          npm --version
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${{ needs.check-release-type.outputs.prerelease == 'true' && 'next' || 'latest' }}"
+          for pkg in shared translations; do
+            if [ -n "$(npm view "@tracearr/${pkg}@${VERSION}" version 2>/dev/null)" ]; then
+              echo "@tracearr/${pkg}@${VERSION} already published, skipping"
+              continue
+            fi
+            (cd "packages/${pkg}" && npm pkg set version="$VERSION" && npm publish --tag "$TAG")
+          done
+
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -490,6 +532,21 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter @tracearr/server...
+
+      - name: Generate OpenAPI specs
+        run: pnpm --filter @tracearr/server openapi:dump "$GITHUB_WORKSPACE"
 
       - name: Get tag annotation
         id: tag_info
@@ -510,3 +567,39 @@ jobs:
           body_path: tag_message.txt
           prerelease: ${{ needs.check-release-type.outputs.prerelease }}
           generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            openapi-v1.json
+            openapi-v2.json
+
+  announce-reddit:
+    name: Post to Reddit
+    runs-on: ubuntu-latest
+    needs: [check-release-type, create-release]
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Get tag annotation
+        run: |
+          SUBJECT=$(git tag -l --format='%(contents:subject)' ${{ github.ref_name }})
+          BODY=$(git tag -l --format='%(contents:body)' ${{ github.ref_name }})
+          if [ -n "$BODY" ]; then
+            printf '%s\n\n%s\n' "$SUBJECT" "$BODY" > tag_message.txt
+          else
+            echo "$SUBJECT" > tag_message.txt
+          fi
+
+      - name: Post release to Reddit
+        run: node .github/scripts/post-release-to-reddit.mjs
+        env:
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_REFRESH_TOKEN: ${{ secrets.REDDIT_REFRESH_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          TITLE_PREFIX: ${{ needs.check-release-type.outputs.prerelease == 'true' && 'Beta Release' || 'Release' }}
+          NOTES_FILE: tag_message.txt

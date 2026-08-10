@@ -66,9 +66,15 @@ vi.mock('../../jobs/librarySyncQueue.js', () => ({
   enqueueLibrarySync: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../../services/serverLiveStats.js', () => ({
+  getServerResourceStats: vi.fn(),
+  getServerLiveStats: vi.fn(),
+}));
+
 // Import mocked modules
 import { db } from '../../db/client.js';
 import { PlexClient, JellyfinClient, EmbyClient } from '../../services/mediaServer/index.js';
+import { getServerLiveStats, getServerResourceStats } from '../../services/serverLiveStats.js';
 import { syncServer } from '../../services/sync.js';
 import { serverRoutes } from '../servers.js';
 
@@ -983,6 +989,171 @@ describe('Server Routes', () => {
       });
 
       expect(response.statusCode).toBe(400);
+    });
+
+    it('returns cached resource data for a Plex server', async () => {
+      const dataPoint = {
+        timespan: 6,
+        at: 1786145464,
+        hostCpuUtilization: 2.757,
+        processCpuUtilization: 0.025,
+        hostMemoryUtilization: 12.41,
+        processMemoryUtilization: 0.371,
+      };
+
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([mockServer]);
+      vi.mocked(getServerResourceStats).mockResolvedValue([dataPoint]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/servers/${mockServer.id}/statistics`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.serverId).toBe(mockServer.id);
+      expect(body.data).toEqual([dataPoint]);
+      expect(getServerResourceStats).toHaveBeenCalledWith(
+        undefined,
+        expect.objectContaining({ id: mockServer.id, url: mockServer.url, token: mockServer.token })
+      );
+    });
+  });
+
+  describe('GET /servers/:id/live-stats', () => {
+    it('returns 404 for non-existent server', async () => {
+      app = await buildTestApp(ownerUser);
+
+      mockDbSelectLimit([]);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/servers/${randomUUID()}/live-stats`,
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
+
+    it('serves non-Plex servers through the stats service (plugin buffer path)', async () => {
+      const jellyfinServer = {
+        ...mockServer,
+        type: 'jellyfin' as const,
+      };
+      const point = {
+        at: 100,
+        timespan: 6,
+        hostCpuUtilization: 1,
+        processCpuUtilization: 2,
+        hostMemoryUtilization: 3,
+        processMemoryUtilization: 4,
+      };
+
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([jellyfinServer]);
+      vi.mocked(getServerLiveStats).mockClear();
+      vi.mocked(getServerLiveStats).mockResolvedValue({
+        statistics: [point],
+        bandwidth: [],
+        bandwidthSamples: [],
+        bandwidthAccounts: [],
+        bandwidthDevices: [],
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/servers/${jellyfinServer.id}/live-stats`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.serverId).toBe(jellyfinServer.id);
+      expect(body.statistics).toEqual([point]);
+      expect(body.bandwidth).toEqual([]);
+      expect(getServerLiveStats).toHaveBeenCalledWith(
+        undefined,
+        expect.objectContaining({ id: jellyfinServer.id, type: 'jellyfin' })
+      );
+    });
+
+    it('returns 400 for invalid server ID', async () => {
+      app = await buildTestApp(ownerUser);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/servers/not-a-uuid/live-stats',
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+
+    it('strips per-account bandwidth detail for non-owner callers', async () => {
+      app = await buildTestApp(viewerUser);
+      mockDbSelectLimit([mockServer]);
+      vi.mocked(getServerLiveStats).mockResolvedValue({
+        statistics: [],
+        bandwidth: [{ at: 101, timespan: 1, lanBytes: 28, wanBytes: 729 }],
+        bandwidthSamples: [{ at: 101, accountId: 1, deviceId: 1, lan: true, bytes: 28 }],
+        bandwidthAccounts: [{ id: 1, name: 'Gallapagos', thumb: null }],
+        bandwidthDevices: [{ id: 1, name: 'Chromecast', platform: 'Chromecast' }],
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/servers/${mockServer.id}/live-stats`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.bandwidth).toEqual([{ at: 101, timespan: 1, lanBytes: 28, wanBytes: 729 }]);
+      expect(body.bandwidthSamples).toEqual([]);
+      expect(body.bandwidthAccounts).toEqual([]);
+      expect(body.bandwidthDevices).toEqual([]);
+    });
+
+    it('returns combined statistics and bandwidth with attribution', async () => {
+      const liveStats = {
+        statistics: [
+          {
+            timespan: 6,
+            at: 1786145464,
+            hostCpuUtilization: 2.757,
+            processCpuUtilization: 0.025,
+            hostMemoryUtilization: 12.41,
+            processMemoryUtilization: 0.371,
+          },
+        ],
+        bandwidth: [{ at: 101, timespan: 1, lanBytes: 28, wanBytes: 729 }],
+        bandwidthSamples: [
+          { at: 101, accountId: 1, deviceId: 1, lan: true, bytes: 28 },
+          { at: 101, accountId: 1, deviceId: 382, lan: false, bytes: 729 },
+        ],
+        bandwidthAccounts: [{ id: 1, name: 'Gallapagos', thumb: null }],
+        bandwidthDevices: [{ id: 1, name: 'Chromecast', platform: 'Chromecast' }],
+      };
+
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([mockServer]);
+      vi.mocked(getServerLiveStats).mockResolvedValue(liveStats);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/servers/${mockServer.id}/live-stats`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.serverId).toBe(mockServer.id);
+      expect(body.statistics).toEqual(liveStats.statistics);
+      expect(body.bandwidth).toEqual(liveStats.bandwidth);
+      expect(body.bandwidthSamples).toEqual(liveStats.bandwidthSamples);
+      expect(body.bandwidthAccounts).toEqual(liveStats.bandwidthAccounts);
+      expect(body.bandwidthDevices).toEqual(liveStats.bandwidthDevices);
+      expect(body.fetchedAt).toBeTruthy();
+      expect(getServerLiveStats).toHaveBeenCalledWith(
+        undefined,
+        expect.objectContaining({ id: mockServer.id, url: mockServer.url, token: mockServer.token })
+      );
     });
   });
 });

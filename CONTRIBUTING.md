@@ -4,7 +4,9 @@ Thanks for considering a contribution. This document covers how we work and what
 
 ## Talk to Us First
 
-For new features or significant changes, please discuss your idea before writing code. Open a GitHub Discussion or drop by [Discord](https://discord.gg/a7n3sFd2Yw). This saves everyone time if the approach needs adjustment or if someone else is already working on it.
+For new features or significant changes, discuss your idea before writing code. Open a GitHub Discussion or drop by [Discord](https://discord.gg/a7n3sFd2Yw). This saves everyone time if the approach needs adjustment or if someone else is already working on it.
+
+This is not a suggestion. A feature PR that was never discussed with a code owner gets closed, even when the code is fine. An unrequested feature carries design decisions nobody agreed to, and reviewing it costs more than building it.
 
 Bug fixes can go straight to a PR, though an issue helps track the problem.
 
@@ -72,6 +74,14 @@ We're fine with AI tools. Copilot, Claude, Cursor, whatever helps you work. But 
 **Tests matter more than ever.** If you understood the code well enough to write it, you can write tests for it. PRs that add features without tests often indicate the contributor doesn't fully grasp what they've built.
 
 To be clear: we're not trying to gatekeep or ban AI. These tools are useful. But a 5,000-line PR with no tests and a contributor who can't explain the implementation creates real problems for maintainers.
+
+## Autonomous Agents and Undiscussed Features
+
+We do not accept contributions from autonomous agents. Pull requests and issues we believe were created autonomously get closed, and automated comments may be marked as spam. Bypassing or replacing the issue and PR templates counts.
+
+The human-shaped version gets the same treatment. If a PR exists because someone pointed an AI at something they wanted and opened whatever came out, without discussing the feature with a code owner and without being able to explain the diff, it gets closed. This has already happened to recent submissions and it will keep happening.
+
+Bug reports follow the same rule. Fill in the template with what actually happened and attach logs. A report that swaps the template for an AI-written diagnosis with a suggested fix gets closed; generated analysis is not evidence, and reviewing it costs more than the two facts we actually needed.
 
 ## Testing
 

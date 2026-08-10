@@ -12,6 +12,11 @@ body:
 
       **Before submitting:** Search [existing issues](https://github.com/connorgallopo/tracearr/issues) first.
 
+      **What gets a report closed:** replacing this template with your own format, or pasting
+      AI-generated analysis and suggested fixes in place of the facts the form asks for.
+      We need the template filled in with what actually happened, plus logs. A two-line
+      description with real logs beats a page of generated diagnosis every time.
+
 - type: input
   id: version
   attributes:
@@ -119,13 +124,19 @@ body:
   attributes:
     label: Relevant Logs
     description: |
-      Paste any relevant error messages or logs. Set `LOG_LEVEL=debug` for more detail.
+      **Required.** If something isn't working, fails to start, crashes, or shows wrong
+      data, we cannot act without logs. If your report is purely visual (layout, colors,
+      spacing), write `UI only` here instead.
+
+      Set `LOG_LEVEL=debug` for more detail. Full guide: https://docs.tracearr.com/configuration/debug
 
       **Standard Docker:** `docker logs tracearr`
       **Supervised Docker:** View logs in the web UI at `/debug` (Log Explorer section), or via CLI:
       `docker exec tracearr cat /var/log/supervisor/tracearr-error.log`
       (Also available: tracearr.log, postgres.log, postgres-error.log, redis.log, supervisord.log)
     render: shell
+  validations:
+    required: true
 
 - type: dropdown
   id: previously_worked
@@ -154,6 +165,10 @@ body:
     - label: Version number filled in above
       required: true
     - label: Docker compose/run command included (if applicable)
+      required: true
+    - label: Logs are attached above, or this is a purely visual issue
+      required: true
+    - label: I wrote this report myself and kept the template intact
       required: true
     - label: I have searched the docs at https://docs.tracearr.com
       required: true

@@ -1,0 +1,1 @@
+ALTER TABLE "sessions" ADD COLUMN "server_version_key" varchar(255);

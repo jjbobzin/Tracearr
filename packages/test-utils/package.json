@@ -42,7 +42,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/",
+    "lint": "eslint src/ --cache --cache-location .eslintcache --cache-strategy content",
     "lint:fix": "eslint src/ --fix",
     "clean": "rm -rf dist .turbo"
   },

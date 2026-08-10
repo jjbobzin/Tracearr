@@ -297,6 +297,22 @@ describe('Rule Migration', () => {
         expect(result?.conditions.groups[0]?.conditions[0]?.params?.window_hours).toBe(48);
       });
 
+      it('clamps windowHours to the v2 maximum of 168', () => {
+        const legacyRule: LegacyRule = {
+          id: 'rule-1',
+          name: 'Max 10 IPs in 30 days',
+          type: 'device_velocity',
+          params: { maxIps: 10, windowHours: 720 },
+          serverUserId: null,
+          serverId: null,
+          isActive: true,
+        };
+
+        const result = convertLegacyRule(legacyRule);
+
+        expect(result?.conditions.groups[0]?.conditions[0]?.params?.window_hours).toBe(168);
+      });
+
       it('adds is_local_network as separate AND group when excludePrivateIps is true', () => {
         const legacyRule: LegacyRule = {
           id: 'rule-1',
@@ -400,7 +416,7 @@ describe('Rule Migration', () => {
 
         expect(result?.conditions.groups[0]?.conditions[0]).toEqual({
           field: 'inactive_days',
-          operator: 'gt',
+          operator: 'gte',
           value: 30,
         });
       });
@@ -420,7 +436,7 @@ describe('Rule Migration', () => {
 
         expect(result?.conditions.groups[0]?.conditions[0]).toEqual({
           field: 'inactive_days',
-          operator: 'gt',
+          operator: 'gte',
           value: 14,
         });
       });
@@ -440,7 +456,7 @@ describe('Rule Migration', () => {
 
         expect(result?.conditions.groups[0]?.conditions[0]).toEqual({
           field: 'inactive_days',
-          operator: 'gt',
+          operator: 'gte',
           value: 90,
         });
       });

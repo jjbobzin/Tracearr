@@ -17,7 +17,7 @@ export function representativeAccountOrderSql(alias: string): SQL {
   return sql.raw(
     `(${alias}.removed_at IS NULL) DESC,
      (${alias}.plex_account_id IS NOT NULL AND ${alias}.plex_account_id = u.plex_account_id) DESC,
-     ${alias}.session_count DESC,
+     ${alias}.last_activity_at DESC NULLS LAST,
      ${alias}.joined_at ASC NULLS LAST,
      ${alias}.id`
   );

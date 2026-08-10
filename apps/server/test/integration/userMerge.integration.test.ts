@@ -28,7 +28,7 @@ import { listRoutes } from '../../src/routes/users/list.js';
 import { sessionsRoutes } from '../../src/routes/users/sessions.js';
 import { terminationsRoutes } from '../../src/routes/users/terminations.js';
 import { violationRoutes } from '../../src/routes/violations.js';
-import { recalculateAggregateTrustScore } from '../../src/services/userService.js';
+import { recomputeIdentityAggregates } from '../../src/services/userService.js';
 import {
   users,
   serverUsers,
@@ -60,13 +60,11 @@ describe('mergeUsers', () => {
       userId: target.id,
       serverId: serverA.id,
       trustScore: 90,
-      sessionCount: 10,
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
       trustScore: 50,
-      sessionCount: 30,
     });
 
     const sourceSession = await createTestSession({
@@ -108,8 +106,8 @@ describe('mergeUsers', () => {
     expect(survivor?.email).toBe('bob@example.com');
     expect(survivor?.role).toBe('member');
 
-    // Weighted aggregate: (90*10 + 50*30) / 40 = 60, one violation total
-    expect(survivor?.aggregateTrustScore).toBe(60);
+    // Worst-account rollup: min(90, 50) = 50, one violation total
+    expect(survivor?.aggregateTrustScore).toBe(50);
     expect(survivor?.totalViolations).toBe(1);
 
     // Audit row enables split later
@@ -219,9 +217,8 @@ describe('mergeUsers', () => {
       .where(eq(sessions.serverUserId, targetSu.id));
     expect(combinedSessions).toHaveLength(3);
 
-    // sessionCount recomputed from combined history, primary metadata and trust kept
+    // Primary metadata and trust kept
     const [combinedSu] = await db.select().from(serverUsers).where(eq(serverUsers.id, targetSu.id));
-    expect(combinedSu?.sessionCount).toBe(3);
     expect(combinedSu?.email).toBe('primary@example.com');
     expect(combinedSu?.trustScore).toBe(95);
 
@@ -479,9 +476,9 @@ describe('GET /users/:id/full identity aggregation', () => {
     expect(identitySuIds).toEqual([sourceSu.id, targetSu.id].sort());
     expect(body.identity.stats.totalSessions).toBe(2);
     expect(body.identity.stats.totalWatchTime).toBe(3000);
-    // Both accounts default to trustScore 100 with sessionCount 0, so the
-    // weighted aggregate falls back to the neutral default, and no violations
-    // were recorded for either side of the merge.
+    // Both accounts default to trustScore 100, so the worst-account rollup
+    // stays at the default, and no violations were recorded for either side
+    // of the merge.
     expect(body.identity.aggregateTrustScore).toBe(100);
     expect(body.identity.totalViolations).toBe(0);
 
@@ -863,17 +860,17 @@ describe('GET /users identityServers', () => {
     const target = await createTestUser({ role: 'member' });
     const source = await createTestUser({ role: 'member' });
     // Both accounts are active and neither matches the identity's plex_account_id,
-    // so a higher session count is the deterministic tiebreaker that makes
+    // so more recent activity is the deterministic tiebreaker that makes
     // targetSu the representative row.
     const targetSu = await createTestServerUser({
       userId: target.id,
       serverId: serverA.id,
-      sessionCount: 10,
+      lastActivityAt: new Date('2026-06-02T00:00:00Z'),
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
-      sessionCount: 5,
+      lastActivityAt: new Date('2026-06-01T00:00:00Z'),
     });
     const unrelatedIdentity = await createTestUser({ role: 'member' });
     const unrelatedSu = await createTestServerUser({
@@ -1043,17 +1040,17 @@ describe('GET /users dedup + includeRemoved + access scoping', () => {
     const serverB = await createTestServer({ type: 'jellyfin' });
     const target = await createTestUser({ role: 'member' });
     const source = await createTestUser({ role: 'member' });
-    // sourceSu is far more active, so without server scoping it would win the
-    // representative tiebreak - but the viewer can't see serverB at all.
+    // sourceSu is more recently active, so without server scoping it would win
+    // the representative tiebreak - but the viewer can't see serverB at all.
     const targetSu = await createTestServerUser({
       userId: target.id,
       serverId: serverA.id,
-      sessionCount: 5,
+      lastActivityAt: new Date('2026-06-01T00:00:00Z'),
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
-      sessionCount: 50,
+      lastActivityAt: new Date('2026-06-02T00:00:00Z'),
     });
 
     await mergeUsers(source.id, target.id, admin.id);
@@ -1129,18 +1126,18 @@ describe('GET /users serverIds (multi-select)', () => {
     const serverB = await createTestServer({ type: 'jellyfin' });
     const target = await createTestUser({ role: 'member' });
     const source = await createTestUser({ role: 'member' });
-    // sourceSu has more sessions, so without server scoping it would win the
-    // representative tiebreak - but only serverA is selected, so the selected
-    // account must represent the merged identity instead.
+    // sourceSu is more recently active, so without server scoping it would win
+    // the representative tiebreak - but only serverA is selected, so the
+    // selected account must represent the merged identity instead.
     const targetSu = await createTestServerUser({
       userId: target.id,
       serverId: serverA.id,
-      sessionCount: 5,
+      lastActivityAt: new Date('2026-06-01T00:00:00Z'),
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
-      sessionCount: 50,
+      lastActivityAt: new Date('2026-06-02T00:00:00Z'),
     });
 
     await mergeUsers(source.id, target.id, admin.id);
@@ -1383,7 +1380,7 @@ describe('GET /users search', () => {
 });
 
 describe('identity trust rollup stays current outside merge/split', () => {
-  it('recomputes the weighted aggregate immediately when a manual trust edit changes one account, and restores it on reversal', async () => {
+  it('recomputes the aggregate immediately when a manual trust edit changes one account, and restores it on reversal', async () => {
     const admin = await createTestUser({ role: 'owner' });
     const serverA = await createTestServer({ type: 'plex' });
     const serverB = await createTestServer({ type: 'jellyfin' });
@@ -1393,13 +1390,11 @@ describe('identity trust rollup stays current outside merge/split', () => {
       userId: person.id,
       serverId: serverA.id,
       trustScore: 90,
-      sessionCount: 10,
     });
     const suB = await createTestServerUser({
       userId: person.id,
       serverId: serverB.id,
       trustScore: 90,
-      sessionCount: 30,
     });
 
     // No trust-affecting write has touched this identity yet, so the rollup
@@ -1415,7 +1410,7 @@ describe('identity trust rollup stays current outside merge/split', () => {
     });
     await app.register(listRoutes, { prefix: '/users' });
 
-    // Lower trust on the heavier-weighted account (sessionCount 30)
+    // Lower trust on one account
     const lowerResponse = await app.inject({
       method: 'PATCH',
       url: `/users/${suB.id}`,
@@ -1423,9 +1418,9 @@ describe('identity trust rollup stays current outside merge/split', () => {
     });
     expect(lowerResponse.statusCode).toBe(200);
 
-    // Weighted average now: (90*10 + 50*30) / 40 = 60
+    // Worst account now: min(90, 50) = 50
     const [afterLower] = await db.select().from(users).where(eq(users.id, person.id));
-    expect(afterLower?.aggregateTrustScore).toBe(60);
+    expect(afterLower?.aggregateTrustScore).toBe(50);
 
     // Reverse the edit back to the original score
     const reverseResponse = await app.inject({
@@ -1445,7 +1440,7 @@ describe('identity trust rollup stays current outside merge/split', () => {
     expect(suARow?.trustScore).toBe(90);
   });
 
-  it('recomputes the weighted aggregate when dismissing a violation reverses a rule trust adjustment on one account', async () => {
+  it('recomputes the aggregate when dismissing a violation reverses a rule trust adjustment on one account', async () => {
     const admin = await createTestUser({ role: 'owner' });
     const serverA = await createTestServer({ type: 'plex' });
     const serverB = await createTestServer({ type: 'jellyfin' });
@@ -1455,21 +1450,19 @@ describe('identity trust rollup stays current outside merge/split', () => {
       userId: person.id,
       serverId: serverA.id,
       trustScore: 90,
-      sessionCount: 10,
     });
     const suB = await createTestServerUser({
       userId: person.id,
       serverId: serverB.id,
       trustScore: 50,
-      sessionCount: 30,
     });
 
     // Seed a correct baseline rollup the way a prior trust-affecting write
-    // would have left it: (90*10 + 50*30) / 40 = 60. Creating accounts
-    // directly (as above) does not itself trigger a recompute.
-    await recalculateAggregateTrustScore(person.id);
+    // would have left it: min(90, 50) = 50. Creating accounts directly (as
+    // above) does not itself trigger a recompute.
+    await recomputeIdentityAggregates(person.id);
     const [before] = await db.select().from(users).where(eq(users.id, person.id));
-    expect(before?.aggregateTrustScore).toBe(60);
+    expect(before?.aggregateTrustScore).toBe(50);
 
     const rule = await createTestRule({
       type: 'concurrent_streams',
@@ -1503,9 +1496,9 @@ describe('identity trust rollup stays current outside merge/split', () => {
     const [suBRow] = await db.select().from(serverUsers).where(eq(serverUsers.id, suB.id));
     expect(suBRow?.trustScore).toBe(70);
 
-    // Weighted average after reversal: (90*10 + 70*30) / 40 = 75
+    // Worst account after reversal: min(90, 70) = 70
     const [after] = await db.select().from(users).where(eq(users.id, person.id));
-    expect(after?.aggregateTrustScore).toBe(75);
+    expect(after?.aggregateTrustScore).toBe(70);
 
     // Untouched sibling account keeps its own score
     const [suARow] = await db.select().from(serverUsers).where(eq(serverUsers.id, suA.id));
@@ -1524,20 +1517,18 @@ describe('POST /users/bulk/reset-trust', () => {
       userId: target.id,
       serverId: serverA.id,
       trustScore: 60,
-      sessionCount: 10,
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
       trustScore: 40,
-      sessionCount: 10,
     });
 
     await mergeUsers(source.id, target.id, admin.id);
 
-    // Merge already recomputed the rollup: (60*10 + 40*10) / 20 = 50
+    // Merge already recomputed the rollup: min(60, 40) = 40
     const [beforeReset] = await db.select().from(users).where(eq(users.id, target.id));
-    expect(beforeReset?.aggregateTrustScore).toBe(50);
+    expect(beforeReset?.aggregateTrustScore).toBe(40);
 
     const app = Fastify({ logger: false });
     await app.register(sensible);
@@ -1582,13 +1573,11 @@ describe('POST /users/bulk/reset-trust', () => {
       userId: target.id,
       serverId: serverA.id,
       trustScore: 60,
-      sessionCount: 10,
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
       trustScore: 40,
-      sessionCount: 10,
     });
 
     await mergeUsers(source.id, target.id, admin.id);
@@ -1629,10 +1618,10 @@ describe('POST /users/bulk/reset-trust', () => {
       .where(eq(serverUsers.id, sourceSu.id));
     expect(sourceSuRow?.trustScore).toBe(40);
 
-    // Aggregate still recomputes over the person's full account set, so it
-    // lands short of 100: (100*10 + 40*10) / 20 = 70
+    // Aggregate still recomputes over the person's full account set, so the
+    // untouched account keeps it short of 100: min(100, 40) = 40
     const [afterReset] = await db.select().from(users).where(eq(users.id, target.id));
-    expect(afterReset?.aggregateTrustScore).toBe(70);
+    expect(afterReset?.aggregateTrustScore).toBe(40);
   });
 
   it('selectAll with the roster filters resets every matching identity in full, without touching non-matching people', async () => {
@@ -1648,13 +1637,11 @@ describe('POST /users/bulk/reset-trust', () => {
       userId: target.id,
       serverId: serverA.id,
       trustScore: 60,
-      sessionCount: 10,
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
       trustScore: 20,
-      sessionCount: 10,
     });
     await mergeUsers(source.id, target.id, admin.id);
 
@@ -1665,9 +1652,8 @@ describe('POST /users/bulk/reset-trust', () => {
       userId: unrelated.id,
       serverId: serverB.id,
       trustScore: 30,
-      sessionCount: 5,
     });
-    await recalculateAggregateTrustScore(unrelated.id);
+    await recomputeIdentityAggregates(unrelated.id);
     const [unrelatedBefore] = await db.select().from(users).where(eq(users.id, unrelated.id));
     expect(unrelatedBefore?.aggregateTrustScore).toBe(30);
 

@@ -10,16 +10,21 @@
  * Supports both Tautulli (for Plex) and Jellystat (for Jellyfin/Emby) imports.
  */
 
+import { randomUUID } from 'node:crypto';
 import { Queue, Worker, type Job, type ConnectionOptions } from 'bullmq';
 import { isMaintenance } from '../serverState.js';
 import { getRedisPrefix } from '@tracearr/shared';
 import type {
   TautulliImportProgress,
   TautulliImportResult,
+  JellystatImportProgress,
   JellystatImportResult,
+  PlaybackReportingImportProgress,
+  PlaybackReportingImportResult,
 } from '@tracearr/shared';
 import { TautulliService } from '../services/tautulli.js';
 import { importJellystatBackup } from '../services/jellystat.js';
+import { importPlaybackReporting } from '../services/playbackReporting.js';
 import { getPubSubService } from '../services/cache.js';
 import { extendJobLock } from './lockUtils.js';
 import { withSessionsCompressionPaused } from '../db/timescale.js';
@@ -27,6 +32,7 @@ import {
   acquireHeavyOpsLock,
   releaseHeavyOpsLock,
   extendHeavyOpsLock,
+  startHeavyOpsLockHeartbeat,
   type HeavyOpsLockHolder,
 } from './heavyOpsLock.js';
 
@@ -49,9 +55,20 @@ export interface JellystatImportJobData {
   updateStreamDetails?: boolean; // Whether to update existing records with stream/transcode data
 }
 
-export type ImportJobData = TautulliImportJobData | JellystatImportJobData;
+export interface PlaybackReportingImportJobData {
+  type: 'playback-reporting';
+  serverId: string;
+  userId: string; // Audit trail - who initiated the import
+  timezone: string;
+  enrichMedia: boolean;
+  importFullRange: boolean;
+}
 
-export type ImportJobResult = TautulliImportResult | JellystatImportResult;
+export type ImportJobData =
+  TautulliImportJobData | JellystatImportJobData | PlaybackReportingImportJobData;
+
+export type ImportJobResult =
+  TautulliImportResult | JellystatImportResult | PlaybackReportingImportResult;
 
 // Queue configuration
 const QUEUE_NAME = 'imports';
@@ -66,7 +83,7 @@ let dlqQueue: Queue<ImportJobData> | null = null;
 // Cached import progress for polling access (in addition to websocket broadcasts)
 interface CachedImportProgress {
   jobId: string;
-  type: 'tautulli' | 'jellystat';
+  type: 'tautulli' | 'jellystat' | 'playback-reporting';
   serverId: string;
   status: 'waiting' | 'fetching' | 'processing' | 'complete' | 'error';
   progress: TautulliImportProgress | null;
@@ -132,6 +149,138 @@ export function initImportQueue(redisUrl: string): void {
   console.log('Import queue initialized');
 }
 
+type ImportProgressPayload =
+  TautulliImportProgress | JellystatImportProgress | PlaybackReportingImportProgress;
+
+function importProgressChannel(
+  type: ImportJobData['type']
+): 'import:progress' | 'import:jellystat:progress' | 'import:playbackreporting:progress' {
+  if (type === 'jellystat') return 'import:jellystat:progress';
+  if (type === 'playback-reporting') return 'import:playbackreporting:progress';
+  return 'import:progress';
+}
+
+// Payload shape must match the importing job's channel, or its UI card never updates.
+function buildWaitingProgress(
+  type: ImportJobData['type'],
+  waitingFor: HeavyOpsLockHolder
+): ImportProgressPayload {
+  const message = `Waiting for ${waitingFor.description} to complete...`;
+  const waitingForSummary = {
+    jobType: waitingFor.jobType,
+    description: waitingFor.description,
+    startedAt: waitingFor.startedAt,
+  };
+
+  if (type === 'jellystat') {
+    return {
+      status: 'waiting',
+      totalRecords: 0,
+      processedRecords: 0,
+      importedRecords: 0,
+      skippedRecords: 0,
+      filteredRecords: 0,
+      errorRecords: 0,
+      enrichedRecords: 0,
+      message,
+      waitingFor: waitingForSummary,
+    };
+  }
+
+  if (type === 'playback-reporting') {
+    return {
+      status: 'waiting',
+      totalRecords: 0,
+      fetchedRecords: 0,
+      processedRecords: 0,
+      importedRecords: 0,
+      skippedRecords: 0,
+      duplicateRecords: 0,
+      unknownUserRecords: 0,
+      overlapRecords: 0,
+      filteredRecords: 0,
+      errorRecords: 0,
+      enrichedRecords: 0,
+      message,
+      waitingFor: waitingForSummary,
+    };
+  }
+
+  return {
+    status: 'waiting',
+    totalRecords: 0,
+    fetchedRecords: 0,
+    processedRecords: 0,
+    importedRecords: 0,
+    updatedRecords: 0,
+    skippedRecords: 0,
+    duplicateRecords: 0,
+    unknownUserRecords: 0,
+    activeSessionRecords: 0,
+    errorRecords: 0,
+    currentPage: 0,
+    totalPages: 0,
+    message,
+    waitingFor: waitingForSummary,
+  };
+}
+
+function buildFailedProgress(
+  type: ImportJobData['type'],
+  errorMessage: string
+): ImportProgressPayload {
+  const message = `Import failed: ${errorMessage}`;
+
+  if (type === 'jellystat') {
+    return {
+      status: 'error',
+      totalRecords: 0,
+      processedRecords: 0,
+      importedRecords: 0,
+      skippedRecords: 0,
+      filteredRecords: 0,
+      errorRecords: 0,
+      enrichedRecords: 0,
+      message,
+    };
+  }
+
+  if (type === 'playback-reporting') {
+    return {
+      status: 'error',
+      totalRecords: 0,
+      fetchedRecords: 0,
+      processedRecords: 0,
+      importedRecords: 0,
+      skippedRecords: 0,
+      duplicateRecords: 0,
+      unknownUserRecords: 0,
+      overlapRecords: 0,
+      filteredRecords: 0,
+      errorRecords: 0,
+      enrichedRecords: 0,
+      message,
+    };
+  }
+
+  return {
+    status: 'error',
+    totalRecords: 0,
+    fetchedRecords: 0,
+    processedRecords: 0,
+    importedRecords: 0,
+    updatedRecords: 0,
+    skippedRecords: 0,
+    duplicateRecords: 0,
+    unknownUserRecords: 0,
+    activeSessionRecords: 0,
+    errorRecords: 0,
+    currentPage: 0,
+    totalPages: 0,
+    message,
+  };
+}
+
 /**
  * Start the import worker to process queued jobs
  */
@@ -181,7 +330,12 @@ export function startImportWorker(): void {
     QUEUE_NAME,
     async (job: Job<ImportJobData>) => {
       const startTime = Date.now();
-      const jobDescription = job.data.type === 'tautulli' ? 'Tautulli import' : 'Jellystat import';
+      const jobDescription =
+        job.data.type === 'tautulli'
+          ? 'Tautulli import'
+          : job.data.type === 'jellystat'
+            ? 'Jellystat import'
+            : 'Playback Reporting import';
       console.log(`[Import] Starting job ${job.id} for server ${job.data.serverId}`);
 
       // Initialize cached progress
@@ -195,13 +349,19 @@ export function startImportWorker(): void {
       };
 
       // Acquire heavy operations lock (waits if another heavy op is running)
+      // One token for this whole processor invocation - see heavyOpsLock.ts
+      // for why job.id alone can't prove ownership across concurrent runs.
+      const runToken = randomUUID();
       let lockHolder: HeavyOpsLockHolder | null;
       const pubSubService = getPubSubService();
       const WAIT_INTERVAL_MS = 5000; // Check every 5 seconds
       const MAX_WAIT_MS = 4 * 60 * 60 * 1000; // Max 4 hours wait
       let waitedMs = 0;
 
-      while ((lockHolder = await acquireHeavyOpsLock('import', job.id!, jobDescription)) !== null) {
+      while (
+        (lockHolder = await acquireHeavyOpsLock('import', job.id!, jobDescription, runToken)) !==
+        null
+      ) {
         // Update cached progress with waiting status
         activeImportProgress = {
           jobId: job.id!,
@@ -215,27 +375,9 @@ export function startImportWorker(): void {
 
         // Broadcast waiting status to frontend
         if (pubSubService) {
-          void pubSubService.publish('import:progress', {
-            status: 'waiting',
-            totalRecords: 0,
-            fetchedRecords: 0,
-            processedRecords: 0,
-            importedRecords: 0,
-            updatedRecords: 0,
-            skippedRecords: 0,
-            duplicateRecords: 0,
-            unknownUserRecords: 0,
-            activeSessionRecords: 0,
-            errorRecords: 0,
-            currentPage: 0,
-            totalPages: 0,
-            message: `Waiting for ${lockHolder.description} to complete...`,
+          void pubSubService.publish(importProgressChannel(job.data.type), {
+            ...buildWaitingProgress(job.data.type, lockHolder),
             jobId: job.id,
-            waitingFor: {
-              jobType: lockHolder.jobType,
-              description: lockHolder.description,
-              startedAt: lockHolder.startedAt,
-            },
           });
         }
 
@@ -264,6 +406,8 @@ export function startImportWorker(): void {
 
       console.log(`[Import] Job ${job.id} acquired heavy ops lock`);
 
+      // Backstop renewal independent of how often processImportJob itself calls extendHeavyOpsLock.
+      const stopHeartbeat = startHeavyOpsLockHeartbeat(job.id!, runToken);
       try {
         const result = await withSessionsCompressionPaused(() => processImportJob(job));
         const duration = Math.round((Date.now() - startTime) / 1000);
@@ -274,6 +418,7 @@ export function startImportWorker(): void {
         console.error(`[Import] Job ${job.id} failed after ${duration}s:`, error);
         throw error;
       } finally {
+        stopHeartbeat();
         // Always release the heavy ops lock and clear cached progress
         await releaseHeavyOpsLock(job.id!);
         activeImportProgress = null;
@@ -309,21 +454,8 @@ export function startImportWorker(): void {
     // Always notify frontend of failure
     const pubSubService = getPubSubService();
     if (pubSubService) {
-      void pubSubService.publish('import:progress', {
-        status: 'error',
-        totalRecords: 0,
-        fetchedRecords: 0,
-        processedRecords: 0,
-        importedRecords: 0,
-        updatedRecords: 0,
-        skippedRecords: 0,
-        duplicateRecords: 0,
-        unknownUserRecords: 0,
-        activeSessionRecords: 0,
-        errorRecords: 0,
-        currentPage: 0,
-        totalPages: 0,
-        message: `Import failed: ${error?.message || 'Unknown error'}`,
+      void pubSubService.publish(importProgressChannel(job.data.type), {
+        ...buildFailedProgress(job.data.type, error?.message || 'Unknown error'),
         jobId: job.id,
       });
     }
@@ -351,6 +483,9 @@ export function startImportWorker(): void {
 async function processImportJob(job: Job<ImportJobData>): Promise<ImportJobResult> {
   if (job.data.type === 'jellystat') {
     return processJellystatImportJob(job as Job<JellystatImportJobData>);
+  }
+  if (job.data.type === 'playback-reporting') {
+    return processPlaybackReportingImportJob(job as Job<PlaybackReportingImportJobData>);
   }
   return processTautulliImportJob(job as Job<TautulliImportJobData>);
 }
@@ -479,6 +614,45 @@ async function processJellystatImportJob(
       importedRecords: result.imported,
       updatedRecords: result.updated,
       skippedRecords: result.skipped,
+      errorRecords: result.errors,
+      enrichedRecords: result.enriched,
+      message: result.message,
+      jobId: job.id,
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Process a Playback Reporting import job
+ */
+async function processPlaybackReportingImportJob(
+  job: Job<PlaybackReportingImportJobData>
+): Promise<PlaybackReportingImportResult> {
+  const { serverId, timezone, enrichMedia, importFullRange } = job.data;
+  const pubSubService = getPubSubService();
+
+  const result = await importPlaybackReporting(
+    serverId,
+    { timezone, enrichMedia, importFullRange },
+    pubSubService ?? undefined
+  );
+
+  if (pubSubService) {
+    const total = result.imported + result.skipped + result.errors;
+    const unknownUserRecords = result.skippedUsers?.reduce((sum, u) => sum + u.recordCount, 0) ?? 0;
+    await pubSubService.publish('import:playbackreporting:progress', {
+      status: result.success ? 'complete' : 'error',
+      totalRecords: total,
+      fetchedRecords: total,
+      processedRecords: total,
+      importedRecords: result.imported,
+      skippedRecords: result.skipped,
+      duplicateRecords: result.duplicates,
+      unknownUserRecords,
+      overlapRecords: result.overlap,
+      filteredRecords: result.filtered,
       errorRecords: result.errors,
       enrichedRecords: result.enriched,
       message: result.message,
@@ -712,6 +886,56 @@ export async function cancelJellystatImport(jobId: string): Promise<boolean> {
   return cancelImport(jobId);
 }
 
+// ==========================================================================
+// Playback Reporting-Specific Functions
+// ==========================================================================
+
+export async function getActivePlaybackReportingImportForServer(
+  serverId: string
+): Promise<string | null> {
+  if (!importQueue) {
+    return null;
+  }
+
+  const activeJobs = await importQueue.getJobs(['active', 'waiting', 'delayed']);
+  const existingJob = activeJobs.find(
+    (j) => j.data.type === 'playback-reporting' && j.data.serverId === serverId
+  );
+
+  return existingJob?.id ?? null;
+}
+
+export async function enqueuePlaybackReportingImport(
+  serverId: string,
+  userId: string,
+  timezone: string,
+  enrichMedia: boolean,
+  importFullRange: boolean
+): Promise<string> {
+  if (!importQueue) {
+    throw new Error('Import queue not initialized');
+  }
+
+  const existingJobId = await getActivePlaybackReportingImportForServer(serverId);
+
+  if (existingJobId) {
+    throw new Error(`Import already in progress for server ${serverId} (job ${existingJobId})`);
+  }
+
+  const job = await importQueue.add('playback-reporting-import', {
+    type: 'playback-reporting',
+    serverId,
+    userId,
+    timezone,
+    enrichMedia,
+    importFullRange,
+  });
+
+  const jobId = job.id ?? `unknown-${Date.now()}`;
+  console.log(`[Import] Enqueued Playback Reporting job ${jobId} for server ${serverId}`);
+  return jobId;
+}
+
 /**
  * Get cached import progress (for polling access in addition to websockets)
  */
@@ -725,7 +949,7 @@ export function getActiveImportProgress(): CachedImportProgress | null {
 export async function getAllActiveImports(): Promise<
   Array<{
     jobId: string;
-    type: 'tautulli' | 'jellystat';
+    type: 'tautulli' | 'jellystat' | 'playback-reporting';
     serverId: string;
     state: string;
     progress: number | object | null;

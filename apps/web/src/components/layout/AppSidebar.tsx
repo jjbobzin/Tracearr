@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { NavLink, useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { ChevronRight, ArrowUpCircle, BookOpen, Globe, Heart } from 'lucide-react';
@@ -49,14 +49,40 @@ function NavMenuItem({ item }: { item: NavItem }) {
   );
 }
 
+/**
+ * Nudges the nav scroll area down just enough that `groupEl` clears the
+ * fixed footer (reserved via scroll-pb-24 on the content region) - never
+ * scrolls past what's needed, so a group opening near the bottom doesn't get
+ * its own trigger/children left half-hidden behind the footer.
+ */
+function scrollGroupAboveFooter(groupEl: HTMLElement | null) {
+  const container = groupEl?.closest<HTMLElement>('[data-sidebar="content"]');
+  if (!groupEl || !container) return;
+  const reserved = parseFloat(getComputedStyle(container).scrollPaddingBottom) || 0;
+  const visibleBottom = container.getBoundingClientRect().bottom - reserved;
+  const overflow = groupEl.getBoundingClientRect().bottom - visibleBottom;
+  if (overflow <= 0) return;
+  const scrollTop: number = container.scrollTop;
+  const maxScrollTop: number = container.scrollHeight - container.clientHeight;
+  container.scrollTop = Math.min(scrollTop + overflow, maxScrollTop);
+}
+
 function NavMenuGroup({ group }: { group: NavGroup }) {
   const location = useLocation();
   const { setOpenMobile } = useSidebar();
   const { t } = useTranslation('nav');
   const isActive = group.children.some((child) => location.pathname.startsWith(child.href));
+  const groupRef = useRef<HTMLDivElement>(null);
 
   return (
-    <Collapsible defaultOpen={isActive} className="group/collapsible">
+    <Collapsible
+      ref={groupRef}
+      defaultOpen={isActive}
+      className="group/collapsible"
+      onOpenChange={(open) => {
+        if (open) requestAnimationFrame(() => scrollGroupAboveFooter(groupRef.current));
+      }}
+    >
       <SidebarMenuItem>
         <CollapsibleTrigger asChild>
           <SidebarMenuButton className={cn(isActive && 'font-medium')}>
@@ -234,7 +260,10 @@ export function AppSidebar() {
         </div>
         <ServerSelector />
       </SidebarHeader>
-      <SidebarContent>
+      {/* scroll-pb reserves room for the fixed footer below so a browser-native
+          scrollIntoView (e.g. clicking a collapsible trigger near the bottom)
+          doesn't stop short and leave the last nav item hidden behind it. */}
+      <SidebarContent className="scroll-pb-24">
         <SidebarGroup>
           <SidebarGroupContent>
             <SidebarMenu>

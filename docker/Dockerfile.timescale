@@ -3,7 +3,11 @@
 # This provides feature parity with the supervised image
 FROM postgres:15-bookworm@sha256:b395c9b05a57a43c079691104bc8468ea336a42e6148f44095e66d0c056cdd1c
 
-# Install TimescaleDB and Toolkit from official TimescaleDB repo
+# Install TimescaleDB and Toolkit from official TimescaleDB repo.
+# timescaledb-2-postgresql-15 is pinned to the 2.28.x line, not left to float:
+# TimescaleDB 2.28.x is the last line PG15 supports (2.29+ requires PG16+), and an
+# unpinned rebuild could silently jump to a release this Dockerfile's PG15 base can't
+# run. Bumping this pin past 2.28.x means a PG major upgrade (dump/restore) first.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
@@ -12,20 +16,32 @@ RUN apt-get update \
     && curl -fsSL https://packagecloud.io/timescale/timescaledb/gpgkey | gpg --dearmor -o /usr/share/keyrings/timescaledb-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/timescaledb-keyring.gpg] https://packagecloud.io/timescale/timescaledb/debian/ bookworm main" > /etc/apt/sources.list.d/timescaledb.list \
     && apt-get update \
+    && TIMESCALEDB_VERSION="$(apt-cache madison timescaledb-2-postgresql-15 | awk '{print $3}' | grep -m1 '^2\.28\.')" \
+    && if [ -z "$TIMESCALEDB_VERSION" ]; then echo "No 2.28.x timescaledb-2-postgresql-15 package found" >&2; exit 1; fi \
     && apt-get install -y --no-install-recommends \
-        timescaledb-2-postgresql-15 \
+        "timescaledb-2-postgresql-15=${TIMESCALEDB_VERSION}" \
         timescaledb-toolkit-postgresql-15 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get purge -y --auto-remove curl gnupg
 
 # Enable TimescaleDB in PostgreSQL config
-# Set unlimited tuple decompression to allow migrations on compressed hypertables
+# Cap tuple decompression per DML transaction at TimescaleDB's default
 # Increase lock table size for TimescaleDB hypertables with many chunks
-# Memory cost: 4096 * max_connections * ~256 bytes = ~100MB at 100 connections (trivial)
+# Memory cost: 4096 * max_connections * ~256 bytes = ~150MB at 150 connections (fine on a dedicated DB container)
+# max_connections 150 leaves room for multi-instance app pools; the entrypoint
+# wrapper applies the same floor to volumes initialized by older image versions
 RUN echo "shared_preload_libraries = 'timescaledb'" >> /usr/share/postgresql/postgresql.conf.sample \
-    && echo "timescaledb.max_tuples_decompressed_per_dml_transaction = 0" >> /usr/share/postgresql/postgresql.conf.sample \
+    && echo "timescaledb.max_tuples_decompressed_per_dml_transaction = 100000" >> /usr/share/postgresql/postgresql.conf.sample \
     && echo "timescaledb.telemetry_level = off" >> /usr/share/postgresql/postgresql.conf.sample \
-    && echo "max_locks_per_transaction = 4096" >> /usr/share/postgresql/postgresql.conf.sample
+    && echo "max_locks_per_transaction = 4096" >> /usr/share/postgresql/postgresql.conf.sample \
+    && echo "max_connections = 150" >> /usr/share/postgresql/postgresql.conf.sample
+
+COPY timescale-entrypoint.sh /usr/local/bin/tracearr-entrypoint.sh
+RUN chmod +x /usr/local/bin/tracearr-entrypoint.sh
+
+# Overriding ENTRYPOINT resets the inherited CMD - restore it
+ENTRYPOINT ["tracearr-entrypoint.sh"]
+CMD ["postgres"]
 
 # OCI image labels for container registries and tools like Renovate
 LABEL org.opencontainers.image.source="https://github.com/connorgallopo/Tracearr" \

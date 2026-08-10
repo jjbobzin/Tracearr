@@ -47,6 +47,21 @@ describe('better auth BASE_PATH handling', () => {
       expect(getBasePath()).toBe('');
       expect(betterAuthBasePath()).toBe('/api/v1/auth');
     });
+
+    it('normalizes BASE_PATH="/" (root) to empty, not "/"', async () => {
+      process.env.BASE_PATH = '/';
+      vi.resetModules();
+      const { getBasePath, betterAuthBasePath } = await import('../basePath.js');
+      expect(getBasePath()).toBe('');
+      expect(betterAuthBasePath()).toBe('/api/v1/auth');
+    });
+
+    it('normalizes whitespace-only BASE_PATH to empty', async () => {
+      process.env.BASE_PATH = '   ';
+      vi.resetModules();
+      const { getBasePath } = await import('../basePath.js');
+      expect(getBasePath()).toBe('');
+    });
   });
 
   describe('toWebRequest', () => {
@@ -61,6 +76,14 @@ describe('better auth BASE_PATH handling', () => {
 
     it('leaves the url untouched with no BASE_PATH', async () => {
       delete process.env.BASE_PATH;
+      vi.resetModules();
+      const { toWebRequest } = await import('../betterAuthRequest.js');
+      const webRequest = toWebRequest(fakeRequest('/api/v1/auth/sign-in/oauth2'));
+      expect(webRequest.url).toBe('https://example.com/api/v1/auth/sign-in/oauth2');
+    });
+
+    it('builds a correct absolute url with BASE_PATH="/" (root), not a protocol-relative one', async () => {
+      process.env.BASE_PATH = '/';
       vi.resetModules();
       const { toWebRequest } = await import('../betterAuthRequest.js');
       const webRequest = toWebRequest(fakeRequest('/api/v1/auth/sign-in/oauth2'));

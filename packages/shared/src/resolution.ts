@@ -95,6 +95,46 @@ export function resolutionTierRank(label: string | null | undefined): number | n
   return RESOLUTION_TIERS[normalized as ResolutionLabel];
 }
 
+/** The four-bucket vocabulary library snapshots and facet endpoints store. */
+export type ResolutionBucket = '4k' | '1080p' | '720p' | 'sd';
+
+/**
+ * Fold a stored resolution label into the four-bucket vocabulary. Tiers above
+ * 1080p (1440p, 8K) fold into 4k, the closest bucket, rather than dropping to
+ * sd. Unknown non-null labels count as sd; null stays null (no video).
+ */
+export function resolutionBucket(label: string | null | undefined): ResolutionBucket | null {
+  if (!label) return null;
+  const rank = resolutionTierRank(label);
+  if (rank !== null && rank >= RESOLUTION_TIERS['1440p']) return '4k';
+  if (rank === RESOLUTION_TIERS['1080p']) return '1080p';
+  if (rank === RESOLUTION_TIERS['720p']) return '720p';
+  return 'sd';
+}
+
+/**
+ * Every known spelling that folds into the given bucket, lowercase. Backs the
+ * SQL IN-lists in resolutionBuckets.ts so database bucketing cannot drift
+ * from resolutionBucket(). The sd bucket has no list: in SQL it is the
+ * non-null complement of the other three.
+ */
+export function resolutionBucketSpellings(bucket: Exclude<ResolutionBucket, 'sd'>): string[] {
+  return Object.keys(LABEL_MAP).filter((key) => resolutionBucket(key) === bucket);
+}
+
+/** All spellings that rank above the sd bucket, for SQL complement predicates. */
+export function resolutionAboveSdSpellings(): string[] {
+  return Object.keys(LABEL_MAP).filter((key) => resolutionBucket(key) !== 'sd');
+}
+
+/** Known spellings paired with their tier rank, for SQL rank CASE expressions. */
+export function resolutionSpellingRanks(): Array<{ spelling: string; rank: number }> {
+  return Object.keys(LABEL_MAP).map((spelling) => ({
+    spelling,
+    rank: resolutionTierRank(spelling) ?? 0,
+  }));
+}
+
 export interface ResolutionInput {
   /** Resolution label from the media server (e.g. "1080", "4k", "sd") */
   label?: string | null;

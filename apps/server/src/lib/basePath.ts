@@ -11,7 +11,12 @@ let cachedBasePath: string | null = null;
  */
 export function getBasePath(): string {
   if (cachedBasePath === null) {
-    cachedBasePath = process.env.BASE_PATH?.replace(/\/+$/, '').replace(/^\/?/, '/') || '';
+    // Strip surrounding slashes before re-adding one leading slash, so
+    // BASE_PATH='/' (root, meaning "no prefix") normalizes to '' instead of
+    // '/' - '/' + a request path starting with '/' would otherwise parse as
+    // a protocol-relative URL in toWebRequest.
+    const trimmed = (process.env.BASE_PATH ?? '').trim().replace(/^\/+/, '').replace(/\/+$/, '');
+    cachedBasePath = trimmed ? `/${trimmed}` : '';
   }
   return cachedBasePath;
 }

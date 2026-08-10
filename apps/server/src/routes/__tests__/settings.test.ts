@@ -85,6 +85,12 @@ const mockAllSettings: Settings = {
   backupRetentionCount: 7,
   pluginUpdateCheckEnabled: true,
   pluginManifestUrl: null,
+  watchedThresholdMovie: 85,
+  watchedThresholdTv: 85,
+  watchedThresholdMusic: 85,
+  publicApiRateLimitPerMinute: 240,
+  imagePrecacheEnabled: true,
+  preferredPosterServerId: null,
 };
 
 async function buildTestApp(authUser: AuthUser): Promise<FastifyInstance> {
@@ -507,6 +513,25 @@ describe('Settings Routes', () => {
       });
 
       expect(response.statusCode).toBe(200);
+    });
+
+    it('accepts and persists imagePrecacheEnabled', async () => {
+      app = await buildTestApp(ownerUser);
+      vi.mocked(getAllSettings).mockResolvedValue({
+        ...mockAllSettings,
+        imagePrecacheEnabled: false,
+      });
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/settings',
+        payload: { imagePrecacheEnabled: false },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(setSettings).toHaveBeenCalledWith({ imagePrecacheEnabled: false });
+      const body = response.json();
+      expect(body.imagePrecacheEnabled).toBe(false);
     });
   });
 });

@@ -93,6 +93,10 @@ vi.mock('../poller/stateTracker.js', () => ({
 }));
 vi.mock('../poller/database.js', () => ({
   getActiveRulesV2: vi.fn().mockResolvedValue([]),
+  // Matches the existing row's serverUserId so the paused-event cross-user
+  // guard lets these updates through.
+  getServerUserIdByExternalId: vi.fn().mockResolvedValue('server-user-1'),
+  batchGetLibraryItemIdentity: vi.fn().mockResolvedValue(new Map()),
   batchGetRecentUserSessions: vi.fn().mockResolvedValue(new Map()),
   mergeRecentSessionsForIdentity: vi.fn().mockReturnValue([]),
 }));

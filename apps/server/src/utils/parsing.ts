@@ -235,26 +235,6 @@ export function parseNumberOrEmpty(val: unknown): number | null {
 }
 
 /**
- * Safely get first element of an array and access a property
- * Useful for patterns like: (item.Media as Record<string, unknown>[])?.[0]?.bitrate
- *
- * @example
- * parseFirstArrayElement(item.Media, 'bitrate', 0) // number from first element
- * parseFirstArrayElement(item.MediaSources, 'Bitrate') // undefined if not found
- */
-export function parseFirstArrayElement<T>(
-  val: unknown,
-  key: string,
-  defaultVal?: T
-): T | undefined {
-  if (!Array.isArray(val) || val.length === 0) return defaultVal;
-  const first = val[0];
-  if (first == null || typeof first !== 'object') return defaultVal;
-  const value = (first as Record<string, unknown>)[key];
-  return value !== undefined ? (value as T) : defaultVal;
-}
-
-/**
  * Find the selected element in an array based on a 'selected' property.
  * Plex uses selected=1 to indicate which Media/Stream is actively playing
  * when multiple versions exist.
@@ -364,7 +344,6 @@ export const parse = {
   optionalBoolean: parseOptionalBoolean,
   array: parseArray,
   filteredArray: parseFilteredArray,
-  firstArrayElement: parseFirstArrayElement,
   nested: getNestedObject,
   nestedValue: getNestedValue,
   date: parseDate,

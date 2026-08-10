@@ -7,6 +7,10 @@ body:
 
         **Before submitting:** Search [existing requests](https://github.com/connorgallopo/Tracearr/discussions/categories/feature-requests) to avoid duplicates.
 
+        This is where features get discussed before anyone writes code. Pull requests for
+        features that were never discussed here (or on Discord) with a code owner get
+        closed, so starting here is the fast path, not the slow one.
+
   - type: textarea
     id: feature
     attributes:

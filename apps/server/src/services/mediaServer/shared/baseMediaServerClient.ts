@@ -6,7 +6,7 @@
  * are handled by abstract methods or configuration.
  */
 
-import { fetchJson, jellyfinEmbyHeaders } from '../../../utils/http.js';
+import { fetchJson, jellyfinEmbyHeaders, HttpClientError } from '../../../utils/http.js';
 import type {
   IMediaServerClient,
   IMediaServerClientWithHistory,
@@ -67,6 +67,7 @@ export interface JellyfinEmbyItemResult {
   };
   SeriesId?: string;
   SeriesPrimaryImageTag?: string;
+  RunTimeTicks?: number;
 }
 
 /**
@@ -196,21 +197,21 @@ export abstract class BaseMediaServerClient
   async getLibraryItems(
     libraryId: string,
     options?: { offset?: number; limit?: number }
-  ): Promise<{ items: MediaLibraryItem[]; totalCount: number }> {
+  ): Promise<{ items: MediaLibraryItem[]; totalCount: number; rawCount: number }> {
     const offset = options?.offset ?? 0;
     const limit = options?.limit ?? 100;
 
     const params = new URLSearchParams({
       ParentId: libraryId,
       Recursive: 'true',
-      // Episode: fetched separately via getLibraryLeaves() to avoid double-counting
-      // Season: not stored (filtered by parser), episode metadata has parentIndex
+      // Episode and Season: fetched separately via getLibraryLeaves() to avoid
+      // double-counting and to keep this query's totalCount top-level-only
       IncludeItemTypes: 'Movie,Series,MusicArtist,MusicAlbum,Audio',
       // IsMissing=false excludes "missing" items that Jellyfin/Emby knows about from metadata
       // but the user doesn't have files for (fixes #240 - inflated episode counts)
       IsMissing: 'false',
       Fields:
-        'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,Album,AlbumArtist,Artists',
+        'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,Album,AlbumArtist,Artists,Genres,ImageTags',
       StartIndex: String(offset),
       Limit: String(limit),
     });
@@ -224,10 +225,11 @@ export abstract class BaseMediaServerClient
       }
     );
 
+    const rawCount = (data.Items ?? []).length;
     const items = this.parsers.parseLibraryItemsResponse(data.Items ?? []);
     const totalCount = data.TotalRecordCount ?? items.length;
 
-    return { items, totalCount };
+    return { items, totalCount, rawCount };
   }
 
   /**
@@ -260,7 +262,7 @@ export abstract class BaseMediaServerClient
         IncludeItemTypes: 'Movie,Series,MusicArtist,MusicAlbum,Audio',
         IsMissing: 'false',
         Fields:
-          'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,Album,AlbumArtist,Artists',
+          'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,Album,AlbumArtist,Artists,Genres,ImageTags',
         StartIndex: String(serverOffset),
         Limit: String(PAGE_SIZE),
         SortBy: 'DateCreated',
@@ -277,47 +279,54 @@ export abstract class BaseMediaServerClient
         }
       );
 
-      const rawItems = this.parsers.parseLibraryItemsResponse(data.Items ?? []);
-      if (rawItems.length === 0) break;
+      // StartIndex is a raw server-side offset, so the page-empty check and the
+      // offset advance must both use the raw count, not the post-extras-filter count
+      const rawCount = (data.Items ?? []).length;
+      if (rawCount === 0) break;
+      const parsedItems = this.parsers.parseLibraryItemsResponse(data.Items ?? []);
 
-      const filtered = rawItems.filter((item) => item.addedAt >= since);
+      const filtered = parsedItems.filter((item) => item.addedAt >= since);
       allItems.push(...filtered);
 
       // If some items on this page predate `since`, we've passed the cutoff
-      if (filtered.length < rawItems.length) break;
+      if (filtered.length < parsedItems.length) break;
 
-      serverOffset += rawItems.length;
+      serverOffset += rawCount;
     }
 
     return { items: allItems, totalCount: allItems.length };
   }
 
   /**
-   * Get all episodes (leaves) in a TV library with pagination
+   * Get all episodes and seasons (leaves) in a TV library with pagination
    *
-   * For TV libraries, this fetches only Episode items, separate from Series/Season.
-   * This matches Plex behavior where episodes are fetched via /allLeaves endpoint.
+   * For TV libraries, this fetches Episode and Season items, separate from
+   * Series. This matches Plex behavior where episodes are fetched via
+   * /allLeaves and seasons via a type=3 query, both apart from the top-level
+   * /all fetch. Season rides this call instead of getLibraryItems so that
+   * call's totalCount - used for the sync count-mismatch check - stays
+   * top-level-only.
    *
    * Fixes #263: Emby not reporting all TV episodes when using getLibraryItems alone.
    *
    * @param libraryId - The parent library ID
    * @param options - Pagination options
-   * @returns Episodes and total count for pagination tracking
+   * @returns Episodes/seasons and total count for pagination tracking
    */
   async getLibraryLeaves(
     libraryId: string,
     options?: { offset?: number; limit?: number }
-  ): Promise<{ items: MediaLibraryItem[]; totalCount: number }> {
+  ): Promise<{ items: MediaLibraryItem[]; totalCount: number; rawCount: number }> {
     const offset = options?.offset ?? 0;
     const limit = options?.limit ?? 100;
 
     const params = new URLSearchParams({
       ParentId: libraryId,
       Recursive: 'true',
-      IncludeItemTypes: 'Episode',
+      IncludeItemTypes: 'Episode,Season',
       IsMissing: 'false',
       Fields:
-        'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber',
+        'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,Genres,ImageTags',
       StartIndex: String(offset),
       Limit: String(limit),
     });
@@ -331,10 +340,11 @@ export abstract class BaseMediaServerClient
       }
     );
 
+    const rawCount = (data.Items ?? []).length;
     const items = this.parsers.parseLibraryItemsResponse(data.Items ?? []);
     const totalCount = data.TotalRecordCount ?? items.length;
 
-    return { items, totalCount };
+    return { items, totalCount, rawCount };
   }
 
   /**
@@ -360,10 +370,10 @@ export abstract class BaseMediaServerClient
       const params = new URLSearchParams({
         ParentId: libraryId,
         Recursive: 'true',
-        IncludeItemTypes: 'Episode',
+        IncludeItemTypes: 'Episode,Season',
         IsMissing: 'false',
         Fields:
-          'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber',
+          'ProviderIds,Path,MediaSources,DateCreated,ProductionYear,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,Genres,ImageTags',
         StartIndex: String(serverOffset),
         Limit: String(PAGE_SIZE),
         SortBy: 'DateCreated',
@@ -380,15 +390,16 @@ export abstract class BaseMediaServerClient
         }
       );
 
-      const rawItems = this.parsers.parseLibraryItemsResponse(data.Items ?? []);
-      if (rawItems.length === 0) break;
+      const rawCount = (data.Items ?? []).length;
+      if (rawCount === 0) break;
+      const parsedItems = this.parsers.parseLibraryItemsResponse(data.Items ?? []);
 
-      const filtered = rawItems.filter((item) => item.addedAt >= since);
+      const filtered = parsedItems.filter((item) => item.addedAt >= since);
       allItems.push(...filtered);
 
-      if (filtered.length < rawItems.length) break;
+      if (filtered.length < parsedItems.length) break;
 
-      serverOffset += rawItems.length;
+      serverOffset += rawCount;
     }
 
     return { items: allItems, totalCount: allItems.length };
@@ -418,7 +429,6 @@ export abstract class BaseMediaServerClient
       SortBy: 'DatePlayed',
       SortOrder: 'Descending',
       Limit: String(options.limit ?? 500),
-      Fields: 'MediaSources',
     });
 
     const data = await fetchJson<unknown>(
@@ -482,7 +492,12 @@ export abstract class BaseMediaServerClient
     const match = Array.isArray(sessions) ? sessions.find((s) => s.Id === sessionId) : undefined;
 
     if (!match) return { found: false, supportsMediaControl: false };
-    return { found: true, supportsMediaControl: match.SupportsMediaControl === true };
+    // Emby sessions only ever carry SupportsRemoteControl; Jellyfin sends both.
+    return {
+      found: true,
+      supportsMediaControl:
+        match.SupportsMediaControl === true || match.SupportsRemoteControl === true,
+    };
   }
 
   /**
@@ -539,7 +554,7 @@ export abstract class BaseMediaServerClient
       Ids: ids.join(','),
       // Include episode, movie, and music metadata fields
       Fields:
-        'ProductionYear,ParentIndexNumber,IndexNumber,SeriesId,SeriesPrimaryImageTag,Album,AlbumArtist,Artists,AlbumId,AlbumPrimaryImageTag',
+        'ProductionYear,ParentIndexNumber,IndexNumber,SeriesId,SeriesPrimaryImageTag,Album,AlbumArtist,Artists,AlbumId,AlbumPrimaryImageTag,RunTimeTicks',
     });
 
     const data = await fetchJson<{ Items?: unknown[] }>(`${this.baseUrl}/Items?${params}`, {
@@ -548,6 +563,66 @@ export abstract class BaseMediaServerClient
     });
 
     return this.parsers.parseItemsResponse(data);
+  }
+
+  private static readonly PLAYBACK_REPORTING_PATHS = {
+    jellyfin: '/user_usage_stats/submit_custom_query',
+    emby: '/emby/user_usage_stats/submit_custom_query',
+  } as const;
+
+  /**
+   * Run a SQL query against the Playback Reporting plugin's SQLite database.
+   * Requires the plugin; a missing plugin surfaces as HttpClientError 404.
+   */
+  async queryPlaybackReporting(query: string): Promise<string[][]> {
+    const path = BaseMediaServerClient.PLAYBACK_REPORTING_PATHS[this.serverType];
+    const data = await fetchJson<{ results?: unknown; message?: string }>(
+      `${this.baseUrl}${path}`,
+      {
+        method: 'POST',
+        headers: { ...this.buildHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ CustomQueryString: query }),
+        service: this.serverType,
+      }
+    );
+    const results = Array.isArray(data.results) ? (data.results as string[][]) : [];
+    if (results.length === 0 && data.message?.startsWith('Error')) {
+      throw new Error(`Playback Reporting query failed: ${data.message}`);
+    }
+    return results;
+  }
+
+  async getPlaybackReportingInfo(): Promise<
+    | { installed: false }
+    | {
+        installed: true;
+        columns: string[];
+        totalRecords: number;
+        oldestDate: string | null;
+        newestDate: string | null;
+      }
+  > {
+    let pragma: string[][];
+    try {
+      pragma = await this.queryPlaybackReporting("pragma table_info('PlaybackActivity')");
+    } catch (error) {
+      if (error instanceof HttpClientError && error.statusCode === 404) {
+        return { installed: false };
+      }
+      throw error;
+    }
+    const columns = pragma.map((row) => row[1] ?? '').filter(Boolean);
+    const summary = await this.queryPlaybackReporting(
+      'SELECT COUNT(1), MIN(DateCreated), MAX(DateCreated) FROM PlaybackActivity'
+    );
+    const first = summary[0];
+    return {
+      installed: true,
+      columns,
+      totalRecords: first?.[0] ? Number(first[0]) : 0,
+      oldestDate: first?.[1] || null,
+      newestDate: first?.[2] || null,
+    };
   }
 
   /**

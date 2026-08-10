@@ -13,8 +13,13 @@ import { sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { REDIS_KEYS, CACHE_TTL, uuidSchema } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { validateServerAccess } from '../../utils/serverFiltering.js';
-import { buildLibraryServerFilter, buildLibraryCacheKey } from './utils.js';
+import { hasVersionInBucket } from '../../utils/resolutionBuckets.js';
+import {
+  validateServerAccess,
+  resolveServerIds,
+  buildMultiServerFragment,
+} from '../../utils/serverFiltering.js';
+import { buildLibraryCacheKey } from './utils.js';
 
 /** Query schema for resolution endpoint */
 const resolutionQuerySchema = z.object({
@@ -110,10 +115,14 @@ export const libraryResolutionRoute: FastifyPluginAsync = async (app) => {
         }
       }
 
+      const resolvedIds = resolveServerIds(authUser, serverId, undefined, { strict: false });
+      const serverCacheSegment =
+        resolvedIds !== undefined ? resolvedIds.slice().sort().join(',') : 'all';
+
       // Build cache key
       const cacheKey = buildLibraryCacheKey(
         REDIS_KEYS.LIBRARY_RESOLUTION ?? 'library:resolution',
-        serverId,
+        serverCacheSegment,
         libraryId ?? 'all'
       );
 
@@ -128,7 +137,7 @@ export const libraryResolutionRoute: FastifyPluginAsync = async (app) => {
       }
 
       // Build server filter
-      const serverFilter = buildLibraryServerFilter(serverId, authUser);
+      const serverFilter = buildMultiServerFragment(resolvedIds);
 
       // Library filter
       const libraryFilter = libraryId ? sql`AND library_id = ${libraryId}` : sql``;
@@ -136,12 +145,14 @@ export const libraryResolutionRoute: FastifyPluginAsync = async (app) => {
       // Query resolution counts for movies
       const moviesResult = await db.execute(sql`
         SELECT
-          COUNT(*) FILTER (WHERE video_resolution = '4k')::int AS count_4k,
-          COUNT(*) FILTER (WHERE video_resolution = '1080p')::int AS count_1080p,
-          COUNT(*) FILTER (WHERE video_resolution = '720p')::int AS count_720p,
-          COUNT(*) FILTER (WHERE video_resolution = 'sd' OR video_resolution IS NULL)::int AS count_sd
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', '4k')})::int AS count_4k,
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', '1080p')})::int AS count_1080p,
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', '720p')})::int AS count_720p,
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', 'sd', { includeNullAsSd: true })}
+                             OR video_resolution IS NULL)::int AS count_sd
         FROM library_items
         WHERE media_type = 'movie'
+          AND removed_at IS NULL
           ${serverFilter}
           ${libraryFilter}
       `);
@@ -149,12 +160,14 @@ export const libraryResolutionRoute: FastifyPluginAsync = async (app) => {
       // Query resolution counts for TV episodes
       const tvResult = await db.execute(sql`
         SELECT
-          COUNT(*) FILTER (WHERE video_resolution = '4k')::int AS count_4k,
-          COUNT(*) FILTER (WHERE video_resolution = '1080p')::int AS count_1080p,
-          COUNT(*) FILTER (WHERE video_resolution = '720p')::int AS count_720p,
-          COUNT(*) FILTER (WHERE video_resolution = 'sd' OR video_resolution IS NULL)::int AS count_sd
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', '4k')})::int AS count_4k,
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', '1080p')})::int AS count_1080p,
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', '720p')})::int AS count_720p,
+          COUNT(*) FILTER (WHERE ${hasVersionInBucket('library_items.id', 'sd', { includeNullAsSd: true })}
+                             OR video_resolution IS NULL)::int AS count_sd
         FROM library_items
         WHERE media_type = 'episode'
+          AND removed_at IS NULL
           ${serverFilter}
           ${libraryFilter}
       `);

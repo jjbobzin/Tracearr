@@ -41,8 +41,9 @@ export async function queryPlaysOverTime(params: {
   bucketInterval: string;
   serverFilter: SQL;
   endDate?: Date;
+  mediaTypeFilter?: SQL;
 }): Promise<PlaysOverTimeRow[]> {
-  const { rangeStart, timezone, bucketInterval, serverFilter, endDate } = params;
+  const { rangeStart, timezone, bucketInterval, serverFilter, endDate, mediaTypeFilter } = params;
 
   const baseWhere = rangeStart
     ? sql`WHERE started_at >= ${rangeStart} AND duration_ms >= ${MIN_PLAY_DURATION_MS}`
@@ -56,6 +57,7 @@ export async function queryPlaysOverTime(params: {
     FROM sessions
     ${baseWhere}
     ${MEDIA_TYPE_SQL_FILTER}
+    ${mediaTypeFilter ?? sql``}
     ${endDate ? sql`AND started_at < ${endDate}` : sql``}
     ${serverFilter}
     GROUP BY 1, 2

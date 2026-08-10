@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Database, RefreshCw, Clock, Loader2, BarChart3 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
@@ -23,7 +24,9 @@ interface LibraryEmptyStateProps {
  * Automatically detects the current state per selected server:
  * 1. Library not synced -> Shows sync button
  * 2. Library synced but needs backfill -> Shows backfill button
- * 3. Backfill running -> Shows progress
+ * 3. Library synced, no backfill needed, but genuinely has no movies/shows
+ *    -> media-appropriate empty message (never "not synced")
+ * 4. Backfill running -> Shows progress
  *
  * With a single server selected this renders the same states as before.
  * With multiple servers selected (this component only renders when every
@@ -32,6 +35,7 @@ interface LibraryEmptyStateProps {
  * job shared by every server, so it keeps one button for all of them.
  */
 export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
+  const { t } = useTranslation('pages');
   const { selectedServerIds, selectedServers } = useServer();
   const queryClient = useQueryClient();
   const [syncingIds, setSyncingIds] = useState<Set<string>>(new Set());
@@ -54,13 +58,14 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
 
       if (progress.status === 'complete') {
         void queryClient.invalidateQueries({ queryKey: ['library'] });
+        void queryClient.invalidateQueries({ queryKey: ['media'] });
         onComplete?.();
-        toast.success('Backfill complete', {
+        toast.success(t('library.emptyState.toast.backfillCompleteTitle'), {
           description: progress.message,
         });
         setBackfillProgress(null);
       } else if (progress.status === 'error') {
-        toast.error('Backfill failed', {
+        toast.error(t('library.emptyState.toast.backfillErrorTitle'), {
           description: progress.message,
         });
         setBackfillProgress(null);
@@ -72,29 +77,31 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
     return () => {
       socket.off(WS_EVENTS.MAINTENANCE_PROGRESS, handleProgress);
     };
-  }, [socket, queryClient, onComplete]);
+  }, [socket, queryClient, onComplete, t]);
 
   const handleSync = async (serverId: string | undefined) => {
     if (!serverId) {
-      toast.error('No server selected');
+      toast.error(t('library.emptyState.toast.noServerSelected'));
       return;
     }
 
     setSyncingIds((prev) => new Set(prev).add(serverId));
     try {
       await api.servers.sync(serverId);
-      toast.success('Library sync started', {
-        description: 'This may take a few minutes depending on library size.',
+      toast.success(t('library.emptyState.toast.syncStartedTitle'), {
+        description: t('library.emptyState.toast.syncStartedDesc'),
       });
 
       // Invalidate queries after a short delay
       setTimeout(() => {
         void queryClient.invalidateQueries({ queryKey: ['library'] });
+        void queryClient.invalidateQueries({ queryKey: ['media'] });
         onComplete?.();
       }, 2000);
     } catch (err) {
-      toast.error('Failed to start sync', {
-        description: err instanceof Error ? err.message : 'Please try again.',
+      toast.error(t('library.emptyState.toast.syncFailedTitle'), {
+        description:
+          err instanceof Error ? err.message : t('library.emptyState.toast.genericRetry'),
       });
     } finally {
       setSyncingIds((prev) => {
@@ -109,13 +116,14 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
     setIsStartingBackfill(true);
     try {
       await api.maintenance.startJob('backfill_library_snapshots');
-      toast.success('Backfill started', {
-        description: 'Historical snapshots are being generated.',
+      toast.success(t('library.emptyState.toast.backfillStartedTitle'), {
+        description: t('library.emptyState.toast.backfillStartedDesc'),
       });
       void queryClient.invalidateQueries({ queryKey: ['library', 'status'] });
     } catch (err) {
-      toast.error('Failed to start backfill', {
-        description: err instanceof Error ? err.message : 'Please try again.',
+      toast.error(t('library.emptyState.toast.backfillFailedTitle'), {
+        description:
+          err instanceof Error ? err.message : t('library.emptyState.toast.genericRetry'),
       });
     } finally {
       setIsStartingBackfill(false);
@@ -127,7 +135,7 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
     return (
       <div className="rounded-xl border border-dashed p-8 text-center">
         <Loader2 className="text-muted-foreground/50 mx-auto h-12 w-12 animate-spin" />
-        <p className="text-muted-foreground mt-4">Checking library status...</p>
+        <p className="text-muted-foreground mt-4">{t('library.emptyState.checkingStatus')}</p>
       </div>
     );
   }
@@ -149,18 +157,24 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
     return (
       <div className="rounded-xl border border-dashed p-8 text-center">
         <Loader2 className="text-muted-foreground/50 mx-auto h-12 w-12 animate-spin" />
-        <h3 className="mt-4 text-lg font-medium">Generating historical data...</h3>
+        <h3 className="mt-4 text-lg font-medium">
+          {t('library.emptyState.backfillRunning.title')}
+        </h3>
         <p className="text-muted-foreground mx-auto mt-2 max-w-md">
-          {backfillProgress?.message ||
-            'Creating snapshots from library history. This may take a few minutes.'}
+          {backfillProgress?.message || t('library.emptyState.backfillRunning.fallbackBody')}
         </p>
         {backfillProgress && backfillProgress.totalRecords > 0 && (
           <div className="mx-auto mt-4 max-w-xs space-y-2">
             <Progress value={pct} className="h-2" />
             <p className="text-muted-foreground text-sm">
-              {backfillProgress.processedRecords} of {backfillProgress.totalRecords} libraries
+              {t('library.emptyState.backfillRunning.progress', {
+                processed: backfillProgress.processedRecords,
+                total: backfillProgress.totalRecords,
+              })}
               {backfillProgress.updatedRecords > 0 &&
-                ` (${backfillProgress.updatedRecords} snapshots)`}
+                t('library.emptyState.backfillRunning.snapshotsSuffix', {
+                  count: backfillProgress.updatedRecords,
+                })}
             </p>
           </div>
         )}
@@ -182,9 +196,11 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
         return (
           <div className="rounded-xl border border-dashed p-8 text-center">
             <Loader2 className="text-muted-foreground/50 mx-auto h-12 w-12 animate-spin" />
-            <h3 className="mt-4 text-lg font-medium">Library sync in progress...</h3>
+            <h3 className="mt-4 text-lg font-medium">
+              {t('library.emptyState.backfillAvailable.syncRunningTitle')}
+            </h3>
             <p className="text-muted-foreground mx-auto mt-2 max-w-md">
-              Historical data generation will start automatically once the sync completes.
+              {t('library.emptyState.backfillAvailable.syncRunningBody')}
             </p>
           </div>
         );
@@ -193,11 +209,13 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
       return (
         <div className="rounded-xl border border-dashed p-8 text-center">
           <Clock className="text-muted-foreground/50 mx-auto h-12 w-12" />
-          <h3 className="mt-4 text-lg font-medium">Historical data available</h3>
+          <h3 className="mt-4 text-lg font-medium">
+            {t('library.emptyState.backfillAvailable.title')}
+          </h3>
           <p className="text-muted-foreground mx-auto mt-2 max-w-md">
             {backfillDays
-              ? `Your library has ${backfillDays} days of history. Generate snapshots to see trends in charts.`
-              : 'Generate historical snapshots to see library trends over time.'}
+              ? t('library.emptyState.backfillAvailable.bodyWithDays', { days: backfillDays })
+              : t('library.emptyState.backfillAvailable.bodyGeneric')}
           </p>
           <Button
             variant="outline"
@@ -209,12 +227,12 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
             {isStartingBackfill ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Starting...
+                {t('library.emptyState.starting')}
               </>
             ) : (
               <>
                 <BarChart3 className="mr-2 h-4 w-4" />
-                Generate History
+                {t('library.emptyState.generateHistory')}
               </>
             )}
           </Button>
@@ -222,28 +240,52 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
       );
     }
 
-    // Default: Library not synced
     // If sync is already running, show progress
     if (isSyncRunning || isSyncing) {
       return (
         <div className="rounded-xl border border-dashed p-8 text-center">
           <Loader2 className="text-muted-foreground/50 mx-auto h-12 w-12 animate-spin" />
-          <h3 className="mt-4 text-lg font-medium">Library sync in progress...</h3>
+          <h3 className="mt-4 text-lg font-medium">
+            {t('library.emptyState.syncInProgress.title')}
+          </h3>
           <p className="text-muted-foreground mx-auto mt-2 max-w-md">
-            Library statistics will appear once the sync completes. This may take a few minutes
-            depending on library size.
+            {t('library.emptyState.syncInProgress.body')}
           </p>
         </div>
       );
     }
 
+    // Synced, no backfill pending, nothing running - a genuinely empty
+    // library. This is not "not synced yet"; that copy would be wrong here.
+    if (isSynced) {
+      return (
+        <div className="rounded-xl border border-dashed p-8 text-center">
+          <Database className="text-muted-foreground/50 mx-auto h-12 w-12" />
+          <h3 className="mt-4 text-lg font-medium">{t('library.emptyState.noMedia.title')}</h3>
+          <p className="text-muted-foreground mx-auto mt-2 max-w-md">
+            {t('library.emptyState.noMedia.body')}
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-4"
+            onClick={() => void handleSync(selectedServerId)}
+            disabled={!selectedServerId}
+          >
+            <RefreshCw className="mr-2 h-4 w-4" />
+            {t('library.emptyState.syncNow')}
+          </Button>
+        </div>
+      );
+    }
+
+    // Default: Library not synced
     return (
       <div className="rounded-xl border border-dashed p-8 text-center">
         <Database className="text-muted-foreground/50 mx-auto h-12 w-12" />
-        <h3 className="mt-4 text-lg font-medium">Library not synced yet</h3>
+        <h3 className="mt-4 text-lg font-medium">{t('library.emptyState.notSynced.title')}</h3>
         <p className="text-muted-foreground mx-auto mt-2 max-w-md">
-          Library statistics will appear here once the library has been synced. This typically
-          happens automatically every hour.
+          {t('library.emptyState.notSynced.body')}
         </p>
         <Button
           variant="outline"
@@ -253,7 +295,7 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
           disabled={!selectedServerId}
         >
           <RefreshCw className="mr-2 h-4 w-4" />
-          Sync Now
+          {t('library.emptyState.syncNow')}
         </Button>
       </div>
     );
@@ -271,9 +313,9 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
   return (
     <div className="rounded-xl border border-dashed p-8 text-center">
       <Database className="text-muted-foreground/50 mx-auto h-12 w-12" />
-      <h3 className="mt-4 text-lg font-medium">Some libraries need attention</h3>
+      <h3 className="mt-4 text-lg font-medium">{t('library.emptyState.multiServer.title')}</h3>
       <p className="text-muted-foreground mx-auto mt-2 max-w-md">
-        Sync the servers below to see combined library statistics.
+        {t('library.emptyState.multiServer.body')}
       </p>
 
       {needsSync.length > 0 && (
@@ -288,7 +330,9 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
                 <div className="flex min-w-0 items-center gap-2">
                   <ServerBadge server={server} variant="outlined" />
                   <span className="text-muted-foreground text-sm">
-                    {isSyncing ? 'Syncing...' : 'Not synced yet'}
+                    {isSyncing
+                      ? t('library.emptyState.syncing')
+                      : t('library.emptyState.notSyncedShort')}
                   </span>
                 </div>
                 <Button
@@ -302,7 +346,7 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
                   ) : (
                     <RefreshCw className="h-4 w-4" />
                   )}
-                  Sync Now
+                  {t('library.emptyState.syncNow')}
                 </Button>
               </li>
             );
@@ -313,7 +357,7 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
       {needsBackfillOnly.length > 0 && (
         <div className="mx-auto mt-6 max-w-md space-y-3">
           <p className="text-muted-foreground text-sm">
-            These servers are synced but have no historical data yet:
+            {t('library.emptyState.multiServer.needsBackfillIntro')}
           </p>
           <div className="flex flex-wrap items-center justify-center gap-2">
             {needsBackfillOnly.map(({ server }) => (
@@ -329,12 +373,12 @@ export function LibraryEmptyState({ onComplete }: LibraryEmptyStateProps) {
             {isStartingBackfill ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Starting...
+                {t('library.emptyState.starting')}
               </>
             ) : (
               <>
                 <BarChart3 className="mr-2 h-4 w-4" />
-                Generate History
+                {t('library.emptyState.generateHistory')}
               </>
             )}
           </Button>

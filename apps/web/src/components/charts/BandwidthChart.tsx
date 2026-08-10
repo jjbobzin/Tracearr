@@ -1,16 +1,19 @@
-import { useMemo } from 'react';
+import { useMemo, useRef } from 'react';
 import Highcharts from 'highcharts';
 import { HighchartsReact } from 'highcharts-react-official';
-import type { ServerBandwidthDataPoint } from '@tracearr/shared';
+import {
+  BANDWIDTH_STATS_CONFIG,
+  liveStatsRetentionSeconds,
+  type ServerBandwidthDataPoint,
+} from '@tracearr/shared';
+import {
+  liveStatsTimeAxis,
+  nearestPoints,
+  useSlidingWindow,
+  zeroFillSeconds,
+} from './liveStatsAxis';
 import { ChartSkeleton } from '@/components/ui/skeleton';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import { ArrowUpDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -22,29 +25,6 @@ const COLORS = {
   remoteGradientStart: 'rgba(0, 180, 228, 0.3)',
   remoteGradientEnd: 'rgba(0, 180, 228, 0.05)',
 };
-
-const X_LABELS: Record<number, string> = {
-  [-120]: '2m',
-  [-110]: '1m 50s',
-  [-100]: '1m 40s',
-  [-90]: '1m 30s',
-  [-80]: '1m 20s',
-  [-70]: '1m 10s',
-  [-60]: '1m',
-  [-50]: '50s',
-  [-40]: '40s',
-  [-30]: '30s',
-  [-20]: '20s',
-  [-10]: '10s',
-  [0]: 'NOW',
-};
-
-const POLL_OPTIONS = [
-  { value: '1', label: '1s' },
-  { value: '3', label: '3s' },
-  { value: '6', label: '6s' },
-  { value: '10', label: '10s' },
-];
 
 /**
  * Format bits per second matching Plex's style (bps, Kbps, Mbps, Gbps)
@@ -58,6 +38,17 @@ function formatBitsPerSecond(bps: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[i]}`;
 }
 
+// In highcharts-react's effect deps - inline literals would update per render
+const UPDATE_ARGS: [boolean, boolean, boolean] = [true, true, false];
+const CONTAINER_PROPS = { style: { width: '100%', height: '100%' } };
+
+export interface BandwidthMultiSeries {
+  serverId: string;
+  serverName: string;
+  color: string;
+  data: ServerBandwidthDataPoint[];
+}
+
 interface ServerBandwidthChartProps {
   data: ServerBandwidthDataPoint[] | undefined;
   isLoading?: boolean;
@@ -65,54 +56,83 @@ interface ServerBandwidthChartProps {
     local: number;
     remote: number;
   } | null;
-  pollInterval: number;
-  onPollIntervalChange: (interval: number) => void;
-}
-
-function PollIntervalSelect({ value, onChange }: { value: number; onChange: (v: number) => void }) {
-  return (
-    <Select value={String(value)} onValueChange={(v) => onChange(Number(v))}>
-      <SelectTrigger className="h-6 w-[70px] text-xs">
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        {POLL_OPTIONS.map((opt) => (
-          <SelectItem key={opt.value} value={opt.value} className="text-xs">
-            {opt.label}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  );
+  /** One total-throughput line per server; replaces the local/remote split */
+  multiSeries?: BandwidthMultiSeries[];
+  clockSkewMs?: number;
 }
 
 export function ServerBandwidthChart({
   data,
   isLoading,
   averages,
-  pollInterval,
-  onPollIntervalChange,
+  multiSeries,
+  clockSkewMs = 0,
 }: ServerBandwidthChartProps) {
   const { t } = useTranslation(['pages']);
+  const chartRef = useRef<HighchartsReact.RefObject | null>(null);
+
+  useSlidingWindow(chartRef, clockSkewMs);
+
+  const isMulti = !!multiSeries && multiSeries.length > 0;
+  const hasData = isMulti ? multiSeries.some((s) => s.data.length > 0) : !!data && data.length > 0;
 
   const chartOptions = useMemo<Highcharts.Options>(() => {
-    if (!data || data.length === 0) {
+    if (!hasData) {
       return {};
     }
 
-    const localData: [number, number][] = [];
-    const remoteData: [number, number][] = [];
+    // Absent seconds moved no bytes, so they zero-fill rather than gap
+    const bpsSeries = (
+      points: ServerBandwidthDataPoint[],
+      bytesOf: (p: ServerBandwidthDataPoint) => number
+    ) =>
+      // Retained span, not the visible window: clipping the fill to the window
+      // leaves the left wall bare until the next poll moves `newest`
+      zeroFillSeconds(
+        points.map((p) => [p.at * 1000, (bytesOf(p) * 8) / p.timespan] as [number, number]),
+        liveStatsRetentionSeconds(BANDWIDTH_STATS_CONFIG.WINDOW_SECONDS)
+      );
 
-    // Use timestamp-based x positions so points stay fixed as new data arrives.
-    // The newest point is at x=0 (NOW), older points at negative seconds.
-    const lastPoint = data[data.length - 1];
-    if (!lastPoint) return {};
-    const newestAt = lastPoint.at;
-    for (const point of data) {
-      const x = -(newestAt - point.at);
-      // Convert bytes to bits per second (bytes * 8 / timespan)
-      localData.push([x, (point.lanBytes * 8) / point.timespan]);
-      remoteData.push([x, (point.wanBytes * 8) / point.timespan]);
+    let series: Highcharts.SeriesOptionsType[];
+
+    if (isMulti) {
+      series = multiSeries.map((s) => ({
+        type: 'line' as const,
+        name: s.serverName,
+        color: s.color,
+        data: bpsSeries(s.data, (p) => p.lanBytes + p.wanBytes),
+      }));
+    } else {
+      if (!data || data.length === 0) return {};
+
+      series = [
+        {
+          type: 'area',
+          name: 'Local',
+          data: bpsSeries(data, (p) => p.lanBytes),
+          color: COLORS.local,
+          fillColor: {
+            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
+            stops: [
+              [0, COLORS.localGradientStart],
+              [1, COLORS.localGradientEnd],
+            ],
+          },
+        },
+        {
+          type: 'area',
+          name: 'Remote',
+          data: bpsSeries(data, (p) => p.wanBytes),
+          color: COLORS.remote,
+          fillColor: {
+            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
+            stops: [
+              [0, COLORS.remoteGradientStart],
+              [1, COLORS.remoteGradientEnd],
+            ],
+          },
+        },
+      ];
     }
 
     return {
@@ -138,20 +158,7 @@ export function ServerBandwidthChart({
         },
         itemHoverStyle: { color: 'hsl(var(--foreground))' },
       },
-      xAxis: {
-        type: 'linear',
-        min: -120,
-        max: 0,
-        tickInterval: 10,
-        labels: {
-          style: { color: 'hsl(var(--muted-foreground))', fontSize: '10px' },
-          formatter: function () {
-            return X_LABELS[this.value as number] || '';
-          },
-        },
-        lineColor: 'hsl(var(--border))',
-        tickColor: 'hsl(var(--border))',
-      },
+      xAxis: liveStatsTimeAxis(Date.now() + clockSkewMs),
       yAxis: {
         title: { text: undefined },
         labels: {
@@ -165,26 +172,29 @@ export function ServerBandwidthChart({
         softMax: 1000, // 1 Kbps floor so the axis has labels when traffic is zero
       },
       plotOptions: {
-        area: {
+        series: {
           marker: {
             enabled: false,
             states: { hover: { enabled: true, radius: 3 } },
           },
           lineWidth: 1.5,
           states: { hover: { lineWidth: 2 } },
-          threshold: null,
           connectNulls: false,
+        },
+        area: {
+          threshold: null,
         },
       },
       tooltip: {
-        shared: true,
         backgroundColor: 'hsl(var(--popover))',
         borderColor: 'hsl(var(--border))',
         style: { color: 'hsl(var(--popover-foreground))', fontSize: '11px' },
         formatter: function () {
-          const points = this.points || [];
-          const x = this.x;
-          const secsAgo = Math.round(Math.abs(x));
+          const matched = nearestPoints(this);
+          const secsAgo = Math.max(
+            0,
+            Math.round((Date.now() + clockSkewMs - Number(this.x)) / 1000)
+          );
           const timeLabel =
             secsAgo === 0
               ? 'Now'
@@ -192,79 +202,50 @@ export function ServerBandwidthChart({
                 ? `${Math.floor(secsAgo / 60)}m ${secsAgo % 60}s ago`
                 : `${secsAgo}s ago`;
 
-          let html = `<span style="font-size:10px;color:hsl(var(--muted-foreground))">${timeLabel}</span><br/>`;
-          let total = 0;
-          for (const point of points) {
-            if (point.y !== null) {
-              const color = point.series.color;
-              total += point.y as number;
-              html += `<span style="color:${color}">\u25CF</span> ${point.series.name} \u2014 <b>${formatBitsPerSecond(point.y as number)}</b><br/>`;
-            }
-          }
-          html += `<br/>Total \u2014 <b>${formatBitsPerSecond(total)}</b>`;
-          return html;
+          const rows = matched
+            .map(
+              (p) =>
+                `<span style="color:${p.color}">\u25CF</span> ${p.name} \u2014 <b>${formatBitsPerSecond(p.y)}</b>`
+            )
+            .join('<br/>');
+          const total = matched.reduce((sum, p) => sum + p.y, 0);
+
+          return (
+            `<span style="font-size:10px;color:hsl(var(--muted-foreground))">${timeLabel}</span><br/>` +
+            `${rows}<br/><br/>Total \u2014 <b>${formatBitsPerSecond(total)}</b>`
+          );
         },
       },
-      series: [
-        {
-          type: 'area',
-          name: 'Local',
-          data: localData,
-          color: COLORS.local,
-          fillColor: {
-            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
-            stops: [
-              [0, COLORS.localGradientStart],
-              [1, COLORS.localGradientEnd],
-            ],
-          },
-        },
-        {
-          type: 'area',
-          name: 'Remote',
-          data: remoteData,
-          color: COLORS.remote,
-          fillColor: {
-            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
-            stops: [
-              [0, COLORS.remoteGradientStart],
-              [1, COLORS.remoteGradientEnd],
-            ],
-          },
-        },
-      ],
+      series,
       responsive: {
         rules: [
           {
             condition: { maxWidth: 400 },
             chartOptions: {
               legend: { align: 'center', layout: 'horizontal', itemStyle: { fontSize: '10px' } },
-              xAxis: { tickInterval: 20, labels: { style: { fontSize: '9px' } } },
+              xAxis: liveStatsTimeAxis(Date.now() + clockSkewMs, true),
             },
           },
         ],
       },
     };
-  }, [data]);
+  }, [data, multiSeries, isMulti, hasData, clockSkewMs]);
 
   // Convert byte averages to bits per second for display
   const avgLocalBps = averages ? averages.local * 8 : null;
   const avgRemoteBps = averages ? averages.remote * 8 : null;
 
-  const headerRight = <PollIntervalSelect value={pollInterval} onChange={onPollIntervalChange} />;
+  const cardTitle = (
+    <CardTitle className="flex items-center gap-2 text-sm font-medium">
+      <ArrowUpDown className="h-4 w-4" />
+      {t('dashboard.bandwidth')}
+    </CardTitle>
+  );
 
   if (isLoading) {
     return (
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center justify-between text-sm font-medium">
-            <span className="flex items-center gap-2">
-              <ArrowUpDown className="h-4 w-4" />
-              {t('dashboard.bandwidth')}
-            </span>
-            {headerRight}
-          </CardTitle>
-        </CardHeader>
+        <CardHeader className="pb-2">{cardTitle}</CardHeader>
         <CardContent>
           <ChartSkeleton height={180} />
         </CardContent>
@@ -272,18 +253,10 @@ export function ServerBandwidthChart({
     );
   }
 
-  if (!data || data.length === 0) {
+  if (!hasData) {
     return (
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center justify-between text-sm font-medium">
-            <span className="flex items-center gap-2">
-              <ArrowUpDown className="h-4 w-4" />
-              {t('dashboard.bandwidth')}
-            </span>
-            {headerRight}
-          </CardTitle>
-        </CardHeader>
+        <CardHeader className="pb-2">{cardTitle}</CardHeader>
         <CardContent>
           <div
             className="text-muted-foreground flex items-center justify-center rounded-lg border border-dashed text-sm"
@@ -298,35 +271,48 @@ export function ServerBandwidthChart({
 
   return (
     <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="flex items-center justify-between text-sm font-medium">
-          <span className="flex items-center gap-2">
-            <ArrowUpDown className="h-4 w-4" />
-            {t('dashboard.bandwidth')}
-          </span>
-          {headerRight}
-        </CardTitle>
-      </CardHeader>
+      <CardHeader className="pb-2">{cardTitle}</CardHeader>
       <CardContent className="pb-2">
         <HighchartsReact
+          ref={chartRef}
           highcharts={Highcharts}
           options={chartOptions}
-          updateArgs={[true, true, false]}
-          containerProps={{ style: { width: '100%', height: '100%' } }}
+          updateArgs={UPDATE_ARGS}
+          containerProps={CONTAINER_PROPS}
         />
-        <div className="text-muted-foreground mt-1 flex justify-end gap-4 pr-2 text-xs">
-          <span>
-            <span style={{ color: COLORS.remote }}>{'\u25CF'}</span> Avg:{' '}
-            <span className="text-foreground font-medium">
-              {avgRemoteBps !== null ? formatBitsPerSecond(avgRemoteBps) : '\u2014'}
-            </span>
-          </span>
-          <span>
-            <span style={{ color: COLORS.local }}>{'\u25CF'}</span> Avg:{' '}
-            <span className="text-foreground font-medium">
-              {avgLocalBps !== null ? formatBitsPerSecond(avgLocalBps) : '\u2014'}
-            </span>
-          </span>
+        <div className="text-muted-foreground mt-1 flex flex-wrap justify-end gap-4 pr-2 text-xs">
+          {isMulti ? (
+            multiSeries.map((s) => (
+              <span key={s.serverId}>
+                <span style={{ color: s.color }}>{'\u25CF'}</span> Avg:{' '}
+                <span className="text-foreground font-medium">
+                  {s.data.length > 0
+                    ? formatBitsPerSecond(
+                        s.data.reduce(
+                          (sum, p) => sum + ((p.lanBytes + p.wanBytes) * 8) / p.timespan,
+                          0
+                        ) / s.data.length
+                      )
+                    : '\u2014'}
+                </span>
+              </span>
+            ))
+          ) : (
+            <>
+              <span>
+                <span style={{ color: COLORS.remote }}>{'\u25CF'}</span> Avg:{' '}
+                <span className="text-foreground font-medium">
+                  {avgRemoteBps !== null ? formatBitsPerSecond(avgRemoteBps) : '\u2014'}
+                </span>
+              </span>
+              <span>
+                <span style={{ color: COLORS.local }}>{'\u25CF'}</span> Avg:{' '}
+                <span className="text-foreground font-medium">
+                  {avgLocalBps !== null ? formatBitsPerSecond(avgLocalBps) : '\u2014'}
+                </span>
+              </span>
+            </>
+          )}
         </div>
       </CardContent>
     </Card>

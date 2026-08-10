@@ -43,24 +43,56 @@ vi.mock('../../services/sync.js', () => ({
   syncServer: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../../services/playbackReporting.js', () => ({
+  importPlaybackReporting: vi.fn().mockResolvedValue({ imported: 0 }),
+}));
+
+vi.mock('../../db/client.js', () => ({
+  db: { select: vi.fn() },
+}));
+
+// Mock class for JellyfinClient/EmbyClient (Playback Reporting test endpoint)
+let mockPlaybackReportingClient: {
+  getPlaybackReportingInfo: ReturnType<typeof vi.fn>;
+};
+
+vi.mock('../../services/mediaServer/index.js', () => {
+  const MockJellyfinClient = vi.fn().mockImplementation(function (
+    this: typeof mockPlaybackReportingClient
+  ) {
+    this.getPlaybackReportingInfo = mockPlaybackReportingClient.getPlaybackReportingInfo;
+  });
+  const MockEmbyClient = vi.fn().mockImplementation(function (
+    this: typeof mockPlaybackReportingClient
+  ) {
+    this.getPlaybackReportingInfo = mockPlaybackReportingClient.getPlaybackReportingInfo;
+  });
+  return { JellyfinClient: MockJellyfinClient, EmbyClient: MockEmbyClient };
+});
+
 // Mock import queue functions
 vi.mock('../../jobs/importQueue.js', () => ({
   enqueueImport: vi.fn().mockRejectedValue(new Error('Queue not available')),
+  enqueuePlaybackReportingImport: vi.fn().mockRejectedValue(new Error('Queue not available')),
   getImportStatus: vi.fn().mockResolvedValue(null),
   cancelImport: vi.fn().mockResolvedValue(false),
   getImportQueueStats: vi.fn().mockResolvedValue(null),
   getActiveImportForServer: vi.fn().mockResolvedValue(null),
+  getActivePlaybackReportingImportForServer: vi.fn().mockResolvedValue(null),
 }));
 
 // Import mocked services and routes
 import { TautulliService } from '../../services/tautulli.js';
 import { syncServer } from '../../services/sync.js';
+import { db } from '../../db/client.js';
 import {
   enqueueImport,
+  enqueuePlaybackReportingImport,
   getImportStatus,
   cancelImport,
   getImportQueueStats,
   getActiveImportForServer,
+  getActivePlaybackReportingImportForServer,
 } from '../../jobs/importQueue.js';
 import { importRoutes } from '../import.js';
 
@@ -121,6 +153,9 @@ describe('Import Routes', () => {
       getUsers: vi.fn().mockResolvedValue([]),
       getHistory: vi.fn().mockResolvedValue({ total: 0 }),
     };
+    mockPlaybackReportingClient = {
+      getPlaybackReportingInfo: vi.fn().mockResolvedValue({ installed: false }),
+    };
   });
 
   afterEach(async () => {
@@ -128,6 +163,17 @@ describe('Import Routes', () => {
       await app.close();
     }
   });
+
+  /** Mocks db.select().from().where().limit() to resolve with `result`. */
+  function mockDbSelectLimit(result: unknown[]) {
+    const chain = {
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      limit: vi.fn().mockResolvedValue(result),
+    };
+    vi.mocked(db.select).mockReturnValue(chain as never);
+    return chain;
+  }
 
   describe('POST /import/tautulli', () => {
     const validServerId = randomUUID();
@@ -577,6 +623,304 @@ describe('Import Routes', () => {
       expect(response.statusCode).toBe(409);
       const body = response.json();
       expect(body.message).toContain('already in progress');
+    });
+  });
+
+  describe('POST /import/playback-reporting', () => {
+    const validServerId = randomUUID();
+    const jellyfinServerRow = {
+      id: validServerId,
+      type: 'jellyfin',
+      url: 'http://jf.local:8096',
+      token: 'tok123',
+      name: 'My Jellyfin',
+    };
+
+    it('queues an import for an owner and applies schema defaults', async () => {
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([jellyfinServerRow]);
+      vi.mocked(enqueuePlaybackReportingImport).mockResolvedValueOnce('job-pr-1');
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting',
+        payload: { serverId: validServerId, timezone: 'America/New_York' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.status).toBe('queued');
+      expect(body.jobId).toBe('job-pr-1');
+      expect(enqueuePlaybackReportingImport).toHaveBeenCalledWith(
+        validServerId,
+        ownerUser.userId,
+        'America/New_York',
+        true,
+        false
+      );
+      expect(syncServer).toHaveBeenCalledWith(validServerId, {
+        syncUsers: true,
+        syncLibraries: false,
+      });
+    });
+
+    it('rejects non-owner users', async () => {
+      app = await buildTestApp(viewerUser);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting',
+        payload: { serverId: validServerId, timezone: 'America/New_York' },
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(enqueuePlaybackReportingImport).not.toHaveBeenCalled();
+    });
+
+    it('rejects servers that are not Jellyfin/Emby', async () => {
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([{ ...jellyfinServerRow, type: 'plex' }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting',
+        payload: { serverId: validServerId, timezone: 'America/New_York' },
+      });
+
+      expect(response.statusCode).toBe(400);
+      const body = response.json();
+      expect(body.message).toContain('Jellyfin');
+      expect(body.message).toContain('Emby');
+    });
+
+    it('rejects an invalid IANA timezone', async () => {
+      app = await buildTestApp(ownerUser);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting',
+        payload: { serverId: validServerId, timezone: 'Mars/Olympus' },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it('returns 409 when an import is already in progress', async () => {
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([jellyfinServerRow]);
+      vi.mocked(enqueuePlaybackReportingImport).mockRejectedValueOnce(
+        new Error(`Import already in progress for server ${validServerId} (job job-x)`)
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting',
+        payload: { serverId: validServerId, timezone: 'America/New_York' },
+      });
+
+      expect(response.statusCode).toBe(409);
+      const body = response.json();
+      expect(body.message).toContain('already in progress');
+    });
+  });
+
+  describe('POST /import/playback-reporting/test', () => {
+    const validServerId = randomUUID();
+    const jellyfinServerRow = {
+      id: validServerId,
+      type: 'jellyfin',
+      url: 'http://jf.local:8096',
+      token: 'tok123',
+      name: 'My Jellyfin',
+    };
+
+    it('returns installed info and record counts from the client', async () => {
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([jellyfinServerRow]);
+      mockPlaybackReportingClient.getPlaybackReportingInfo.mockResolvedValueOnce({
+        installed: true,
+        columns: ['DateCreated', 'UserId'],
+        totalRecords: 4200,
+        oldestDate: '2023-01-01 10:00:00',
+        newestDate: '2026-08-01 21:00:00',
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting/test',
+        payload: { serverId: validServerId },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.success).toBe(true);
+      expect(body.installed).toBe(true);
+      expect(body.records).toBe(4200);
+      expect(body.oldestDate).toBe('2023-01-01 10:00:00');
+      expect(body.newestDate).toBe('2026-08-01 21:00:00');
+    });
+
+    it('reports installed: false without calling the plugin when not present', async () => {
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([jellyfinServerRow]);
+      mockPlaybackReportingClient.getPlaybackReportingInfo.mockResolvedValueOnce({
+        installed: false,
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting/test',
+        payload: { serverId: validServerId },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body).toMatchObject({ success: true, installed: false });
+    });
+
+    it('returns success: false on a connection error', async () => {
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([jellyfinServerRow]);
+      mockPlaybackReportingClient.getPlaybackReportingInfo.mockRejectedValueOnce(
+        new Error('Connection refused')
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting/test',
+        payload: { serverId: validServerId },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body).toEqual({
+        success: false,
+        installed: false,
+        message: 'Connection refused',
+      });
+    });
+
+    it('rejects non-owner users', async () => {
+      app = await buildTestApp(viewerUser);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting/test',
+        payload: { serverId: validServerId },
+      });
+
+      expect(response.statusCode).toBe(403);
+    });
+
+    it('rejects servers that are not Jellyfin/Emby', async () => {
+      app = await buildTestApp(ownerUser);
+      mockDbSelectLimit([{ ...jellyfinServerRow, type: 'plex' }]);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/playback-reporting/test',
+        payload: { serverId: validServerId },
+      });
+
+      expect(response.statusCode).toBe(400);
+    });
+  });
+
+  describe('GET /import/playback-reporting/active/:serverId', () => {
+    it('returns active: true with status from the playback-reporting-specific lookup', async () => {
+      app = await buildTestApp(ownerUser);
+      const serverId = randomUUID();
+
+      vi.mocked(getActivePlaybackReportingImportForServer).mockResolvedValueOnce('job-pr-active');
+      vi.mocked(getImportStatus).mockResolvedValueOnce({
+        jobId: 'job-pr-active',
+        state: 'active',
+        progress: { processed: 10, total: 100 },
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/import/playback-reporting/active/${serverId}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.active).toBe(true);
+      expect(body.jobId).toBe('job-pr-active');
+      expect(getActivePlaybackReportingImportForServer).toHaveBeenCalledWith(serverId);
+    });
+
+    it('returns active: false when no import is active', async () => {
+      app = await buildTestApp(ownerUser);
+      const serverId = randomUUID();
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/import/playback-reporting/active/${serverId}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ active: false });
+    });
+  });
+
+  describe('GET /import/playback-reporting/:jobId', () => {
+    it('returns job status when found', async () => {
+      app = await buildTestApp(ownerUser);
+
+      vi.mocked(getImportStatus).mockResolvedValueOnce({
+        jobId: 'job-pr-999',
+        state: 'completed',
+        progress: { processed: 100, total: 100 },
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/import/playback-reporting/job-pr-999',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().jobId).toBe('job-pr-999');
+    });
+
+    it('returns 404 when job not found', async () => {
+      app = await buildTestApp(ownerUser);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/import/playback-reporting/nonexistent-job',
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
+  });
+
+  describe('DELETE /import/playback-reporting/:jobId', () => {
+    it('cancels job successfully for owner', async () => {
+      app = await buildTestApp(ownerUser);
+
+      vi.mocked(cancelImport).mockResolvedValueOnce(true);
+
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/import/playback-reporting/job-pr-789',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ status: 'cancelled', jobId: 'job-pr-789' });
+      expect(cancelImport).toHaveBeenCalledWith('job-pr-789');
+    });
+
+    it('rejects non-owner users', async () => {
+      app = await buildTestApp(viewerUser);
+
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/import/playback-reporting/job-pr-789',
+      });
+
+      expect(response.statusCode).toBe(403);
     });
   });
 });

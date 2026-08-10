@@ -2,7 +2,7 @@
  * Settings Index Screen
  * Main settings page with links to sub-settings, external links, and disconnect option
  */
-import { View, Pressable, Alert, ScrollView, Linking } from 'react-native';
+import { View, Pressable, Alert, ScrollView, Linking, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import {
@@ -19,7 +19,11 @@ import {
   Heart,
 } from 'lucide-react-native';
 import * as Application from 'expo-application';
+import { useQuery } from '@tanstack/react-query';
 import { Text } from '@/components/ui/text';
+import { UserAvatar } from '@/components/ui/user-avatar';
+import { api } from '@/lib/api';
+import { queryKeys } from '@/lib/queryKeys';
 import { useAuthStateStore } from '@/lib/authStateStore';
 import { colors } from '@/lib/theme';
 import {
@@ -80,6 +84,35 @@ function SettingsRow({
   );
 }
 
+function ProfileRow() {
+  const { data: user, isLoading } = useQuery({
+    queryKey: queryKeys.me(),
+    queryFn: () => api.me(),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  if (isLoading) {
+    return (
+      <View className="items-center px-4 py-3.5">
+        <ActivityIndicator size="small" color={colors.text.secondary.dark} />
+      </View>
+    );
+  }
+  if (!user) return null;
+
+  return (
+    <View className="flex-row items-center gap-4 px-4 py-3.5">
+      <UserAvatar thumbUrl={user.thumbUrl} username={user.username} size={40} />
+      <View className="flex-1">
+        <Text className="text-[15px] font-semibold" numberOfLines={1}>
+          {user.friendlyName}
+        </Text>
+        <Text className="text-muted-foreground text-xs capitalize">{user.role}</Text>
+      </View>
+    </View>
+  );
+}
+
 export default function SettingsScreen() {
   const { t } = useTranslation(['mobile', 'common']);
   const router = useRouter();
@@ -132,7 +165,7 @@ export default function SettingsScreen() {
 
   return (
     <SafeAreaView
-      style={{ flex: 1, backgroundColor: '#09090B' }}
+      style={{ flex: 1, backgroundColor: colors.background.dark }}
       edges={['left', 'right', 'bottom']}
     >
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ flexGrow: 1, padding: 16 }}>
@@ -203,6 +236,7 @@ export default function SettingsScreen() {
 
         {/* Account */}
         <SettingsSection title={t('mobile:settings.account')}>
+          <ProfileRow />
           <SettingsRow
             icon={<LogOut size={20} color={colors.icon.danger} />}
             label={t('mobile:settings.disconnect')}

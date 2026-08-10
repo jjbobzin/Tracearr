@@ -6,7 +6,11 @@
 
 import type { FastifyPluginAsync } from 'fastify';
 import { sql } from 'drizzle-orm';
-import { libraryStatusQuerySchema, type LibraryStatusQueryInput } from '@tracearr/shared';
+import {
+  libraryStatusQuerySchema,
+  LEGACY_VERSION_SENTINEL,
+  type LibraryStatusQueryInput,
+} from '@tracearr/shared';
 import { db } from '../../db/client.js';
 import { isMaintenanceJobRunning } from '../../jobs/maintenanceQueue.js';
 import { getLibrarySyncStatus } from '../../jobs/librarySyncQueue.js';
@@ -35,6 +39,9 @@ interface LibraryStatusResponse {
   earliestSnapshotDate: string | null;
   /** Days of history that could be backfilled */
   backfillDays: number | null;
+  /** True while any 'legacy:1' version sentinel remains for the server, i.e.
+   * items not yet re-scanned into real version rows. Cleared by a full sync. */
+  versionsBackfillPending: boolean;
 }
 
 interface LibraryStatusRow {
@@ -65,7 +72,7 @@ async function fetchLibraryStatusRows(serverIds: string[]): Promise<Map<string, 
         MIN(li.created_at) FILTER (WHERE ${validLibraryItemCondition('li')})::date AS earliest_item,
         COUNT(*)::int AS item_count
       FROM library_items li
-      WHERE 1=1 ${itemFilter}
+      WHERE 1=1 AND li.removed_at IS NULL ${itemFilter}
       GROUP BY li.server_id
     ),
     snapshot_agg AS (
@@ -106,6 +113,25 @@ async function fetchLibraryStatusRows(serverIds: string[]): Promise<Map<string, 
       },
     ])
   );
+}
+
+/** Servers that still carry 'legacy:1' sentinels (backed by the partial
+ * sentinel index, so this stays cheap and shrinks to empty as backfill
+ * completes). Derived from data rather than a stored flag: Redis sync state
+ * evaporates on flush and a stored flag drifts when a scan dies partway. */
+async function fetchVersionsBackfillPending(
+  serverIds: string[] | null | undefined
+): Promise<Set<string>> {
+  const filter = buildMultiServerFragment(serverIds ?? undefined, 'li.server_id');
+  const result = await db.execute(sql`
+    SELECT DISTINCT li.server_id
+    FROM library_item_versions v
+    JOIN library_items li ON li.id = v.library_item_id
+    WHERE v.server_version_key = ${LEGACY_VERSION_SENTINEL}
+      AND v.removed_at IS NULL
+      ${filter}
+  `);
+  return new Set((result.rows as Array<{ server_id: string }>).map((r) => r.server_id));
 }
 
 function deriveLibraryStatus(
@@ -181,9 +207,10 @@ export const libraryStatusRoute: FastifyPluginAsync = async (app) => {
 
       if (serverIds) {
         const targetIds = resolvedIds ?? [];
-        const [rowsById, syncStatuses] = await Promise.all([
+        const [rowsById, syncStatuses, sentinelServers] = await Promise.all([
           fetchLibraryStatusRows(targetIds),
           Promise.all(targetIds.map((id) => getLibrarySyncStatus(id))),
+          fetchVersionsBackfillPending(targetIds),
         ]);
 
         const response: Record<string, LibraryStatusResponse> = {};
@@ -193,6 +220,7 @@ export const libraryStatusRoute: FastifyPluginAsync = async (app) => {
             isSyncRunning: syncStatuses[i]?.isActive ?? false,
             isBackfillRunning: backfillStatus.isRunning,
             backfillState: backfillStatus.state,
+            versionsBackfillPending: sentinelServers.has(id),
           };
         });
 
@@ -200,9 +228,10 @@ export const libraryStatusRoute: FastifyPluginAsync = async (app) => {
       }
 
       if (serverId && resolvedIds) {
-        const [rowsById, syncStatus] = await Promise.all([
+        const [rowsById, syncStatus, sentinelServers] = await Promise.all([
           fetchLibraryStatusRows(resolvedIds),
           getLibrarySyncStatus(serverId),
+          fetchVersionsBackfillPending(resolvedIds),
         ]);
 
         return reply.send({
@@ -210,6 +239,7 @@ export const libraryStatusRoute: FastifyPluginAsync = async (app) => {
           isSyncRunning: syncStatus?.isActive ?? false,
           isBackfillRunning: backfillStatus.isRunning,
           backfillState: backfillStatus.state,
+          versionsBackfillPending: sentinelServers.has(serverId),
         } satisfies LibraryStatusResponse);
       }
 
@@ -219,10 +249,10 @@ export const libraryStatusRoute: FastifyPluginAsync = async (app) => {
       const result = await db.execute(sql`
         SELECT
           (SELECT MIN(li.created_at)::date FROM library_items li
-           WHERE ${validLibraryItemCondition('li')} ${itemFilter}) AS earliest_item,
+           WHERE ${validLibraryItemCondition('li')} AND li.removed_at IS NULL ${itemFilter}) AS earliest_item,
           (SELECT MIN(lsd.day)::date FROM library_stats_daily lsd
            WHERE 1=1 ${snapshotFilter}) AS earliest_snapshot,
-          (SELECT COUNT(*)::int FROM library_items li WHERE 1=1 ${itemFilter}) AS item_count,
+          (SELECT COUNT(*)::int FROM library_items li WHERE 1=1 AND li.removed_at IS NULL ${itemFilter}) AS item_count,
           (SELECT COUNT(DISTINCT lsd.day)::int FROM library_stats_daily lsd
            WHERE 1=1 ${snapshotFilter}) AS snapshot_count
       `);
@@ -244,6 +274,7 @@ export const libraryStatusRoute: FastifyPluginAsync = async (app) => {
         isSyncRunning: false,
         isBackfillRunning: backfillStatus.isRunning,
         backfillState: backfillStatus.state,
+        versionsBackfillPending: (await fetchVersionsBackfillPending(resolvedIds)).size > 0,
       } satisfies LibraryStatusResponse);
     }
   );

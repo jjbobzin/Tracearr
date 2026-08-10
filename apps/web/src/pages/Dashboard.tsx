@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Play, Clock, AlertTriangle, Tv, MapPin, Calendar, Users, Activity } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
@@ -11,14 +11,16 @@ import { ServerBandwidthChart } from '@/components/charts/BandwidthChart';
 import { ErrorState } from '@/components/library/ErrorState';
 import { NowPlayingCardSkeleton } from '@/components/ui/skeleton';
 import { useDashboardStats, useActiveSessions } from '@/hooks/queries';
-import { useServerStatistics, useServerBandwidth } from '@/hooks/queries/useServers';
+import { useServerLiveStats, useMultiServerLiveStats } from '@/hooks/queries/useServers';
 import { useServer } from '@/hooks/useServer';
 import { useServerColorMap } from '@/hooks/useServerColorMap';
-import type { ActiveSession } from '@tracearr/shared';
+import { useSocket } from '@/hooks/useSocket';
+import { pickServerColor, type ActiveSession } from '@tracearr/shared';
 
 export function Dashboard() {
   const { t } = useTranslation(['pages', 'common']);
   const { selectedServerIds, selectedServers, isMultiServer, selectedServerId } = useServer();
+  const { isConnected } = useSocket();
   const {
     data: stats,
     isLoading: statsLoading,
@@ -31,7 +33,7 @@ export function Dashboard() {
     isError: sessionsError,
     error: sessionsErrorObj,
     refetch: refetchSessions,
-  } = useActiveSessions(selectedServerIds);
+  } = useActiveSessions(selectedServerIds, isConnected);
 
   // Session detail sheet state
   const [selectedSession, setSelectedSession] = useState<ActiveSession | null>(null);
@@ -48,22 +50,88 @@ export function Dashboard() {
     );
   }, [sessions, selectedServers]);
 
-  // Only show server resource stats for a single Plex server
-  const showServerResources = !isMultiServer && selectedServers[0]?.type === 'plex';
+  // Single-server view: Plex always shows the section; Jellyfin/Emby show it
+  // once the SSE plugin's server.stats samples start arriving
+  const singleServer = !isMultiServer ? selectedServers[0] : undefined;
+  const singleIsPlex = singleServer?.type === 'plex';
 
-  // Poll server statistics only when viewing a single Plex server
-  const {
-    data: serverStats,
-    isLoading: statsChartLoading,
-    averages,
-  } = useServerStatistics(selectedServerId ?? undefined, showServerResources);
+  // Multi-server view fans out to every selected server and overlays one
+  // line per server that reports data. Servers without a stats source yet
+  // (Jellyfin/Emby until the SSE plugin samples them) return empty series
+  // and contribute no line.
+  const statsServerIds = useMemo(
+    () => (isMultiServer ? selectedServers.map((s) => s.id) : []),
+    [isMultiServer, selectedServers]
+  );
 
-  const [bandwidthPollInterval, setBandwidthPollInterval] = useState(6);
   const {
-    data: bandwidthStats,
-    isLoading: bandwidthChartLoading,
-    averages: bandwidthAverages,
-  } = useServerBandwidth(selectedServerId ?? undefined, showServerResources, bandwidthPollInterval);
+    statistics: serverStats,
+    statisticsAverages: averages,
+    bandwidth: bandwidthStats,
+    bandwidthAverages,
+    clockSkewMs: singleClockSkewMs,
+    isLoading: liveStatsLoading,
+  } = useServerLiveStats(selectedServerId ?? undefined, !!singleServer);
+
+  const showServerResources = !!singleServer && (singleIsPlex || (serverStats?.length ?? 0) > 0);
+
+  // Plex measures bandwidth; Jellyfin/Emby have no source for it
+  const showBandwidthChart =
+    singleIsPlex || (isMultiServer && selectedServers.some((s) => s.type === 'plex'));
+  const singleProcessLabel = singleServer
+    ? { plex: 'Plex Media Server', jellyfin: 'Jellyfin', emby: 'Emby' }[singleServer.type]
+    : undefined;
+
+  const {
+    series: multiLiveStats,
+    clockSkewMs: multiClockSkewMs,
+    isLoading: multiStatsLoading,
+  } = useMultiServerLiveStats(statsServerIds, statsServerIds.length > 0);
+
+  const clockSkewMs = showServerResources ? singleClockSkewMs : multiClockSkewMs;
+
+  const hasAnyMultiData = multiLiveStats.some(
+    (s) => s.statistics.length > 0 || s.bandwidth.length > 0
+  );
+  const showMultiServerResources =
+    isMultiServer && (hasAnyMultiData || selectedServers.some((s) => s.type === 'plex'));
+
+  const seriesMeta = useCallback(
+    (serverId: string) => {
+      const server = selectedServers.find((p) => p.id === serverId);
+      return {
+        serverId,
+        serverName: server?.name ?? serverId,
+        color:
+          serverColorMap.get(serverId) ??
+          pickServerColor(
+            server?.type ?? 'plex',
+            selectedServers.map((p) => p.color)
+          ),
+      };
+    },
+    [selectedServers, serverColorMap]
+  );
+
+  const resourceMultiSeries = useMemo(
+    () =>
+      showMultiServerResources
+        ? multiLiveStats
+            .filter((s) => s.statistics.length > 0)
+            .map((s) => ({ ...seriesMeta(s.serverId), data: s.statistics }))
+        : undefined,
+    [showMultiServerResources, multiLiveStats, seriesMeta]
+  );
+
+  const bandwidthMultiSeries = useMemo(
+    () =>
+      showMultiServerResources
+        ? multiLiveStats
+            .filter((s) => s.bandwidth.length > 0)
+            .map((s) => ({ ...seriesMeta(s.serverId), data: s.bandwidth }))
+        : undefined,
+    [showMultiServerResources, multiLiveStats, seriesMeta]
+  );
 
   const activeCount = sessions?.length ?? 0;
   const hasActiveStreams = activeCount > 0;
@@ -192,26 +260,35 @@ export function Dashboard() {
         </section>
       )}
 
-      {/* Server Resource Stats (single Plex server only) */}
-      {showServerResources && (
+      {/* Server Resource Stats (single server, or per-server overlay lines) */}
+      {(showServerResources || showMultiServerResources) && (
         <section>
           <div className="mb-4 flex items-center gap-2">
             <Activity className="text-primary h-5 w-5" />
             <h2 className="text-lg font-semibold">{t('dashboard.serverResources')}</h2>
           </div>
-          <div className="grid gap-4 md:grid-cols-3">
+          <div className={`grid gap-4 ${showBandwidthChart ? 'md:grid-cols-3' : 'md:grid-cols-2'}`}>
             <ServerResourceCharts
-              data={serverStats?.data}
-              isLoading={statsChartLoading}
-              averages={averages}
+              data={showServerResources ? serverStats : undefined}
+              isLoading={
+                showServerResources ? liveStatsLoading : multiStatsLoading && !hasAnyMultiData
+              }
+              averages={showServerResources ? averages : undefined}
+              multiSeries={showMultiServerResources ? resourceMultiSeries : undefined}
+              processLabel={singleProcessLabel}
+              clockSkewMs={clockSkewMs}
             />
-            <ServerBandwidthChart
-              data={bandwidthStats?.data}
-              isLoading={bandwidthChartLoading}
-              averages={bandwidthAverages}
-              pollInterval={bandwidthPollInterval}
-              onPollIntervalChange={setBandwidthPollInterval}
-            />
+            {showBandwidthChart && (
+              <ServerBandwidthChart
+                data={showServerResources ? bandwidthStats : undefined}
+                isLoading={
+                  showServerResources ? liveStatsLoading : multiStatsLoading && !hasAnyMultiData
+                }
+                averages={showServerResources ? bandwidthAverages : undefined}
+                multiSeries={showMultiServerResources ? bandwidthMultiSeries : undefined}
+                clockSkewMs={clockSkewMs}
+              />
+            )}
           </div>
         </section>
       )}

@@ -463,6 +463,18 @@ describe('sessionMapper', () => {
     });
 
     describe('core field mapping', () => {
+      it('passes serverVersionKey through to the processed session', () => {
+        const session = createBaseMediaSession({ serverVersionKey: '98869' });
+
+        expect(mapMediaSession(session, 'plex').serverVersionKey).toBe('98869');
+      });
+
+      it('maps a missing serverVersionKey to null', () => {
+        const session = createBaseMediaSession();
+
+        expect(mapMediaSession(session, 'plex').serverVersionKey).toBeNull();
+      });
+
       it('should map all core fields correctly', () => {
         const session = createBaseMediaSession({
           sessionKey: 'unique-session-key',

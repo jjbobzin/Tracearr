@@ -76,7 +76,8 @@ describe('JellyfinEmbyEventSource detection', () => {
     expect(states).toContain('connected');
   });
 
-  it('transitions to unsupported on a 404 error', async () => {
+  it('treats a single 404 as a normal reconnect, not proof the plugin is missing', async () => {
+    vi.useFakeTimers();
     const states: SSEConnectionState[] = [];
     const src = new JellyfinEmbyEventSource({
       serverId: 'srv-1',
@@ -91,9 +92,124 @@ describe('JellyfinEmbyEventSource detection', () => {
     // Real eventsource v4 ErrorEvent shape: .code holds the HTTP status, not .status
     stub._triggerError({ message: 'Non-200 status code (404)', code: 404 });
 
+    expect(states).toContain('reconnecting');
+    expect(states).not.toContain('unsupported');
+    vi.useRealTimers();
+    src.disconnect();
+  });
+
+  it('transitions to unsupported only after three consecutive 404s', async () => {
+    vi.useFakeTimers();
+    const states: SSEConnectionState[] = [];
+    const { EventSource } = await import('eventsource');
+    const stubs: ReturnType<typeof createEventSourceStub>[] = [];
+    vi.mocked(EventSource).mockImplementation(function () {
+      const s = createEventSourceStub();
+      stubs.push(s);
+      return s as unknown as InstanceType<typeof EventSource>;
+    });
+
+    const src = new JellyfinEmbyEventSource({
+      serverId: 'srv-1',
+      serverName: 'My JF',
+      url: 'http://jf.local:8096',
+      serverType: 'jellyfin',
+      token: 'abc',
+    });
+
+    src.on('connection:state', (s: SSEConnectionState) => states.push(s));
+    await src.connect();
+
+    stubs[0]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
+    expect(states).not.toContain('unsupported');
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    stubs[1]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
+    expect(states).not.toContain('unsupported');
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    stubs[2]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
     expect(states).toContain('unsupported');
-    expect(states).not.toContain('fallback');
-    expect(states).not.toContain('reconnecting');
+
+    vi.useRealTimers();
+    src.disconnect();
+  });
+
+  it('resets the 404 streak when a different error interleaves', async () => {
+    vi.useFakeTimers();
+    const states: SSEConnectionState[] = [];
+    const { EventSource } = await import('eventsource');
+    const stubs: ReturnType<typeof createEventSourceStub>[] = [];
+    vi.mocked(EventSource).mockImplementation(function () {
+      const s = createEventSourceStub();
+      stubs.push(s);
+      return s as unknown as InstanceType<typeof EventSource>;
+    });
+
+    const src = new JellyfinEmbyEventSource({
+      serverId: 'srv-1',
+      serverName: 'My JF',
+      url: 'http://jf.local:8096',
+      serverType: 'jellyfin',
+      token: 'abc',
+    });
+
+    src.on('connection:state', (s: SSEConnectionState) => states.push(s));
+    await src.connect();
+
+    // 404, 404, connection refused, 404, 404: never three 404s in a row
+    stubs[0]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
+    await vi.advanceTimersByTimeAsync(5_000);
+    stubs[1]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    stubs[2]!._triggerError({ message: 'TypeError: fetch failed' });
+    await vi.advanceTimersByTimeAsync(15_000);
+    stubs[3]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
+    await vi.advanceTimersByTimeAsync(20_000);
+    stubs[4]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
+
+    expect(states).not.toContain('unsupported');
+
+    vi.useRealTimers();
+    src.disconnect();
+  });
+
+  it('retries from unsupported when nudged, and recovers when the endpoint is back', async () => {
+    vi.useFakeTimers();
+    const states: SSEConnectionState[] = [];
+    const { EventSource } = await import('eventsource');
+    const stubs: ReturnType<typeof createEventSourceStub>[] = [];
+    vi.mocked(EventSource).mockImplementation(function () {
+      const s = createEventSourceStub();
+      stubs.push(s);
+      return s as unknown as InstanceType<typeof EventSource>;
+    });
+
+    const src = new JellyfinEmbyEventSource({
+      serverId: 'srv-1',
+      serverName: 'My JF',
+      url: 'http://jf.local:8096',
+      serverType: 'jellyfin',
+      token: 'abc',
+    });
+
+    src.on('connection:state', (s: SSEConnectionState) => states.push(s));
+    await src.connect();
+
+    for (let i = 0; i < 3; i++) {
+      stubs[stubs.length - 1]!._triggerError({ message: 'Non-200 status code (404)', code: 404 });
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    expect(src.getState()).toBe('unsupported');
+
+    src.retryFromFallback();
+    await vi.advanceTimersByTimeAsync(0);
+    stubs[stubs.length - 1]!._triggerOpen();
+
+    expect(src.getState()).toBe('connected');
+
+    vi.useRealTimers();
+    src.disconnect();
   });
 
   it('schedules reconnect on non-404 error', async () => {
@@ -188,6 +304,63 @@ describe('JellyfinEmbyEventSource detection', () => {
 
     expect(events).toHaveLength(1);
     expect((events[0] as { sessionId: string }).sessionId).toBe('abc123');
+  });
+
+  it('emits library:event for library.item.added and library.item.removed', async () => {
+    const events: unknown[] = [];
+    const src = new JellyfinEmbyEventSource({
+      serverId: 'srv-1',
+      serverName: 'My JF',
+      url: 'http://jf.local:8096',
+      serverType: 'jellyfin',
+      token: 'abc',
+    });
+
+    src.on('library:event', (e: unknown) => events.push(e));
+    await src.connect();
+    stub._triggerOpen();
+
+    stub._emit('library.item.added', JSON.stringify({ itemId: 'item-added-1' }));
+    stub._emit('library.item.removed', JSON.stringify({ itemId: 'item-removed-1' }));
+
+    expect(events).toEqual([
+      { type: 'added', itemId: 'item-added-1' },
+      { type: 'removed', itemId: 'item-removed-1' },
+    ]);
+  });
+
+  it('never emits library:event when the plugin does not send library events', async () => {
+    const events: unknown[] = [];
+    const src = new JellyfinEmbyEventSource({
+      serverId: 'srv-1',
+      serverName: 'My JF',
+      url: 'http://jf.local:8096',
+      serverType: 'jellyfin',
+      token: 'abc',
+    });
+
+    src.on('library:event', (e: unknown) => events.push(e));
+    await src.connect();
+    stub._triggerOpen();
+    // Only session events, as the plugin sends today
+    stub._emit('playing', JSON.stringify({ sessionId: 's1', state: 'playing' }));
+
+    expect(events).toHaveLength(0);
+  });
+
+  it('ignores a malformed library event payload without throwing', async () => {
+    const src = new JellyfinEmbyEventSource({
+      serverId: 'srv-1',
+      serverName: 'My JF',
+      url: 'http://jf.local:8096',
+      serverType: 'jellyfin',
+      token: 'abc',
+    });
+
+    await src.connect();
+    stub._triggerOpen();
+
+    expect(() => stub._emit('library.item.added', '{not json')).not.toThrow();
   });
 
   describe('auth header injection', () => {

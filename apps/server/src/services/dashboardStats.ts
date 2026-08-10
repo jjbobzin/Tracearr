@@ -173,6 +173,7 @@ async function computeDashboardStats(
           FROM violations v
           INNER JOIN server_users su ON su.id = v.server_user_id
           WHERE v.created_at >= ${last24h}
+          AND v.dismissed_at IS NULL
           ${violationServerFilter}
         `
         )

@@ -8,6 +8,7 @@
  */
 
 import { useQuery } from '@tanstack/react-query';
+import { serverScopeFromIds, serverScopeKey } from '@tracearr/shared';
 import { api, getBrowserTimezone } from '@/lib/api';
 import type { LibraryStatusResponse } from '@/lib/api';
 import type {
@@ -36,7 +37,7 @@ const LIBRARY_STALE_TIME = 1000 * 60 * 5;
  */
 export function useLibraryStats(serverIds: string[], libraryId?: string | null) {
   const timezone = getBrowserTimezone();
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<LibraryStatsResponse>({
     queryKey: ['library', 'stats', sortedIds, libraryId, timezone],
     queryFn: () => api.library.stats(serverIds, libraryId ?? undefined),
@@ -52,13 +53,16 @@ export function useLibraryStats(serverIds: string[], libraryId?: string | null) 
 export function useLibraryGrowth(
   serverIds: string[],
   libraryId?: string | null,
-  period: string = '30d'
+  period: string = '30d',
+  startDate?: string,
+  endDate?: string
 ) {
   const timezone = getBrowserTimezone();
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<LibraryGrowthResponse>({
-    queryKey: ['library', 'growth', sortedIds, libraryId, period, timezone],
-    queryFn: () => api.library.growth(serverIds, libraryId ?? undefined, period),
+    queryKey: ['library', 'growth', sortedIds, libraryId, period, startDate, endDate, timezone],
+    queryFn: () =>
+      api.library.growth(serverIds, libraryId ?? undefined, period, startDate, endDate),
     staleTime: LIBRARY_STALE_TIME,
     enabled: serverIds.length > 0,
   });
@@ -100,6 +104,26 @@ export function useLibraryStorage(
 }
 
 /**
+ * Fetch storage analytics over the whole server selection in one request, so
+ * the server-side mirror dedup spans servers. Used for the combined KPI;
+ * per-server charts keep the fan-out.
+ */
+export function useLibraryStorageScoped(
+  serverIds: string[],
+  period: string = '30d',
+  enabled: boolean = true
+) {
+  const timezone = getBrowserTimezone();
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
+  return useQuery<LibraryStorageResponse>({
+    queryKey: ['library', 'storage', 'scoped', sortedIds, period, timezone],
+    queryFn: () => api.library.storageScoped(serverIds, period),
+    staleTime: LIBRARY_STALE_TIME,
+    enabled: enabled && serverIds.length > 0,
+  });
+}
+
+/**
  * Fetch cross-server duplicate detection results
  * @param enabled - Set to false to skip fetching (e.g., when only one server is selected)
  */
@@ -109,7 +133,7 @@ export function useLibraryDuplicates(
   pageSize: number = 20,
   enabled: boolean = true
 ) {
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<DuplicatesResponse>({
     queryKey: ['library', 'duplicates', sortedIds, page, pageSize],
     queryFn: () => api.library.duplicates(serverIds, page, pageSize),
@@ -132,7 +156,7 @@ export function useLibraryStale(
   sortBy: 'size' | 'title' | 'days_stale' | 'added_at' = 'size',
   sortOrder: 'asc' | 'desc' = 'desc'
 ) {
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<StaleResponse>({
     queryKey: [
       'library',
@@ -175,7 +199,7 @@ export function useLibraryWatch(
   page: number = 1,
   pageSize: number = 20
 ) {
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<WatchResponse>({
     queryKey: ['library', 'watch', sortedIds, libraryId, page, pageSize],
     queryFn: () => api.library.watch(serverIds, libraryId ?? undefined, page, pageSize),
@@ -231,7 +255,7 @@ export function useLibraryPatterns(
   periodWeeks: number = 12
 ) {
   const timezone = getBrowserTimezone();
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<PatternsResponse>({
     queryKey: ['library', 'patterns', sortedIds, libraryId, periodWeeks, timezone],
     queryFn: () => api.library.patterns(serverIds, libraryId ?? undefined, periodWeeks),
@@ -253,7 +277,7 @@ export function useLibraryRoi(
   sortOrder: 'asc' | 'desc' = 'asc'
 ) {
   const timezone = getBrowserTimezone();
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<RoiResponse>({
     queryKey: [
       'library',
@@ -293,7 +317,7 @@ export function useTopMovies(
   page: number = 1,
   pageSize: number = 20
 ) {
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<TopMoviesResponse>({
     queryKey: ['library', 'top-movies', sortedIds, period, sortBy, sortOrder, page, pageSize],
     queryFn: () => api.library.topMovies(serverIds, period, sortBy, sortOrder, page, pageSize),
@@ -313,7 +337,7 @@ export function useTopShows(
   page: number = 1,
   pageSize: number = 20
 ) {
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   return useQuery<TopShowsResponse>({
     queryKey: ['library', 'top-shows', sortedIds, period, sortBy, sortOrder, page, pageSize],
     queryFn: () => api.library.topShows(serverIds, period, sortBy, sortOrder, page, pageSize),
@@ -355,7 +379,7 @@ export interface LibraryStatusFanOut {
 
 /** Fetch sync/backfill status for every selected server in one request. */
 export function useLibraryStatus(serverIds: string[]): LibraryStatusFanOut {
-  const sortedIds = [...serverIds].sort().join(',');
+  const sortedIds = serverScopeKey(serverScopeFromIds(serverIds));
   const query = useQuery<Record<string, LibraryStatusResponse>>({
     queryKey: ['library', 'status', sortedIds],
     queryFn: () => api.library.status(serverIds),

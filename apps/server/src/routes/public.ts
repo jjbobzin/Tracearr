@@ -298,8 +298,12 @@ export const publicRoutes: FastifyPluginAsync = async (app) => {
       .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id));
 
     const violationFilter = serverId
-      ? and(eq(serverUsers.serverId, serverId), gte(violations.createdAt, sevenDaysAgo))
-      : gte(violations.createdAt, sevenDaysAgo);
+      ? and(
+          eq(serverUsers.serverId, serverId),
+          gte(violations.createdAt, sevenDaysAgo),
+          isNull(violations.dismissedAt)
+        )
+      : and(gte(violations.createdAt, sevenDaysAgo), isNull(violations.dismissedAt));
 
     const [violationCountResult] = await violationQuery.where(violationFilter);
 
@@ -576,8 +580,9 @@ export const publicRoutes: FastifyPluginAsync = async (app) => {
         acknowledged ? isNotNull(violations.acknowledgedAt) : isNull(violations.acknowledgedAt)
       );
     }
+    conditions.push(isNull(violations.dismissedAt));
 
-    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+    const whereClause = and(...conditions);
 
     // Get total count with join
     const [countResult] = await db

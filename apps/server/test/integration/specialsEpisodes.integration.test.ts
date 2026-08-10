@@ -118,7 +118,6 @@ function buildCreationInput(
       thumbUrl: serverUser.thumbUrl,
       identityName: null,
       trustScore: 100,
-      sessionCount: 0,
       lastActivityAt: null,
       createdAt: new Date(),
       identityServerUserIds: [serverUser.id],

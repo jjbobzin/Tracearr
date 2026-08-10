@@ -32,7 +32,6 @@ const CONDITION_FIELD_LABELS: Record<ConditionField, string> = {
   country: 'Country',
   ip_in_range: 'IP Range',
   server_id: 'Server',
-  library_id: 'Library',
   media_type: 'Media Type',
 };
 

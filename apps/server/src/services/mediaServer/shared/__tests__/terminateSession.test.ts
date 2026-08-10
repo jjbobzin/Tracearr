@@ -53,6 +53,17 @@ describe('BaseMediaServerClient.terminateSession control-capability guard', () =
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  it('stops an Emby session that only reports SupportsRemoteControl (no SupportsMediaControl key)', async () => {
+    withSessions([{ Id: 'sess1', SupportsRemoteControl: true }]);
+
+    await expect(makeClient().terminateSession('sess1')).resolves.toBe(true);
+
+    const stopped = mockFetch.mock.calls.some(([url]) =>
+      String(url).includes('/Sessions/sess1/Playing/Stop')
+    );
+    expect(stopped).toBe(true);
+  });
+
   it('throws "not found" when the session is no longer active', async () => {
     withSessions([{ Id: 'someone-else', SupportsMediaControl: true }]);
 

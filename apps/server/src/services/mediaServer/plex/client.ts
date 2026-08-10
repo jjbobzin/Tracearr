@@ -33,7 +33,7 @@ import {
   getTranscodingSessionRatingKeys,
   type PlexServerResource,
   type PlexStatisticsDataPoint,
-  type PlexBandwidthDataPoint,
+  type PlexBandwidthStats,
   type PlexOriginalMedia,
 } from './parser.js';
 
@@ -287,16 +287,71 @@ export class PlexClient implements IMediaServerClient, IMediaServerClientWithHis
   }
 
   /**
+   * Get all seasons in a TV library section (type=3), with pagination.
+   * Separate from getLibraryItems/getLibraryLeaves since Plex has no combined
+   * shows+seasons+episodes endpoint. Paginates via headers - see
+   * fetchItemsSortedByUpdatedAt's doc for why type-filtered requests need that.
+   */
+  async getLibrarySeasons(
+    libraryId: string,
+    options?: { offset?: number; limit?: number }
+  ): Promise<{ items: MediaLibraryItem[]; totalCount: number; rawCount?: number }> {
+    const offset = options?.offset ?? 0;
+    const limit = options?.limit ?? 100;
+
+    const params = new URLSearchParams({ type: '3', includeGuids: '1' });
+
+    const data = await fetchJson<unknown>(
+      `${this.baseUrl}/library/sections/${libraryId}/all?${params}`,
+      {
+        headers: {
+          ...this.buildHeaders(),
+          'X-Plex-Container-Start': String(offset),
+          'X-Plex-Container-Size': String(limit),
+        },
+        service: 'plex',
+        timeout: 30000,
+      }
+    );
+
+    const container = data as { MediaContainer?: { totalSize?: number } };
+    const totalCount = container?.MediaContainer?.totalSize ?? 0;
+    const items = parseLibraryItemsResponse(data);
+
+    return { items, totalCount };
+  }
+
+  /** Get seasons updated since the given date. */
+  async getLibrarySeasonsSince(
+    libraryId: string,
+    since: Date,
+    _options?: { offset?: number; limit?: number }
+  ): Promise<{ items: MediaLibraryItem[]; totalCount: number }> {
+    const sinceUnix = Math.floor(since.getTime() / 1000);
+    return this.fetchItemsSortedByUpdatedAt(`/library/sections/${libraryId}/all`, sinceUnix, {
+      extraParams: { type: '3' },
+      paginateViaHeaders: true,
+    });
+  }
+
+  /**
    * Fetch items sorted by updatedAt:desc, collecting items until one falls
    * below sinceUnix. Replaces the broken addedAt>>= filter which is silently
    * ignored on Plex 1.43.x+.
+   *
+   * @param extraParams - Extra query params merged in (e.g. type=3 for seasons)
+   * @param paginateViaHeaders - Plex ignores X-Plex-Container-Start/Size as query
+   *   params on type-filtered requests (always returns the full result set) but
+   *   honors them as HTTP headers; set true for any type=N request.
    */
   private async fetchItemsSortedByUpdatedAt(
     path: string,
-    sinceUnix: number
+    sinceUnix: number,
+    options?: { extraParams?: Record<string, string>; paginateViaHeaders?: boolean }
   ): Promise<{ items: MediaLibraryItem[]; totalCount: number }> {
     const PAGE_SIZE = 100;
     const MAX_PAGES = 500;
+    const paginateViaHeaders = options?.paginateViaHeaders ?? false;
     const allItems: MediaLibraryItem[] = [];
     let offset = 0;
     let pageCount = 0;
@@ -308,15 +363,27 @@ export class PlexClient implements IMediaServerClient, IMediaServerClientWithHis
         );
         break;
       }
-      const params = new URLSearchParams({
+      const paramsObj: Record<string, string> = {
         includeGuids: '1',
-        'X-Plex-Container-Start': String(offset),
-        'X-Plex-Container-Size': String(PAGE_SIZE),
         sort: 'updatedAt:desc',
-      });
+        ...options?.extraParams,
+      };
+      if (!paginateViaHeaders) {
+        paramsObj['X-Plex-Container-Start'] = String(offset);
+        paramsObj['X-Plex-Container-Size'] = String(PAGE_SIZE);
+      }
+      const params = new URLSearchParams(paramsObj);
 
       const data = await fetchJson<unknown>(`${this.baseUrl}${path}?${params}`, {
-        headers: this.buildHeaders(),
+        headers: {
+          ...this.buildHeaders(),
+          ...(paginateViaHeaders
+            ? {
+                'X-Plex-Container-Start': String(offset),
+                'X-Plex-Container-Size': String(PAGE_SIZE),
+              }
+            : {}),
+        },
         service: 'plex',
         timeout: 30000,
       });
@@ -444,12 +511,12 @@ export class PlexClient implements IMediaServerClient, IMediaServerClientWithHis
    * Get server bandwidth statistics (Local/Remote traffic)
    *
    * Uses the undocumented /statistics/bandwidth endpoint.
-   * Returns per-second data points with local/remote byte totals.
+   * Returns aggregated per-second points plus per-account/device samples.
    *
    * @param timespan - Plex API timespan parameter (default: 6)
-   * @returns Array of bandwidth data points, sorted newest first
+   * @returns Bandwidth stats, series sorted newest first
    */
-  async getServerBandwidth(timespan: number = 6): Promise<PlexBandwidthDataPoint[]> {
+  async getServerBandwidth(timespan: number = 6): Promise<PlexBandwidthStats> {
     const url = `${this.baseUrl}/statistics/bandwidth?timespan=${timespan}`;
 
     try {
@@ -462,7 +529,7 @@ export class PlexClient implements IMediaServerClient, IMediaServerClientWithHis
       return parseStatisticsBandwidthResponse(data);
     } catch {
       // Requires Plex Pass — silently return empty when unavailable
-      return [];
+      return { points: [], samples: [], accounts: [], devices: [] };
     }
   }
 

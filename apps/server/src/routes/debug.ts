@@ -30,7 +30,7 @@ import {
   getBuildDate,
 } from '../utils/buildInfo.js';
 import { getInactivityCheckQueueStats } from '../jobs/inactivityCheckQueue.js';
-import { invalidateRulesCache } from '../jobs/poller/database.js';
+import { invalidateRulesCache, invalidateServersCache } from '../jobs/poller/database.js';
 import { getBackupQueueStats } from '../jobs/backupQueue.js';
 import { resetSettingsCache } from '../services/settings.js';
 import { getAllServices } from '../services/serviceTracker.js';
@@ -371,7 +371,7 @@ export const debugRoutes: FastifyPluginAsync = async (app) => {
         'termination_logs', 'plex_accounts', 'settings',
         'notification_preferences', 'notification_channel_routing',
         'mobile_sessions', 'mobile_tokens',
-        'library_items', 'library_snapshots'
+        'library_items', 'library_item_versions', 'library_snapshots'
       )
       ORDER BY pg_total_relation_size(relid) DESC
     `);
@@ -507,6 +507,7 @@ export const debugRoutes: FastifyPluginAsync = async (app) => {
    */
   app.delete('/servers', async () => {
     const deleted = await db.delete(servers).returning({ id: servers.id });
+    invalidateServersCache();
     return {
       success: true,
       deleted: deleted.length,
@@ -597,6 +598,7 @@ export const debugRoutes: FastifyPluginAsync = async (app) => {
     await db.delete(libraryItems); // Library data (references servers)
     await db.delete(serverUsers);
     await db.delete(servers); // servers references plex_accounts
+    invalidateServersCache();
     await db.delete(plexAccounts); // plex_accounts references users
     await db.delete(users);
 

@@ -60,25 +60,43 @@ vi.mock('../../serverState.js', () => ({
   isMaintenance: vi.fn().mockReturnValue(false),
 }));
 
-// Mock BullMQ - we're testing the processor function directly
-vi.mock('bullmq', () => ({
-  Queue: vi.fn().mockImplementation(() => ({
-    add: vi.fn(),
-    close: vi.fn(),
-    getWaitingCount: vi.fn(),
-    getActiveCount: vi.fn(),
-    getCompletedCount: vi.fn(),
-    getFailedCount: vi.fn(),
-    getDelayedCount: vi.fn(),
-    getJobs: vi.fn(),
-  })),
-  Worker: vi.fn().mockImplementation(() => ({
-    on: vi.fn(),
-    close: vi.fn(),
-  })),
+// Mock BullMQ - we're testing the processor function directly.
+// Queue must be a regular function (not an arrow) so `new Queue()` works;
+// instances are captured so enqueueNotification tests can reach `add`.
+const { queueInstances } = vi.hoisted(() => ({
+  queueInstances: [] as Array<{ name: string; add: ReturnType<typeof vi.fn> }>,
 }));
 
-import { processNotificationJob } from '../notificationQueue.js';
+vi.mock('bullmq', () => ({
+  Queue: vi.fn(function (name: string) {
+    const instance = {
+      name,
+      on: vi.fn(),
+      add: vi.fn(),
+      close: vi.fn(),
+      getWaitingCount: vi.fn(),
+      getActiveCount: vi.fn(),
+      getCompletedCount: vi.fn(),
+      getFailedCount: vi.fn(),
+      getDelayedCount: vi.fn(),
+      getJobs: vi.fn(),
+    };
+    queueInstances.push(instance);
+    return instance;
+  }),
+  Worker: vi.fn(function () {
+    return {
+      on: vi.fn(),
+      close: vi.fn(),
+    };
+  }),
+}));
+
+import {
+  processNotificationJob,
+  initNotificationQueue,
+  enqueueNotification,
+} from '../notificationQueue.js';
 
 describe('Notification Queue - Rule Notification Bypass', () => {
   const createMockSettings = () => ({
@@ -411,5 +429,137 @@ describe('processNotificationJob - user_id condition regression', () => {
     await processNotificationJob(job);
 
     expect(mockNotifyViolation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('enqueueNotification - violation dedupe keys', () => {
+  const makeViolationPayload = (serverUserId: string, ruleId: string): ViolationWithDetails => ({
+    id: `violation-${serverUserId}-${ruleId}`,
+    ruleId,
+    serverUserId,
+    sessionId: 'session-123',
+    severity: 'warning',
+    data: {},
+    acknowledgedAt: null,
+    createdAt: new Date(),
+    user: {
+      id: serverUserId,
+      username: 'testuser',
+      serverId: 'server-id',
+      thumbUrl: null,
+      identityName: null,
+    },
+    rule: {
+      id: ruleId,
+      name: 'Test Rule',
+      type: null,
+    },
+  });
+
+  function getQueueAdd(): ReturnType<typeof vi.fn> {
+    const instance = [...queueInstances].reverse().find((q) => q.name === 'notifications');
+    if (!instance) throw new Error('notifications queue was not constructed');
+    instance.add.mockImplementation((_name: string, _data: unknown, opts?: { jobId?: string }) => ({
+      id: opts?.jobId,
+    }));
+    return instance.add;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Module state keeps the first queue; repeat inits are no-ops
+    initNotificationQueue('redis://localhost:6379');
+  });
+
+  it('keys violations by server user so one user cannot swallow another', async () => {
+    const add = getQueueAdd();
+
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-a', 'rule-1'),
+    });
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-b', 'rule-1'),
+    });
+
+    const jobIds = add.mock.calls.map((call) => (call[2] as { jobId?: string }).jobId);
+    expect(jobIds[0]).toContain('su-a');
+    expect(jobIds[1]).toContain('su-b');
+    expect(jobIds[0]).not.toBe(jobIds[1]);
+  });
+
+  it('keys violations by rule id so v2 rules with null type stay distinct', async () => {
+    const add = getQueueAdd();
+
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-a', 'rule-1'),
+    });
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-a', 'rule-2'),
+    });
+
+    const jobIds = add.mock.calls.map((call) => (call[2] as { jobId?: string }).jobId);
+    expect(jobIds[0]).toContain('rule-1');
+    expect(jobIds[1]).toContain('rule-2');
+    expect(jobIds[0]).not.toBe(jobIds[1]);
+  });
+
+  it('enqueues a notify action and the routed violation as two separate jobs', async () => {
+    const add = getQueueAdd();
+
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-a', 'rule-1'),
+    });
+    await enqueueNotification({
+      type: 'violation',
+      payload: {
+        ...makeViolationPayload('su-a', 'rule-1'),
+        data: { ruleNotification: true, channels: ['discord'] },
+      },
+    });
+
+    const jobIds = add.mock.calls.map((call) => (call[2] as { jobId?: string }).jobId);
+    expect(add).toHaveBeenCalledTimes(2);
+    expect(jobIds[0]).toBeDefined();
+    expect(jobIds[1]).toBeDefined();
+    expect(jobIds[0]).not.toBe(jobIds[1]);
+  });
+
+  it('still dedupes identical routed violations within a bucket', async () => {
+    const add = getQueueAdd();
+
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-a', 'rule-1'),
+    });
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-a', 'rule-1'),
+    });
+
+    const jobIds = add.mock.calls.map((call) => (call[2] as { jobId?: string }).jobId);
+    expect(jobIds[0]).toBeDefined();
+    expect(jobIds[0]).toBe(jobIds[1]);
+  });
+
+  it('skips dedupe entirely when the payload has neither rule id nor type', async () => {
+    const add = getQueueAdd();
+
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-a', ''),
+    });
+    await enqueueNotification({
+      type: 'violation',
+      payload: makeViolationPayload('su-b', ''),
+    });
+
+    const jobIds = add.mock.calls.map((call) => (call[2] as { jobId?: string }).jobId);
+    expect(jobIds[0]).toBeUndefined();
+    expect(jobIds[1]).toBeUndefined();
   });
 });

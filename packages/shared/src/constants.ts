@@ -85,6 +85,7 @@ export const WS_EVENTS = {
   STATS_UPDATED: 'stats:updated',
   IMPORT_PROGRESS: 'import:progress',
   IMPORT_JELLYSTAT_PROGRESS: 'import:jellystat:progress',
+  IMPORT_PLAYBACK_REPORTING_PROGRESS: 'import:playbackreporting:progress',
   MAINTENANCE_PROGRESS: 'maintenance:progress',
   /** Library sync progress updates */
   LIBRARY_SYNC_PROGRESS: 'library:sync:progress',
@@ -149,6 +150,12 @@ export const REDIS_KEYS = {
   SERVER_HEALTH_FAIL_COUNT: (serverId: string) =>
     `${_redisPrefix}tracearr:servers:${serverId}:health:fails`,
   SERVER_CONNECTION: (serverId: string) => `${_redisPrefix}tracearr:servers:${serverId}:connection`,
+  SERVER_STATS_RESOURCES: (serverId: string) =>
+    `${_redisPrefix}tracearr:servers:${serverId}:stats:resources`,
+  SERVER_STATS_BANDWIDTH: (serverId: string) =>
+    `${_redisPrefix}tracearr:servers:${serverId}:stats:bandwidth`,
+  SERVER_STATS_SAMPLES: (serverId: string) =>
+    `${_redisPrefix}tracearr:servers:${serverId}:stats:samples`,
   get PUBSUB_EVENTS() {
     return `${_redisPrefix}tracearr:events`;
   },
@@ -169,30 +176,32 @@ export const REDIS_KEYS = {
   get VERSION_CHECK_COOLDOWN() {
     return `${_redisPrefix}tracearr:version:check:cooldown`;
   },
-  // Library statistics
+  // Library statistics. The :v2 suffix marks the multi-version payload
+  // change (version-summed sizes, overlapping buckets); old keys expire via
+  // TTL. Bump again whenever a cached payload's meaning shifts.
   get LIBRARY_STATS() {
-    return `${_redisPrefix}tracearr:library:stats`;
+    return `${_redisPrefix}tracearr:library:stats:v2`;
   },
   get LIBRARY_GROWTH() {
     return `${_redisPrefix}tracearr:library:growth`;
   },
   get LIBRARY_QUALITY() {
-    return `${_redisPrefix}tracearr:library:quality`;
+    return `${_redisPrefix}tracearr:library:quality:v2`;
   },
   get LIBRARY_STALE() {
-    return `${_redisPrefix}tracearr:library:stale`;
+    return `${_redisPrefix}tracearr:library:stale:v2`;
   },
   get LIBRARY_DUPLICATES() {
-    return `${_redisPrefix}tracearr:library:duplicates`;
+    return `${_redisPrefix}tracearr:library:duplicates:v3`;
   },
   get LIBRARY_STORAGE() {
-    return `${_redisPrefix}tracearr:library:storage`;
+    return `${_redisPrefix}tracearr:library:storage:v3`;
   },
   get LIBRARY_WATCH() {
-    return `${_redisPrefix}tracearr:library:watch`;
+    return `${_redisPrefix}tracearr:library:watch:v2`;
   },
   get LIBRARY_ROI() {
-    return `${_redisPrefix}tracearr:library:roi`;
+    return `${_redisPrefix}tracearr:library:roi:v2`;
   },
   get LIBRARY_PATTERNS() {
     return `${_redisPrefix}tracearr:library:patterns`;
@@ -207,18 +216,60 @@ export const REDIS_KEYS = {
     return `${_redisPrefix}tracearr:library:top-shows`;
   },
   get LIBRARY_CODECS() {
-    return `${_redisPrefix}tracearr:library:codecs`;
+    return `${_redisPrefix}tracearr:library:codecs:v2`;
   },
   get LIBRARY_RESOLUTION() {
-    return `${_redisPrefix}tracearr:library:resolution`;
+    return `${_redisPrefix}tracearr:library:resolution:v2`;
   },
+  get LIBRARY_SHELVES() {
+    return `${_redisPrefix}tracearr:library:shelves`;
+  },
+  get LIBRARY_GENRES() {
+    return `${_redisPrefix}tracearr:library:genres`;
+  },
+  get LIBRARY_CATALOG_LETTERS() {
+    return `${_redisPrefix}tracearr:library:catalog-letters:v2`;
+  },
+  get LIBRARY_LIBRARIES() {
+    return `${_redisPrefix}tracearr:library:libraries`;
+  },
+  // Watched-filtered ordered candidate list shared by /catalog and
+  // /catalog/letters (see getWatchedCandidates in catalog.ts)
+  get LIBRARY_CATALOG_WATCHED() {
+    return `${_redisPrefix}tracearr:library:catalog-watched:v2`;
+  },
+  // Catalog COUNT + total file size per filter set - O(catalog) to compute,
+  // so it must never run once per scroll page
+  get LIBRARY_CATALOG_TOTALS() {
+    return `${_redisPrefix}tracearr:library:catalog-totals:v2`;
+  },
+  // Single-flight compute lock for a cold cache miss (see
+  // withComputeSingleFlight in routes/library/utils.ts), shared by /shelves
+  // and the catalog watched-candidates compute. cacheKey already carries the
+  // prefix, so this only appends the lock segment.
+  LIBRARY_SINGLE_FLIGHT_LOCK: (cacheKey: string) => `${cacheKey}:lock`,
+  // Internal media detail responses (id/segment/scope composed by the caller);
+  // distinct from PUBLIC_MEDIA_STATS, which backs the public API v2 namespace
+  LIBRARY_MEDIA_DETAIL: (cacheKey: string) =>
+    `${_redisPrefix}tracearr:library:media-detail:v2:${cacheKey}`,
   // Library sync state
   LIBRARY_SYNC_LAST: (serverId: string, libraryId: string) =>
     `${_redisPrefix}tracearr:library:sync:last:${serverId}:${libraryId}`,
   LIBRARY_SYNC_COUNT: (serverId: string, libraryId: string) =>
     `${_redisPrefix}tracearr:library:sync:count:${serverId}:${libraryId}`,
-  LIBRARY_SYNC_CYCLE: (serverId: string, libraryId: string) =>
-    `${_redisPrefix}tracearr:library:sync:cycle:${serverId}:${libraryId}`,
+  // Timestamp of the last completed full scan - the periodic full-scan safety
+  // net is time-based so event-sync bursts can't drag it forward
+  LIBRARY_SYNC_FULL_SCAN_AT: (serverId: string, libraryId: string) =>
+    `${_redisPrefix}tracearr:library:sync:fullscan:${serverId}:${libraryId}`,
+  // Accepted structural shortfall from the last full scan - see COUNT_MISMATCH_* in librarySync.ts
+  LIBRARY_SYNC_SHORTFALL: (serverId: string, libraryId: string) =>
+    `${_redisPrefix}tracearr:library:sync:shortfall:${serverId}:${libraryId}`,
+  // Image precache watermark state (per server, not per library - the precache
+  // job walks library_items scoped only by server)
+  LIBRARY_PRECACHE_WATERMARK: (serverId: string) =>
+    `${_redisPrefix}tracearr:library:precache:watermark:${serverId}`,
+  LIBRARY_PRECACHE_LAST_FULL: (serverId: string) =>
+    `${_redisPrefix}tracearr:library:precache:last-full:${serverId}`,
   // Auth tokens
   REFRESH_TOKEN: (hash: string) => `${_redisPrefix}tracearr:refresh:${hash}`,
   PLEX_TEMP_TOKEN: (token: string) => `${_redisPrefix}tracearr:plex_temp:${token}`,
@@ -257,11 +308,15 @@ export const REDIS_KEYS = {
     `${_redisPrefix}tracearr:filter-options:${userId}:${scopeHash}`,
   // v1 segment invalidates cached entries if the GeoLocation shape ever changes
   PLEX_GEOIP: (ip: string) => `${_redisPrefix}tracearr:geoip:plex:v1:${ip}`,
+  // Public API v2 per-media stats/watchers responses
+  PUBLIC_MEDIA_STATS: (cacheKey: string) =>
+    `${_redisPrefix}tracearr:public:media-stats:${cacheKey}`,
 };
 
 // Cache TTLs in seconds
 export const CACHE_TTL = {
   DASHBOARD_STATS: 60,
+  PUBLIC_MEDIA_STATS: 60,
   // Must exceed several SSE reconciliation intervals (30s): paused Plex sessions emit no events,
   // and an expiring entry hides the session from the dashboard and from concurrent-stream limits.
   ACTIVE_SESSIONS: 150,
@@ -269,6 +324,11 @@ export const CACHE_TTL = {
   RATE_LIMIT: 900,
   SERVER_HEALTH: 600, // 10 minutes - servers marked unhealthy if no update
   SERVER_CONNECTION: 600, // 10 minutes - live runtime state, not persisted to DB
+  // Live stats micro-cache: collapses concurrent dashboard viewers into one
+  // Plex call per tick. Each stays under its endpoint's sample spacing so a
+  // tick can't serve an entry that already missed a sample.
+  SERVER_STATS_RESOURCES: 4,
+  SERVER_STATS_BANDWIDTH: 1,
   LOCATION_FILTERS: 300, // 5 minutes - filter options change infrequently
   VERSION_CHECK: 21600, // 6 hours - version check interval
   // Library statistics
@@ -286,6 +346,11 @@ export const CACHE_TTL = {
   LIBRARY_TOP_SHOWS: 300, // 5 minutes
   LIBRARY_CODECS: 300, // 5 minutes
   LIBRARY_RESOLUTION: 300, // 5 minutes
+  LIBRARY_SHELVES: 300, // 5 minutes
+  LIBRARY_GENRES: 3600, // 1 hour
+  LIBRARY_CATALOG_LETTERS: 300, // 5 minutes, matches LIBRARY_SHELVES freshness
+  LIBRARY_LIBRARIES: 300, // 5 minutes - library list changes only on sync
+  LIBRARY_MEDIA_DETAIL: 60, // 1 minute, matches PUBLIC_MEDIA_STATS freshness
   MOBILE_LAST_SEEN: 300, // 5 minutes - throttle for device activity updates
   // Filter options (dropdown values change infrequently)
   FILTER_OPTIONS: 120, // 2 minutes
@@ -308,8 +373,17 @@ export const NOTIFICATION_EVENTS = {
 } as const;
 
 // API version
+/**
+ * server_version_key of the placeholder version rows the multi-version
+ * migration seeds from flat library_items columns. Never surfaced as a real
+ * version and hard-deleted (not tombstoned) when observed versions replace it.
+ */
+export const LEGACY_VERSION_SENTINEL = 'legacy:1';
+
 export const API_VERSION = 'v1';
 export const API_BASE_PATH = `/api/${API_VERSION}`;
+export const API_VERSION_V2 = 'v2';
+export const API_V2_BASE_PATH = `/api/${API_VERSION_V2}`;
 
 // JWT configuration
 export const JWT_CONFIG = {
@@ -738,18 +812,18 @@ export function formatAudioChannels(channels: number | null | undefined): string
 
 // Server color palette (40-60% HSL lightness, visible on both dark and light backgrounds)
 export const SERVER_COLOR_PALETTE = [
-  { hex: '#E5A00D', label: 'Gold' }, // Plex brand
-  { hex: '#AA5CC3', label: 'Purple' }, // Jellyfin brand
-  { hex: '#52B54B', label: 'Green' }, // Emby brand
+  { hex: '#F4A825', label: 'Gold' }, // Plex brand
+  { hex: '#895FDD', label: 'Purple' }, // Jellyfin brand
+  { hex: '#39C668', label: 'Green' }, // Emby brand
   { hex: '#3B82F6', label: 'Blue' },
   { hex: '#EF4444', label: 'Red' },
   { hex: '#14B8A6', label: 'Teal' },
 ] as const;
 
 export const SERVER_TYPE_BRAND_COLORS: Record<string, string> = {
-  plex: '#E5A00D',
-  jellyfin: '#AA5CC3',
-  emby: '#52B54B',
+  plex: '#F4A825',
+  jellyfin: '#895FDD',
+  emby: '#39C668',
 };
 
 /** Pick best color for a server given its type and colors already used by other servers */
@@ -773,30 +847,41 @@ export const TIME_MS = {
 } as const;
 
 // Server resource statistics configuration (CPU, RAM)
-// Used with Plex's undocumented /statistics/resources endpoint
+// Used with Plex's undocumented /statistics/resources endpoint.
+//
+// Plex samples every 5s, not the 6 its per-point `timespan` field implies.
+// The timer free-runs and drifts, so timestamps land on no fixed grid.
 export const SERVER_STATS_CONFIG = {
-  // Poll interval in seconds (how often we fetch new data)
-  POLL_INTERVAL_SECONDS: 6,
-  // Timespan parameter for Plex API (MUST be 6 - other values return empty!)
-  TIMESPAN_SECONDS: 6,
-  // Fixed 2-minute window (20 data points at 6s intervals)
+  // Granularity enum, not seconds (days=3, hours=4, seconds=6).
+  // Resources answers only 6; bandwidth also answers 0-4 for rollups.
+  TIMESPAN_PARAM: 6,
+  POLL_INTERVAL_SECONDS: 5,
   WINDOW_SECONDS: 120,
-  // Data points to display (2 min / 6s = 20 points)
-  DATA_POINTS: 20,
+  // Charts hold their right edge this far behind real time so the newest
+  // region is always populated. Sized to the slowest source, the 6s plugin.
+  NOW_DELAY_SECONDS: 6,
+  // Memory cap, not a window - charts bound themselves by time
+  MAX_POINTS: 32,
+  // Break the line rather than bridge dead air: 3 Plex samples, 2 plugin ones
+  GAP_BREAK_SECONDS: 15,
 } as const;
 
-// Server bandwidth statistics configuration (Local/Remote)
-// Used with Plex's undocumented /statistics/bandwidth endpoint
-// Data arrives per-second from Plex, displayed at 1-second granularity
+/**
+ * How far back live-stats points are kept: the visible window, plus the delay
+ * the chart holds its right edge by, plus slack. Retaining only the window
+ * drops points while they are still inside the left wall.
+ */
+export function liveStatsRetentionSeconds(windowSeconds: number): number {
+  return windowSeconds + SERVER_STATS_CONFIG.NOW_DELAY_SECONDS + 10;
+}
+
+// Plex-only; Jellyfin and Emby expose no server-wide byte counter.
+// Rows are per-second and sparse - an absent second moved no bytes, so a
+// point count is not a time window.
 export const BANDWIDTH_STATS_CONFIG = {
-  // Poll interval in seconds (how often we fetch new data)
-  POLL_INTERVAL_SECONDS: 6,
-  // Timespan parameter for Plex API
-  TIMESPAN_SECONDS: 6,
-  // Fixed 2-minute window (120 data points at 1s intervals)
+  TIMESPAN_PARAM: 6,
   WINDOW_SECONDS: 120,
-  // Data points to display (2 min * 1/s = 120 points)
-  DATA_POINTS: 120,
+  MAX_POINTS: 150,
 } as const;
 
 // Sentinel returned by the merge API when combining server users on the same

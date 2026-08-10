@@ -11,8 +11,10 @@ import {
   mapJellyfinType,
   getResolutionString,
   extractQuality,
+  extractVersions,
   parseLibraryDate,
   parseLibraryItemsResponse,
+  parseLibraryItem,
   parseItem,
 } from '../jellyfinEmbyParser.js';
 
@@ -146,6 +148,34 @@ describe('parseProviderIds', () => {
   it('rejects zero IDs', () => {
     const result = parseProviderIds({ Tmdb: '0' });
     expect(result.tmdbId).toBeUndefined();
+  });
+
+  it('extracts MusicBrainzTrack for a track item', () => {
+    const result = parseProviderIds({ MusicBrainzTrack: 'f3e5c1a0-track' }, 'track');
+    expect(result.musicBrainzId).toBe('f3e5c1a0-track');
+  });
+
+  it('extracts MusicBrainzAlbum for an album item', () => {
+    const result = parseProviderIds({ MusicBrainzAlbum: 'album-mbid' }, 'album');
+    expect(result.musicBrainzId).toBe('album-mbid');
+  });
+
+  it('extracts MusicBrainzArtist, falling back to MusicBrainzAlbumArtist, for an artist item', () => {
+    expect(parseProviderIds({ MusicBrainzArtist: 'artist-mbid' }, 'artist').musicBrainzId).toBe(
+      'artist-mbid'
+    );
+    expect(
+      parseProviderIds({ MusicBrainzAlbumArtist: 'album-artist-mbid' }, 'artist').musicBrainzId
+    ).toBe('album-artist-mbid');
+  });
+
+  it('leaves musicBrainzId undefined for a track with an untagged (empty) ProviderIds object', () => {
+    expect(parseProviderIds({}, 'track').musicBrainzId).toBeUndefined();
+  });
+
+  it('does not extract a MusicBrainz field for non-music media types', () => {
+    const result = parseProviderIds({ MusicBrainzTrack: 'f3e5c1a0-track' }, 'movie');
+    expect(result.musicBrainzId).toBeUndefined();
   });
 });
 
@@ -362,6 +392,36 @@ describe('extractQuality', () => {
     expect(result.audioCodec).toBe('AAC');
   });
 
+  it('extracts and normalizes dynamic range from VideoRangeType', () => {
+    const mediaSources = [
+      {
+        MediaStreams: [{ Type: 'Video', Codec: 'hevc', VideoRangeType: 'HDR10' }],
+      },
+    ];
+    const result = extractQuality(mediaSources);
+    expect(result.videoDynamicRange).toBe('hdr10');
+  });
+
+  it('normalizes Dolby Vision VideoRangeType variants to one token', () => {
+    const mediaSources = [
+      {
+        MediaStreams: [{ Type: 'Video', Codec: 'hevc', VideoRangeType: 'DOVIWithHDR10' }],
+      },
+    ];
+    const result = extractQuality(mediaSources);
+    expect(result.videoDynamicRange).toBe('dolby vision');
+  });
+
+  it('defaults dynamic range to sdr when no HDR signal is present', () => {
+    const mediaSources = [
+      {
+        MediaStreams: [{ Type: 'Video', Codec: 'h264', Width: 1920, Height: 1080 }],
+      },
+    ];
+    const result = extractQuality(mediaSources);
+    expect(result.videoDynamicRange).toBe('sdr');
+  });
+
   it('uses first video and audio streams found', () => {
     const mediaSources = [
       {
@@ -479,6 +539,50 @@ describe('parseLibraryItemsResponse', () => {
     expect(item.addedAt).toBeInstanceOf(Date);
   });
 
+  it('builds thumbPath with a tag query when ImageTags.Primary is present', () => {
+    const input = [
+      {
+        Id: 'jf-item-1',
+        Name: 'Tagged Item',
+        Type: 'Movie',
+        ImageTags: { Primary: 'abc123tag' },
+      },
+    ];
+
+    const result = parseLibraryItemsResponse(input);
+
+    expect(result[0]!.thumbPath).toBe('/Items/jf-item-1/Images/Primary?tag=abc123tag');
+  });
+
+  it('builds thumbPath with no query string when ImageTags is absent (Emby untagged item)', () => {
+    const input = [
+      {
+        Id: 'emby-item-1',
+        Name: 'Untagged Item',
+        Type: 'Movie',
+      },
+    ];
+
+    const result = parseLibraryItemsResponse(input);
+
+    expect(result[0]!.thumbPath).toBe('/Items/emby-item-1/Images/Primary');
+  });
+
+  it('parses Genres array into genres', () => {
+    const input = [
+      {
+        Id: '1',
+        Name: 'X',
+        Type: 'Movie',
+        Genres: ['Action', 'Crime'],
+      },
+    ];
+
+    const result = parseLibraryItemsResponse(input);
+
+    expect(result[0]!.genres).toEqual(['Action', 'Crime']);
+  });
+
   it('parses episode with series info', () => {
     const input = [
       {
@@ -532,6 +636,41 @@ describe('parseLibraryItemsResponse', () => {
     expect(item.parentTitle).toBe('Album Name');
     expect(item.parentRatingKey).toBe('album456'); // links to MusicAlbum
     expect(item.itemIndex).toBe(3);
+  });
+
+  it('extracts musicBrainzId for a track from ProviderIds.MusicBrainzTrack', () => {
+    const input = [
+      {
+        Id: 'track-mbid',
+        Name: 'Song Title',
+        Type: 'Audio',
+        ProviderIds: { MusicBrainzTrack: 'f3e5c1a0-track' },
+        DateCreated: '2024-03-10T08:00:00Z',
+      },
+    ];
+
+    const [item] = parseLibraryItemsResponse(input);
+
+    expect(item!.musicBrainzId).toBe('f3e5c1a0-track');
+  });
+
+  // MusicAlbum items aren't in ALLOWED_LIBRARY_ITEM_TYPES so never reach parseLibraryItemsResponse
+  // in production; parseLibraryItem itself is tested directly here.
+  it('parses an album item, carrying its own parent artist as parentTitle/parentRatingKey', () => {
+    const item = parseLibraryItem({
+      Id: 'album456',
+      Name: 'Album Name',
+      Type: 'MusicAlbum',
+      AlbumArtist: 'Artist Name',
+      AlbumArtists: [{ Name: 'Artist Name', Id: 'artist789' }],
+      ProviderIds: { MusicBrainzAlbum: 'album-mbid' },
+      DateCreated: '2024-03-10T08:00:00Z',
+    });
+
+    expect(item.mediaType).toBe('album');
+    expect(item.parentTitle).toBe('Artist Name');
+    expect(item.parentRatingKey).toBe('artist789');
+    expect(item.musicBrainzId).toBe('album-mbid');
   });
 
   it('uses AlbumArtists ID for grandparentRatingKey on compilation albums', () => {
@@ -686,9 +825,47 @@ describe('parseLibraryItemsResponse', () => {
 
     const result = parseLibraryItemsResponse(input);
 
-    expect(result).toHaveLength(5);
-    expect(result.map((r) => r.ratingKey)).toEqual(['1', '9', '11', '12', '14']);
-    expect(result.map((r) => r.mediaType)).toEqual(['movie', 'show', 'episode', 'track', 'artist']);
+    expect(result).toHaveLength(6);
+    expect(result.map((r) => r.ratingKey)).toEqual(['1', '9', '10', '11', '12', '14']);
+    expect(result.map((r) => r.mediaType)).toEqual([
+      'movie',
+      'show',
+      'season',
+      'episode',
+      'track',
+      'artist',
+    ]);
+  });
+
+  it('excludes extras (trailers, behind-the-scenes) that share Type with primary content', () => {
+    const input = [
+      { Id: '1', Name: 'Anatomy of a Fall', Type: 'Movie', DateCreated: '2024-01-01T00:00:00Z' },
+      {
+        Id: '2',
+        Name: 'Anatomy of a Fall - Trailer 2',
+        Type: 'Movie',
+        ExtraType: 'Trailer',
+        DateCreated: '2024-01-01T00:00:00Z',
+      },
+      {
+        Id: '3',
+        Name: 'The Devil Wears Prada - Behind the Scenes',
+        Type: 'Video',
+        ExtraType: 'BehindTheScenes',
+        DateCreated: '2024-01-01T00:00:00Z',
+      },
+      {
+        Id: '4',
+        Name: 'The Devil Wears Prada',
+        Type: 'Movie',
+        DateCreated: '2024-01-01T00:00:00Z',
+      },
+    ];
+
+    const result = parseLibraryItemsResponse(input);
+
+    expect(result.map((r) => r.ratingKey)).toEqual(['1', '4']);
+    expect(result.map((r) => r.title)).toEqual(['Anatomy of a Fall', 'The Devil Wears Prada']);
   });
 });
 
@@ -742,3 +919,122 @@ describe('parseItem', () => {
     expect(result.AlbumArtist).toBe('Artist Name');
   });
 });
+
+describe('extractVersions', () => {
+  const twoSources = [
+    {
+      Id: 'src-a',
+      Size: 14316046820,
+      Container: 'MKV',
+      Bitrate: 15512000,
+      Path: '/data/a.mkv',
+      MediaStreams: [
+        { Type: 'Video', Codec: 'hevc', Width: 3840, Height: 2160 },
+        { Type: 'Audio', Codec: 'eac3', Channels: 6 },
+      ],
+    },
+    {
+      Id: 'src-b',
+      Size: 4100000000,
+      Container: 'mp4',
+      Bitrate: 10000000,
+      MediaStreams: [
+        { Type: 'Video', Codec: 'h264', Width: 1920, Height: 1080 },
+        { Type: 'Audio', Codec: 'aac', Channels: 2 },
+      ],
+    },
+  ];
+
+  it('keeps each MediaSource paired with its own streams', () => {
+    const versions = extractVersions(twoSources, undefined, 'item-1');
+
+    expect(versions).toHaveLength(2);
+    expect(versions[0]).toMatchObject({
+      serverVersionKey: 'src-a',
+      videoCodec: 'HEVC',
+      videoResolution: '4k',
+      audioCodec: 'EAC3',
+      audioChannels: 6,
+      container: 'mkv',
+      fileSize: 14316046820,
+      bitrate: 15512,
+      filePath: '/data/a.mkv',
+    });
+    expect(versions[1]).toMatchObject({
+      serverVersionKey: 'src-b',
+      videoCodec: 'H264',
+      videoResolution: '1080p',
+      audioCodec: 'AAC',
+      fileSize: 4100000000,
+      bitrate: 10000,
+    });
+  });
+
+  it('synthesizes one version from item-level MediaStreams when MediaSources are absent', () => {
+    const versions = extractVersions(
+      undefined,
+      [{ Type: 'Video', Codec: 'hevc', Width: 1920, Height: 1080 }],
+      'item-9'
+    );
+
+    expect(versions).toHaveLength(1);
+    expect(versions[0]).toMatchObject({ serverVersionKey: 'item-9', videoCodec: 'HEVC' });
+  });
+
+  it('returns empty for containers with no sources or streams', () => {
+    expect(extractVersions(undefined, undefined, 'series-1')).toEqual([]);
+    expect(extractVersions([], [], 'series-1')).toEqual([]);
+  });
+});
+
+describe('parseLibraryItem multi-version', () => {
+  it('sums file size and rolls quality up from the best version', () => {
+    const item = parseLibraryItem({
+      Id: 'merged-1',
+      Name: 'Guy Ritchies The Covenant',
+      Type: 'Movie',
+      ProductionYear: 2023,
+      MediaSources: twoSourcesFixture(),
+    });
+
+    expect(item.versions).toHaveLength(2);
+    expect(item.fileSize).toBe(14316046820 + 4100000000);
+    expect(item.videoResolution).toBe('4k');
+    expect(item.videoCodec).toBe('HEVC');
+    expect(item.versionsFingerprint).toBeTruthy();
+  });
+
+  it('fingerprint is stable across MediaSource order', () => {
+    const forward = parseLibraryItem({
+      Id: 'merged-1',
+      Name: 'Test',
+      Type: 'Movie',
+      MediaSources: twoSourcesFixture(),
+    });
+    const reversed = parseLibraryItem({
+      Id: 'merged-1',
+      Name: 'Test',
+      Type: 'Movie',
+      MediaSources: twoSourcesFixture().reverse(),
+    });
+
+    expect(forward.versionsFingerprint).toBe(reversed.versionsFingerprint);
+  });
+});
+
+function twoSourcesFixture() {
+  return [
+    {
+      Id: 'src-a',
+      Size: 14316046820,
+      Container: 'mkv',
+      MediaStreams: [{ Type: 'Video', Codec: 'hevc', Width: 3840, Height: 2160 }],
+    },
+    {
+      Id: 'src-b',
+      Size: 4100000000,
+      Container: 'mp4',
+      MediaStreams: [{ Type: 'Video', Codec: 'h264', Width: 1920, Height: 1080 }],
+    },
+  ];
+}

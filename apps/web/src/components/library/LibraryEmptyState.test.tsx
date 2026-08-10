@@ -1,10 +1,15 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import type { Server } from '@tracearr/shared';
+import { initI18n } from '@tracearr/translations';
 import { LibraryEmptyState } from './LibraryEmptyState';
+
+beforeAll(async () => {
+  await initI18n({ lng: 'en' });
+});
 
 vi.mock('@/hooks/useServer', () => ({
   useServer: vi.fn(),
@@ -96,9 +101,7 @@ describe('LibraryEmptyState', () => {
 
   it('shows a loading state while status is still being fetched', () => {
     mockUseServer.mockReturnValue(useServerReturn(['s1'], [server('s1', 'Plex')]));
-    mockUseLibraryStatus.mockReturnValue(
-      statusResult({}, true)
-    );
+    mockUseLibraryStatus.mockReturnValue(statusResult({}, true));
 
     render(<LibraryEmptyState />, { wrapper: wrapper() });
 
@@ -126,6 +129,26 @@ describe('LibraryEmptyState', () => {
     await userEvent.click(screen.getByRole('button', { name: /Sync Now/i }));
 
     await waitFor(() => expect(api.servers.sync).toHaveBeenCalledWith('s1'));
+  });
+
+  it('single server synced with an empty library: shows a media-appropriate message, not "not synced"', () => {
+    mockUseServer.mockReturnValue(useServerReturn(['s1'], [server('s1', 'Plex')]));
+    mockUseLibraryStatus.mockReturnValue(
+      statusResult({
+        s1: {
+          isSynced: true,
+          isSyncRunning: false,
+          needsBackfill: false,
+          isBackfillRunning: false,
+          backfillDays: null,
+        },
+      })
+    );
+
+    render(<LibraryEmptyState />, { wrapper: wrapper() });
+
+    expect(screen.queryByText('Library not synced yet')).not.toBeInTheDocument();
+    expect(screen.getByText('No movies or shows yet')).toBeInTheDocument();
   });
 
   it('single server synced but needing backfill: shows the Generate History action', async () => {

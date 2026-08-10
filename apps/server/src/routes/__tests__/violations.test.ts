@@ -31,7 +31,7 @@ const { mockGetServerUserDisplayNames, mockRecalculateAggregateTrustScore } = vi
 }));
 vi.mock('../../services/userService.js', () => ({
   getServerUserDisplayNames: mockGetServerUserDisplayNames,
-  recalculateAggregateTrustScore: mockRecalculateAggregateTrustScore,
+  recomputeIdentityAggregates: mockRecalculateAggregateTrustScore,
 }));
 
 // Import the mocked db and the routes
@@ -775,12 +775,13 @@ describe('Violation Routes', () => {
   });
 
   describe('DELETE /violations/:id', () => {
-    it('should delete violation for owner', async () => {
+    it('soft-deletes the violation and recomputes the rollup even without trust actions', async () => {
       const ownerUser = createOwnerUser();
       app = await buildTestApp(ownerUser);
 
       const violationId = randomUUID();
       const serverUserId = randomUUID();
+      const userId = randomUUID();
       const serverId = ownerUser.serverIds[0];
 
       // First select: violation exists check with serverUsers join
@@ -796,6 +797,7 @@ describe('Violation Routes', () => {
               ruleId: 'rule-1',
               serverUserId,
               serverId,
+              userId,
             },
           ]);
         } else {
@@ -810,20 +812,22 @@ describe('Violation Routes', () => {
         }
       });
 
-      // Mock transaction for delete + trust reversal
+      const deleteMock = vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined),
+      });
+      const setMock = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{ id: violationId }]),
+        }),
+      });
+      const txMock = {
+        delete: deleteMock,
+        update: vi.fn().mockReturnValue({ set: setMock }),
+      };
+
       mockDb.transaction = vi
         .fn()
         .mockImplementation(async (callback: (tx: unknown) => Promise<void>) => {
-          const txMock = {
-            delete: vi.fn().mockReturnValue({
-              where: vi.fn().mockResolvedValue(undefined),
-            }),
-            update: vi.fn().mockReturnValue({
-              set: vi.fn().mockReturnValue({
-                where: vi.fn().mockResolvedValue(undefined),
-              }),
-            }),
-          };
           return callback(txMock);
         });
 
@@ -835,6 +839,12 @@ describe('Violation Routes', () => {
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
       expect(body.success).toBe(true);
+      // Soft delete: the row is stamped, never removed
+      expect(deleteMock).not.toHaveBeenCalled();
+      expect(setMock).toHaveBeenCalledTimes(1);
+      expect(setMock).toHaveBeenCalledWith({ dismissedAt: expect.any(Date) });
+      // The rollup recomputes on every dismiss, not only trust-reversing ones
+      expect(mockRecalculateAggregateTrustScore).toHaveBeenCalledWith(userId, txMock);
     });
 
     it('reverses trust score when dismissing violation with adjust_trust action', async () => {
@@ -885,11 +895,12 @@ describe('Violation Routes', () => {
       const deleteMock = vi.fn().mockReturnValue({
         where: vi.fn().mockResolvedValue(undefined),
       });
-      const updateMock = vi.fn().mockReturnValue({
-        set: vi.fn().mockReturnValue({
-          where: vi.fn().mockResolvedValue(undefined),
+      const setMock = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{ id: violationId }]),
         }),
       });
+      const updateMock = vi.fn().mockReturnValue({ set: setMock });
       const txMock = {
         delete: deleteMock,
         update: updateMock,
@@ -909,10 +920,15 @@ describe('Violation Routes', () => {
       expect(response.statusCode).toBe(200);
       // Verify transaction was called
       expect(mockDb.transaction).toHaveBeenCalledTimes(1);
-      // Verify delete was called
-      expect(deleteMock).toHaveBeenCalled();
-      // Verify update was called (trust score reversal: -(-20) = +20)
-      expect(updateMock).toHaveBeenCalled();
+      // Soft delete plus trust reversal: two updates, no delete
+      expect(deleteMock).not.toHaveBeenCalled();
+      expect(setMock).toHaveBeenCalledTimes(2);
+      expect(setMock.mock.calls[0]?.[0]).toEqual({ dismissedAt: expect.any(Date) });
+      // Trust reversal update carries the score expression and timestamp
+      expect(setMock.mock.calls[1]?.[0]).toEqual(
+        expect.objectContaining({ updatedAt: expect.any(Date) })
+      );
+      expect(setMock.mock.calls[1]?.[0]).toHaveProperty('trustScore');
       // Verify the identity's overall trust rollup was recomputed for the reversal
       expect(mockRecalculateAggregateTrustScore).toHaveBeenCalledWith(userId, txMock);
     });

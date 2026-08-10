@@ -412,7 +412,16 @@ function getDedupeKey(data: NotificationJobData): string | undefined {
 
   switch (data.type) {
     case 'violation': {
-      return `violation-${data.payload.serverUserId}-${data.payload.rule.type}-${timeBucket}`;
+      // Key on rule id, not rule type: every v2 rule has type null, so a
+      // type-based key would dedupe unrelated rules against each other.
+      const ruleKey = data.payload.rule.id || data.payload.rule.type;
+      if (!ruleKey) return undefined;
+      // A rule's notify action and its routed violation notification are
+      // separate sends: without the kind in the key they share a jobId and
+      // BullMQ silently drops whichever enqueues second.
+      const violationData = data.payload.data as Record<string, unknown> | null;
+      const kind = violationData?.ruleNotification === true ? 'notify' : 'auto';
+      return `violation-${data.payload.serverUserId}-${ruleKey}-${kind}-${timeBucket}`;
     }
     case 'session_started':
     case 'session_stopped': {

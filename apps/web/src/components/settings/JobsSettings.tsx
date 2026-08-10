@@ -99,6 +99,7 @@ const JOB_ICONS: Record<string, typeof Database> = {
   fix_imported_progress: RefreshCw,
   backfill_user_dates: Calendar,
   backfill_library_snapshots: Library,
+  normalize_library_snapshots: Library,
   rebuild_timescale_views: HardDrive,
   full_aggregate_rebuild: History,
   cleanup_old_chunks: Trash2,

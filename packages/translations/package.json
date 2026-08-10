@@ -1,7 +1,14 @@
 {
   "name": "@tracearr/translations",
   "version": "0.1.0",
-  "private": true,
+  "description": "Shared i18n resources and helpers for Tracearr apps",
+  "license": "AGPL-3.0-only",
+  "author": "Connor Gallopo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/connorgallopo/Tracearr.git",
+    "directory": "packages/translations"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,13 +24,20 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src",
+    "!src/locales/_template",
+    "!dist/locales/_template"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc && node scripts/copy-locales.js",
+    "prepublishOnly": "pnpm build",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/",
+    "lint": "eslint src/ --cache --cache-location .eslintcache --cache-strategy content",
     "lint:fix": "eslint src/ --fix",
     "clean": "rm -rf dist .turbo",
     "check": "tsx scripts/check-translations.ts"

@@ -5,14 +5,18 @@ import { StatCard } from '@/components/ui/stat-card';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { TimeRangePicker } from '@/components/ui/time-range-picker';
+import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import {
   ErrorState,
+  InlineErrorState,
   LibraryEmptyState,
-  // DuplicatesTable, // Temporarily hidden
+  DuplicatesTable,
   StaleContentTabs,
   RoiTable,
+  DeadWeightTable,
+  DeadWeightTableSkeleton,
 } from '@/components/library';
 import { StoragePredictionChart } from '@/components/charts';
 import { PerServerCardGrid } from '@/components/server';
@@ -21,23 +25,26 @@ import {
   useLibraryStale,
   useLibraryRoi,
   useLibraryStatus,
+  useLibraryStorageScoped,
+  useShelves,
 } from '@/hooks/queries';
 import { useMultiServerQuery } from '@/hooks/useMultiServerQuery';
 import { useServer } from '@/hooks/useServer';
 import { useTimeRange } from '@/hooks/useTimeRange';
 import { formatBytes } from '@/lib/formatters';
 import { api } from '@/lib/api';
+import { toast } from 'sonner';
 
 export function LibraryStorage() {
   const { t } = useTranslation(['pages', 'common']);
-  const { selectedServerIds, selectedServers, isMultiServer } = useServer();
+  const { selectedServerIds, selectedServers, servers, isMultiServer } = useServer();
   const { value: timeRange, setValue: setTimeRange } = useTimeRange();
 
   // Check library status - fan out per server to detect which need setup
   const statusResult = useLibraryStatus(selectedServerIds);
 
   // Pagination state for tables
-  const [duplicatesPage, _setDuplicatesPage] = useState(1);
+  const [duplicatesPage, setDuplicatesPage] = useState(1);
   const [roiPage, setRoiPage] = useState(1);
 
   // Storage trend chart toggle
@@ -72,36 +79,56 @@ export function LibraryStorage() {
     queryFn: () => api.library.storage(id, undefined, apiPeriod),
   }));
 
-  // Combined KPI: sum totalSizeBytes across all servers (field is a string from BigInt serialization)
+  // Combined KPI: one request over the whole selection so the server-side
+  // mirror dedup spans servers - summing per-server totals double-counts
+  // every file two servers share. Single-server reuses the fan-out entry.
+  const scopedStorage = useLibraryStorageScoped(selectedServerIds, apiPeriod, isMultiServer);
   const totalStorageBytes = useMemo(() => {
+    if (isMultiServer) return Number(scopedStorage.data?.current.totalSizeBytes ?? 0);
     let sum = 0;
     for (const id of selectedServerIds) {
       const entry = storageMulti.byServer.get(id);
       sum += Number(entry?.data?.current.totalSizeBytes ?? 0);
     }
     return sum;
-  }, [storageMulti.byServer, selectedServerIds]);
+  }, [isMultiServer, scopedStorage.data, storageMulti.byServer, selectedServerIds]);
 
-  // Combined growth rate: sum bytesPerMonth; treat insufficient as 0 contribution
+  // Combined growth rate: sum bytesPerMonth; treat insufficient as 0
+  // contribution. fitDays is how many days actually back the fit (it can be
+  // the pre-changeover side); older cached responses fall back to the
+  // predictions countdown.
   const growthSummary = useMemo(() => {
     let totalBytes = 0;
     let allInsufficient = true;
     let hasAnyData = false;
+    let anyPreChangeover = false;
+    let worstDays: number | null = null;
+    let minDataDays = 7;
 
     for (const id of selectedServerIds) {
       const data = storageMulti.byServer.get(id)?.data;
       if (!data) continue;
       hasAnyData = true;
-      const insufficient =
-        data.predictions.currentDataDays != null &&
-        data.predictions.currentDataDays < (data.predictions.minDataDays ?? 7);
-      if (!insufficient) {
+      minDataDays = data.predictions.minDataDays ?? minDataDays;
+      const fitDays = data.growthRate?.fitDays ?? data.predictions.currentDataDays;
+      const insufficient = fitDays != null && fitDays < (data.predictions.minDataDays ?? 7);
+      if (insufficient) {
+        const days = data.predictions.currentDataDays;
+        if (days != null && (worstDays === null || days < worstDays)) worstDays = days;
+      } else {
         allInsufficient = false;
         totalBytes += Number(data.growthRate?.bytesPerMonth ?? 0);
+        if (data.growthRate?.basis === 'preChangeover') anyPreChangeover = true;
       }
     }
 
-    return { totalBytes, allInsufficient: !hasAnyData || allInsufficient };
+    return {
+      totalBytes,
+      allInsufficient: !hasAnyData || allInsufficient,
+      anyPreChangeover,
+      worstDays,
+      minDataDays,
+    };
   }, [storageMulti.byServer, selectedServerIds]);
 
   const growthRateDisplay = growthSummary.allInsufficient
@@ -115,21 +142,20 @@ export function LibraryStorage() {
     !isMultiServer && selectedServerIds.length === 1
       ? (storageMulti.byServer.get(selectedServerIds[0] ?? '') ?? null)
       : null;
-  const singleInsufficient =
-    singleStorageEntry?.data?.predictions.currentDataDays != null &&
-    singleStorageEntry.data.predictions.currentDataDays <
-      (singleStorageEntry.data.predictions.minDataDays ?? 7);
   const growthRateSubValue =
-    !isMultiServer && singleInsufficient
-      ? `${singleStorageEntry?.data?.predictions.currentDataDays} ${t('library.storage.of')} ${singleStorageEntry?.data?.predictions.minDataDays} ${t('library.storage.days')}`
-      : undefined;
+    growthSummary.allInsufficient && growthSummary.worstDays != null
+      ? `${growthSummary.worstDays} ${t('library.storage.of')} ${growthSummary.minDataDays} ${t('library.storage.days')}`
+      : growthSummary.anyPreChangeover
+        ? t('library.storage.growthPreChangeover')
+        : undefined;
 
-  // Combined cross-server duplicates - only relevant when multiple servers are selected
+  // Duplicates cover same-server copies and versions too, so the KPI and
+  // table render for single-server installs as well
   const duplicates = useLibraryDuplicates(
     selectedServerIds,
     duplicatesPage,
     10,
-    selectedServerIds.length > 1
+    selectedServerIds.length > 0
   );
 
   // Combined stale summary for KPI card
@@ -152,6 +178,22 @@ export function LibraryStorage() {
     roiSortOrder
   );
 
+  // Dead Weight (all-time never-watched titles) rides the shelves endpoint
+  // shared with the media Overview page - Redis-cached and single-flighted
+  // server-side, so reusing it here is cheap even though the response carries
+  // shelf rows this page doesn't use. Pinned to the default period rather
+  // than this page's picker: dead weight is period-independent, and wiring
+  // the picker in would recompute the whole shelves payload on every period
+  // change for zero visible difference (the stale/roi widgets on this page
+  // pin their windows for the same reason).
+  const shelvesTimeRange = useMemo(() => ({ period: 'month' as const }), []);
+  const shelves = useShelves(selectedServerIds, shelvesTimeRange);
+  const deadWeightServerById = useMemo(
+    () => new Map(servers.map((server) => [server.id, server])),
+    [servers]
+  );
+  const allTimeLabel = t('common:time.allTime').toLowerCase();
+
   // All hooks must fire before any early returns
   const allStorageErrors = useMemo(() => {
     if (selectedServerIds.length === 0) return false;
@@ -165,6 +207,28 @@ export function LibraryStorage() {
     }
     return null;
   }, [storageMulti.byServer, selectedServerIds]);
+
+  // Servers still carrying placeholder version rows: storage and quality
+  // numbers are provisional until their next full sync replaces them
+  const versionsPendingIds = useMemo(
+    () =>
+      selectedServerIds.filter(
+        (id) => statusResult.byServer.get(id)?.data?.versionsBackfillPending === true
+      ),
+    [statusResult, selectedServerIds]
+  );
+  const [versionSyncRequested, setVersionSyncRequested] = useState(false);
+  const handleVersionSync = async () => {
+    setVersionSyncRequested(true);
+    const results = await Promise.allSettled(versionsPendingIds.map((id) => api.servers.sync(id)));
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    if (failed > 0) {
+      toast.error(t('library.versionsBackfill.syncFailed', { count: failed }));
+      setVersionSyncRequested(false);
+    } else {
+      toast.success(t('library.versionsBackfill.syncStarted'));
+    }
+  };
 
   // Show empty state only if ALL selected servers need setup
   const allNeedSetup = useMemo(() => {
@@ -222,13 +286,32 @@ export function LibraryStorage() {
     <div className="space-y-6">
       {header}
 
+      {versionsPendingIds.length > 0 && (
+        <Card className="border-amber-500/40 bg-amber-500/5">
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-3">
+            <p className="text-sm">{t('library.versionsBackfill.banner')}</p>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void handleVersionSync()}
+              disabled={versionSyncRequested}
+            >
+              {t('library.versionsBackfill.action')}
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
       {/* KPI Cards Grid - 4 columns on desktop, 2 on mobile */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <StatCard
           icon={HardDrive}
           label={t('library.storage.totalStorage')}
-          value={formatBytes(totalStorageBytes)}
-          isLoading={storageMulti.isLoading}
+          value={isMultiServer && scopedStorage.isError ? '—' : formatBytes(totalStorageBytes)}
+          subValue={
+            isMultiServer && scopedStorage.isError ? t('library.storage.failedToLoad') : undefined
+          }
+          isLoading={isMultiServer ? scopedStorage.isLoading : storageMulti.isLoading}
         />
         <StatCard
           icon={TrendingUp}
@@ -237,16 +320,21 @@ export function LibraryStorage() {
           subValue={growthRateSubValue}
           isLoading={storageMulti.isLoading}
         />
-        {/* Duplicates KPI - only meaningful when multiple servers selected */}
-        {selectedServerIds.length > 1 && (
-          <StatCard
-            icon={Copy}
-            label={t('library.storage.duplicates')}
-            value={`${duplicates.data?.summary.totalGroups ?? 0} ${t('library.storage.groups')}`}
-            subValue={`${formatBytes(duplicates.data?.summary.totalPotentialSavingsBytes ?? 0)} ${t('library.storage.recoverable')}`}
-            isLoading={duplicates.isLoading}
-          />
-        )}
+        <StatCard
+          icon={Copy}
+          label={t('library.storage.duplicates')}
+          value={
+            duplicates.isError
+              ? '—'
+              : `${duplicates.data?.summary.totalGroups ?? 0} ${t('library.storage.groups')}`
+          }
+          subValue={
+            duplicates.isError
+              ? t('library.storage.failedToLoad')
+              : `${formatBytes(duplicates.data?.summary.totalPotentialSavingsBytes ?? 0)} ${t('library.storage.recoverable')}`
+          }
+          isLoading={duplicates.isLoading}
+        />
         <StatCard
           icon={Archive}
           label={t('library.storage.staleContent')}
@@ -330,24 +418,46 @@ export function LibraryStorage() {
         </CardContent>
       </Card>
 
-      {/* Duplicates Section - temporarily hidden globally
-      {selectedServerIds.length > 1 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base font-medium">Cross-Server Duplicates</CardTitle>
-            <p className="text-muted-foreground text-sm">Content that exists on multiple servers</p>
-          </CardHeader>
-          <CardContent>
-            <DuplicatesTable
-              data={duplicates.data}
-              isLoading={duplicates.isLoading}
-              page={duplicatesPage}
-              onPageChange={setDuplicatesPage}
-            />
-          </CardContent>
-        </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base font-medium">
+            {t('library.storage.duplicatesTitle')}
+          </CardTitle>
+          <p className="text-muted-foreground text-sm">{t('library.storage.duplicatesSubtitle')}</p>
+        </CardHeader>
+        <CardContent>
+          <DuplicatesTable
+            data={duplicates.data}
+            isLoading={duplicates.isLoading}
+            isError={duplicates.isError}
+            onRetry={() => void duplicates.refetch()}
+            page={duplicatesPage}
+            onPageChange={setDuplicatesPage}
+          />
+        </CardContent>
+      </Card>
+
+      {/* Dead Weight - never-watched titles, all-time. Cousin of Stale Content
+          below (not-watched-recently) - the two cover opposite ends of the
+          same neglect spectrum, so they sit next to each other. */}
+      {shelves.isLoading ? (
+        <DeadWeightTableSkeleton />
+      ) : shelves.isError ? (
+        <InlineErrorState
+          message={shelves.error?.message ?? t('library.storage.failedToLoadDesc')}
+          onRetry={() => void shelves.refetch()}
+        />
+      ) : (
+        shelves.data && (
+          <DeadWeightTable
+            rows={shelves.data.deadWeight ?? []}
+            count={shelves.data.kpis.deadWeight?.count ?? 0}
+            totalBytes={shelves.data.kpis.deadWeight?.totalBytes ?? 0}
+            serverById={deadWeightServerById}
+            allTimeLabel={allTimeLabel}
+          />
+        )
       )}
-      */}
 
       {/* Stale Content Section */}
       <Card>

@@ -227,9 +227,19 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
       // Top shows - separate query (needs daily_intensity CTE)
       db.execute(sql`
           WITH filtered_daily AS (
-            SELECT * FROM daily_content_engagement
+            -- canonical_show_id folds a merged-loser show id to its winner
+            -- (mirrors value_rollup's alias fold in catalog.ts) so a show that
+            -- exists on two servers, or was merged after the fact, collapses
+            -- below instead of appearing twice. am is only null for unstamped
+            -- episodes, which fall back to the normalized-title key.
+            SELECT
+              d.*,
+              COALESCE(am.merged_into_id, d.show_media_id) AS canonical_show_id
+            FROM daily_content_engagement d
+            LEFT JOIN media am ON am.id = d.show_media_id
             WHERE ${dailyStartFilter} ${dailyEndFilter} ${serverFilter}
-            AND media_type = 'episode' AND show_title IS NOT NULL
+            AND d.media_type = 'episode' AND d.show_title IS NOT NULL
+            AND (am.id IS NULL OR am.media_type = 'show')
           ),
           -- Daily intensity: episodes per user/show/day
           daily_intensity AS (
@@ -257,6 +267,7 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
               server_user_id,
               rating_key,
               MAX(show_title) AS show_title,
+              MAX(canonical_show_id::text)::uuid AS canonical_show_id,
               MAX(thumb_path) AS thumb_path,
               MAX(server_id::text)::uuid AS server_id,
               MAX(year) AS year,
@@ -298,6 +309,7 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
             SELECT
               ca.server_user_id,
               ca.show_title,
+              MAX(ca.canonical_show_id::text)::uuid AS canonical_show_id,
               MAX(ca.server_id::text)::uuid AS server_id,
               MAX(ca.thumb_path) AS thumb_path,
               MAX(ca.year) AS year,
@@ -316,28 +328,38 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
             FROM content_agg ca
             LEFT JOIN intensity_stats ist ON ca.server_user_id = ist.server_user_id AND ca.show_title = ist.show_title
             GROUP BY ca.server_user_id, ca.show_title, ist.avg_episodes_per_viewing_day
+          ),
+          with_dedup_key AS (
+            SELECT
+              sa.*,
+              COALESCE(
+                sa.canonical_show_id::text,
+                'title:' || NULLIF(LOWER(REGEXP_REPLACE(sa.show_title, '[^a-zA-Z0-9]', '', 'g')), ''),
+                'raw:' || sa.show_title
+              ) AS dedup_key
+            FROM show_agg sa
           )
           SELECT
-            sa.show_title,
-            MAX(sa.thumb_path) AS thumb_path,
-            MAX(sa.server_id::text)::uuid AS server_id,
-            MAX(sa.year) AS year,
-            SUM(sa.unique_episodes_watched) AS total_episode_views,
-            SUM(sa.total_watch_hours) AS total_watch_hours,
+            MAX(wdk.show_title) AS show_title,
+            MAX(wdk.thumb_path) AS thumb_path,
+            MAX(wdk.server_id::text)::uuid AS server_id,
+            MAX(wdk.year) AS year,
+            SUM(wdk.unique_episodes_watched) AS total_episode_views,
+            SUM(wdk.total_watch_hours) AS total_watch_hours,
             COUNT(DISTINCT su.user_id) AS unique_viewers,
-            SUM(sa.total_valid_sessions) AS valid_sessions,
-            SUM(sa.total_all_sessions) AS total_sessions,
-            ROUND(AVG(sa.unique_episodes_watched), 1) AS avg_episodes_per_viewer,
-            ROUND(AVG(sa.episode_completion_rate), 1) AS avg_completion_rate,
+            SUM(wdk.total_valid_sessions) AS valid_sessions,
+            SUM(wdk.total_all_sessions) AS total_sessions,
+            ROUND(AVG(wdk.unique_episodes_watched), 1) AS avg_episodes_per_viewer,
+            ROUND(AVG(wdk.episode_completion_rate), 1) AS avg_completion_rate,
             -- Enhanced binge score (0-100): Volume×Quality (60%) + Daily Intensity (40%)
             -- Note: Continuity metrics not available in date-filtered queries
             ROUND(
-              LEAST(AVG(sa.unique_episodes_watched) * AVG(sa.episode_completion_rate) / 100, 60) +
-              LEAST(AVG(sa.avg_episodes_per_viewing_day) * 8, 40),
+              LEAST(AVG(wdk.unique_episodes_watched) * AVG(wdk.episode_completion_rate) / 100, 60) +
+              LEAST(AVG(wdk.avg_episodes_per_viewing_day) * 8, 40),
             1) AS binge_score
-          FROM show_agg sa
-          JOIN server_users su ON su.id = sa.server_user_id
-          GROUP BY sa.show_title
+          FROM with_dedup_key wdk
+          JOIN server_users su ON su.id = wdk.server_user_id
+          GROUP BY wdk.dedup_key
           ORDER BY total_episode_views DESC
           LIMIT ${limit}
         `),
@@ -547,10 +569,20 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
 
       const result = await db.execute(sql`
         WITH filtered_daily AS (
-          SELECT * FROM daily_content_engagement
+          -- canonical_show_id folds a merged-loser show id to its winner
+          -- (mirrors value_rollup's alias fold in catalog.ts) so a show that
+          -- exists on two servers, or was merged after the fact, collapses
+          -- below instead of appearing twice. am is only null for unstamped
+          -- episodes, which fall back to the normalized-title key.
+          SELECT
+            d.*,
+            COALESCE(am.merged_into_id, d.show_media_id) AS canonical_show_id
+          FROM daily_content_engagement d
+          LEFT JOIN media am ON am.id = d.show_media_id
           WHERE ${dailyStartFilter} ${dailyEndFilter}
-            AND media_type = 'episode'
-            AND show_title IS NOT NULL
+            AND d.media_type = 'episode'
+            AND d.show_title IS NOT NULL
+            AND (am.id IS NULL OR am.media_type = 'show')
             ${serverFilter}
         ),
         -- Daily intensity: episodes per user/show/day
@@ -579,6 +611,7 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
             server_user_id,
             rating_key,
             show_title,
+            MAX(canonical_show_id::text)::uuid AS canonical_show_id,
             MAX(server_id::text)::uuid AS server_id,
             MAX(thumb_path) AS thumb_path,
             MAX(year) AS year,
@@ -603,6 +636,7 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
           SELECT
             ca.server_user_id,
             ca.show_title,
+            MAX(ca.canonical_show_id::text)::uuid AS canonical_show_id,
             MAX(ca.server_id::text)::uuid AS server_id,
             MAX(ca.thumb_path) AS thumb_path,
             MAX(ca.year) AS year,
@@ -618,27 +652,37 @@ export const engagementRoutes: FastifyPluginAsync = async (app) => {
           FROM content_agg ca
           LEFT JOIN intensity_stats ist ON ca.server_user_id = ist.server_user_id AND ca.show_title = ist.show_title
           GROUP BY ca.server_user_id, ca.show_title, ist.avg_episodes_per_viewing_day
+        ),
+        with_dedup_key AS (
+          SELECT
+            sa.*,
+            COALESCE(
+              sa.canonical_show_id::text,
+              'title:' || NULLIF(LOWER(REGEXP_REPLACE(sa.show_title, '[^a-zA-Z0-9]', '', 'g')), ''),
+              'raw:' || sa.show_title
+            ) AS dedup_key
+          FROM show_agg sa
         )
         SELECT
-          sa.show_title,
-          MAX(sa.server_id::text)::uuid AS server_id,
-          MAX(sa.thumb_path) AS thumb_path,
-          MAX(sa.year) AS year,
-          SUM(sa.unique_episodes_watched)::bigint AS total_episode_views,
-          SUM(sa.total_watch_hours)::numeric AS total_watch_hours,
+          MAX(wdk.show_title) AS show_title,
+          MAX(wdk.server_id::text)::uuid AS server_id,
+          MAX(wdk.thumb_path) AS thumb_path,
+          MAX(wdk.year) AS year,
+          SUM(wdk.unique_episodes_watched)::bigint AS total_episode_views,
+          SUM(wdk.total_watch_hours)::numeric AS total_watch_hours,
           COUNT(DISTINCT su.user_id)::bigint AS unique_viewers,
-          SUM(sa.total_valid_sessions)::bigint AS valid_sessions,
-          SUM(sa.total_all_sessions)::bigint AS total_sessions,
-          ROUND(AVG(sa.unique_episodes_watched), 1) AS avg_episodes_per_viewer,
-          ROUND(AVG(sa.episode_completion_rate), 1) AS avg_completion_rate,
+          SUM(wdk.total_valid_sessions)::bigint AS valid_sessions,
+          SUM(wdk.total_all_sessions)::bigint AS total_sessions,
+          ROUND(AVG(wdk.unique_episodes_watched), 1) AS avg_episodes_per_viewer,
+          ROUND(AVG(wdk.episode_completion_rate), 1) AS avg_completion_rate,
           -- Enhanced binge score (0-100): Volume×Quality (60%) + Daily Intensity (40%)
           ROUND(
-            LEAST(AVG(sa.unique_episodes_watched) * AVG(sa.episode_completion_rate) / 100, 60) +
-            LEAST(AVG(sa.avg_episodes_per_viewing_day) * 8, 40),
+            LEAST(AVG(wdk.unique_episodes_watched) * AVG(wdk.episode_completion_rate) / 100, 60) +
+            LEAST(AVG(wdk.avg_episodes_per_viewing_day) * 8, 40),
           1) AS binge_score
-        FROM show_agg sa
-        JOIN server_users su ON su.id = sa.server_user_id
-        GROUP BY sa.show_title
+        FROM with_dedup_key wdk
+        JOIN server_users su ON su.id = wdk.server_user_id
+        GROUP BY wdk.dedup_key
         ORDER BY ${orderColumn} DESC
         LIMIT ${limit}
       `);

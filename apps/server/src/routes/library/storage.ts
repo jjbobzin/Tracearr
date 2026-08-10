@@ -15,10 +15,18 @@ import {
   TIME_MS,
   libraryStorageQuerySchema,
   type LibraryStorageQueryInput,
+  type LibraryStorageResponse,
+  type StorageHistoryPoint,
+  type StoragePrediction,
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { validateServerAccess } from '../../utils/serverFiltering.js';
-import { buildLibraryCacheKey } from './utils.js';
+import { getSetting } from '../../services/settings.js';
+import {
+  validateServerAccess,
+  resolveServerIds,
+  buildMultiServerFragment,
+} from '../../utils/serverFiltering.js';
+import { buildLibraryCacheKey, dedupedStorageBytesSql } from './utils.js';
 
 // ============================================================================
 // Linear Regression Implementation
@@ -67,41 +75,56 @@ function linearRegression(data: DataPoint[]): RegressionResult {
 }
 
 // ============================================================================
-// Response Types
+// Growth Fit Selection
 // ============================================================================
 
-interface StorageHistoryPoint {
+interface GrowthFitRow {
   day: string;
-  totalSizeBytes: string;
 }
 
-interface StoragePrediction {
-  predicted: string;
-  min: string;
-  max: string;
+interface GrowthFitSelection<T extends GrowthFitRow> {
+  fitRows: T[];
+  basis: 'current' | 'preChangeover';
+  /** Days of current-semantics data; what predictions and the countdown key on */
+  postDaysSpanned: number;
 }
 
-interface LibraryStorageResponse {
-  current: {
-    totalSizeBytes: string;
-    totalItems: number;
-    lastUpdated: string | null;
-  };
-  history: StorageHistoryPoint[];
-  growthRate: {
-    bytesPerDay: string;
-    bytesPerWeek: string;
-    bytesPerMonth: string;
-  };
-  predictions: {
-    day30: StoragePrediction | null;
-    day90: StoragePrediction | null;
-    day365: StoragePrediction | null;
-    confidence: 'high' | 'medium' | 'low' | null;
-    minDataDays: number;
-    currentDataDays: number;
-    message?: string;
-  };
+/** Inclusive calendar-day span of a sorted daily series */
+function daysSpanned(rows: GrowthFitRow[]): number {
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  if (!first || !last) return 0;
+  return (
+    Math.round((new Date(last.day).getTime() - new Date(first.day).getTime()) / TIME_MS.DAY) + 1
+  );
+}
+
+/**
+ * Pick the rows the growth regression fits. Storage totals changed meaning at
+ * mediaVersionsBackfilledAt (multi-version rollups), so a fit must never span
+ * the stamp: the one-time correction would read as growth. Prefer the
+ * post-stamp side once it has minDays of data; until then the pre-stamp side
+ * stands in for the growth rate, since its slope is internally consistent even
+ * though its levels are old-semantics. Exported for tests.
+ */
+export function selectGrowthFit<T extends GrowthFitRow>(
+  rows: T[],
+  stampMs: number | null,
+  minDays: number
+): GrowthFitSelection<T> {
+  if (stampMs === null || !rows.some((row) => new Date(row.day).getTime() < stampMs)) {
+    return { fitRows: rows, basis: 'current', postDaysSpanned: daysSpanned(rows) };
+  }
+  const postRows = rows.filter((row) => new Date(row.day).getTime() >= stampMs);
+  const postDaysSpanned = daysSpanned(postRows);
+  if (postDaysSpanned >= minDays) {
+    return { fitRows: postRows, basis: 'current', postDaysSpanned };
+  }
+  const preRows = rows.filter((row) => new Date(row.day).getTime() < stampMs);
+  if (daysSpanned(preRows) >= minDays) {
+    return { fitRows: preRows, basis: 'preChangeover', postDaysSpanned };
+  }
+  return { fitRows: postRows, basis: 'current', postDaysSpanned };
 }
 
 // ============================================================================
@@ -183,7 +206,7 @@ export const libraryStorageRoute: FastifyPluginAsync = async (app) => {
         return reply.badRequest('Invalid query parameters');
       }
 
-      const { serverId, libraryId, period, timezone } = query.data;
+      const { serverId, serverIds, libraryId, period, timezone } = query.data;
       const authUser = request.user;
       const tz = timezone ?? 'UTC';
 
@@ -195,8 +218,17 @@ export const libraryStorageRoute: FastifyPluginAsync = async (app) => {
         }
       }
 
+      const resolvedIds = resolveServerIds(authUser, serverId, serverIds, { strict: false });
+      const serverCacheSegment =
+        resolvedIds !== undefined ? resolvedIds.slice().sort().join(',') : 'all';
+
       // Build cache key with all varying params
-      const cacheKey = buildLibraryCacheKey(REDIS_KEYS.LIBRARY_STORAGE, serverId, period, tz);
+      const cacheKey = buildLibraryCacheKey(
+        REDIS_KEYS.LIBRARY_STORAGE,
+        serverCacheSegment,
+        period,
+        tz
+      );
       const fullCacheKey = libraryId ? `${cacheKey}:${libraryId}` : cacheKey;
 
       // Try cache first
@@ -214,14 +246,7 @@ export const libraryStorageRoute: FastifyPluginAsync = async (app) => {
       const endDate = new Date();
 
       // Build server filter for library_stats_daily
-      const serverFilter = serverId
-        ? sql`AND lsd.server_id = ${serverId}::uuid`
-        : authUser.serverIds?.length
-          ? sql`AND lsd.server_id IN (${sql.join(
-              authUser.serverIds.map((id: string) => sql`${id}::uuid`),
-              sql`, `
-            )})`
-          : sql``;
+      const serverFilter = buildMultiServerFragment(resolvedIds, 'lsd.server_id');
 
       // Optional library filter
       const libraryFilter = libraryId ? sql`AND lsd.library_id = ${libraryId}` : sql``;
@@ -315,30 +340,51 @@ export const libraryStorageRoute: FastifyPluginAsync = async (app) => {
       // Total items comes from the latest snapshot's cumulative total
       const totalItems = latestRow?.total_items ?? 0;
 
+      // Headline total is mirror-deduped live (#478): per-library snapshot
+      // sums double-count the same file indexed by several libraries. The
+      // trend series above keeps per-library truth; history cannot be
+      // deduped retroactively.
+      const dedupedResult = await db.execute(sql`
+        SELECT ${dedupedStorageBytesSql(
+          buildMultiServerFragment(resolvedIds, 'li.server_id'),
+          libraryId ? sql`AND li.library_id = ${libraryId}` : sql``
+        )}::bigint AS total
+      `);
+      const dedupedBytes = (dedupedResult.rows[0] as { total: string } | undefined)?.total;
+
       const current = {
-        totalSizeBytes: latestRow?.total_size_bytes ?? '0',
+        totalSizeBytes: dedupedBytes ?? latestRow?.total_size_bytes ?? '0',
         totalItems,
         lastUpdated: latestRow?.day ?? null,
       };
 
       // Calculate growth rate using linear regression
-      // Use actual day offsets from first data point to handle gaps correctly
-      const firstRow = rows[0];
+      // Use actual day offsets from first data point to handle gaps correctly.
+      // The fit never spans the multi-version changeover (see selectGrowthFit);
+      // the displayed history keeps the full range either way. Once the
+      // snapshot normalization has regenerated pre-changeover history in
+      // current semantics there is no step left to guard, so the whole
+      // window fits.
+      const versionsStamp = await getSetting('mediaVersionsBackfilledAt');
+      const normalizedAt = await getSetting('snapshotsNormalizedAt');
+      const stampMs =
+        versionsStamp && normalizedAt === null ? new Date(versionsStamp).getTime() : null;
+      const MIN_DATA_DAYS = 7;
+      const fit = selectGrowthFit(rows, stampMs, MIN_DATA_DAYS);
+      const firstRow = fit.fitRows[0];
       const firstDate = firstRow ? new Date(firstRow.day).getTime() : 0;
-      const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-      const dataPoints: DataPoint[] = rows.map((row) => ({
-        x: Math.round((new Date(row.day).getTime() - firstDate) / MS_PER_DAY),
+      const dataPoints: DataPoint[] = fit.fitRows.map((row) => ({
+        x: Math.round((new Date(row.day).getTime() - firstDate) / TIME_MS.DAY),
         y: Number(row.total_size_bytes),
       }));
 
       const regression = linearRegression(dataPoints);
 
       // Calculate actual days spanned (not row count) for data quality checks
-      const MIN_DATA_DAYS = 7;
       const lastDataPoint = dataPoints[dataPoints.length - 1];
       const lastDayOffset = lastDataPoint?.x ?? 0;
-      const actualDaysSpanned = lastDayOffset + 1; // +1 because day 0 counts as 1 day
+      const fitDays = lastDayOffset + 1; // +1 because day 0 counts as 1 day
 
       // slope is bytes per day (x is now actual days elapsed)
       const bytesPerDay = regression.slope;
@@ -346,19 +392,24 @@ export const libraryStorageRoute: FastifyPluginAsync = async (app) => {
         bytesPerDay: Math.round(bytesPerDay).toString(),
         bytesPerWeek: Math.round(bytesPerDay * 7).toString(),
         bytesPerMonth: Math.round(bytesPerDay * 30).toString(),
+        fitDays,
+        basis: fit.basis,
       };
 
+      // Predictions extrapolate absolute levels, so unlike the growth slope
+      // they can never borrow the pre-changeover side: its levels are
+      // old-semantics. They wait for postDaysSpanned to reach the minimum.
       let predictions: LibraryStorageResponse['predictions'];
 
-      if (actualDaysSpanned < MIN_DATA_DAYS) {
+      if (fit.basis !== 'current' || fit.postDaysSpanned < MIN_DATA_DAYS) {
         predictions = {
           day30: null,
           day90: null,
           day365: null,
           confidence: null,
           minDataDays: MIN_DATA_DAYS,
-          currentDataDays: actualDaysSpanned,
-          message: `Predictions require at least ${MIN_DATA_DAYS} days of data. Currently have ${actualDaysSpanned} days.`,
+          currentDataDays: fit.postDaysSpanned,
+          message: `Predictions require at least ${MIN_DATA_DAYS} days of data. Currently have ${fit.postDaysSpanned} days.`,
         };
       } else {
         predictions = {
@@ -367,7 +418,7 @@ export const libraryStorageRoute: FastifyPluginAsync = async (app) => {
           day365: calculatePrediction(regression, 365, lastDayOffset),
           confidence: getConfidenceLevel(regression.r2),
           minDataDays: MIN_DATA_DAYS,
-          currentDataDays: actualDaysSpanned,
+          currentDataDays: fit.postDaysSpanned,
         };
       }
 

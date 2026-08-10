@@ -87,6 +87,14 @@ export const maintenanceRoutes: FastifyPluginAsync = async (app) => {
             'Creates historical library snapshots from library_items.created_at for proper deletion/upgrade tracking. ' +
             'Run this once after upgrading to enable accurate Storage Trend and Quality Evolution charts.',
         },
+        {
+          type: 'backfill_session_identity',
+          category: 'backfill',
+          name: 'Backfill Media Identity',
+          description:
+            'Stamps canonical media identity onto history sessions by matching them to your library. ' +
+            'Run this once after upgrading so older sessions link to the same media records as new ones.',
+        },
         // Cleanup jobs - database maintenance and optimization
         {
           type: 'rebuild_timescale_views',
@@ -150,8 +158,10 @@ export const maintenanceRoutes: FastifyPluginAsync = async (app) => {
         'normalize_resolutions',
         'backfill_user_dates',
         'backfill_library_snapshots',
+        'normalize_library_snapshots',
         'cleanup_old_chunks',
         'repair_corrupted_chunks',
+        'backfill_session_identity',
       ];
       if (!validTypes.includes(type as MaintenanceJobType)) {
         return reply.badRequest(`Invalid job type: ${type}`);

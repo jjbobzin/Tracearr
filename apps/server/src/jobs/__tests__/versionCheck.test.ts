@@ -381,6 +381,19 @@ describe('findBestUpdateForPrerelease', () => {
     expect(result?.tag_name).toBe('v1.4.1-beta.18');
   });
 
+  it('should offer the newest prerelease when a new beta line exists past the latest stable', () => {
+    // User on v1.5.0-beta.7 with 2.0.0-beta.1 released: the newest release
+    // wins, not the 1.5.0 stable that merely outranks the user's own tag
+    const releases = [
+      mockRelease('v2.0.0-beta.1', true),
+      mockRelease('v1.5.0', false),
+      mockRelease('v1.5.0-beta.7', true),
+    ];
+
+    const result = findBestUpdateForPrerelease('v1.5.0-beta.7', releases);
+    expect(result?.tag_name).toBe('v2.0.0-beta.1');
+  });
+
   it('should return null when already on latest', () => {
     const releases = [mockRelease('v1.4.1-beta.17', true), mockRelease('v1.4.0', false)];
 

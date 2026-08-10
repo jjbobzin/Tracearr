@@ -32,20 +32,16 @@ export default defineConfig({
     ],
     exclude: ['**/node_modules/**', '**/dist/**'],
     setupFiles: ['./src/test/setup.integration.ts'],
+    globalSetup: ['./src/test/globalSetup.integration.ts'],
     testTimeout: 30000, // Longer timeout for database operations
     hookTimeout: 30000,
     clearMocks: true,
     restoreMocks: true,
-    // Run tests sequentially to avoid database conflicts
-    // fileParallelism: false ensures test FILES run one at a time
-    // singleFork: true ensures all tests share the same process
-    fileParallelism: false,
+    // Each worker runs against its own template-copied database and redis
+    // DB index (see globalSetup.integration.ts / setup.integration.ts),
+    // so test files can run across multiple worker processes.
     pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true,
-      },
-    },
+    maxWorkers: 7,
     reporters: isCI ? ['default', 'github-actions'] : ['default'],
     // Coverage for integration tests
     coverage: {

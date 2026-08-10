@@ -607,3 +607,98 @@ describe('Session Termination Schemas', () => {
     });
   });
 });
+
+describe('ruleConditionsSchema - inactivity field compatibility', () => {
+  const group = (conditions: unknown[]) => ({ conditions });
+
+  it('accepts inactive_days combined with user-level fields', async () => {
+    const { ruleConditionsSchema } = await import('@tracearr/shared');
+    const result = ruleConditionsSchema.safeParse({
+      groups: [
+        group([{ field: 'inactive_days', operator: 'gte', value: 30 }]),
+        group([{ field: 'server_id', operator: 'eq', value: randomUUID() }]),
+        group([{ field: 'trust_score', operator: 'lt', value: 50 }]),
+        group([{ field: 'account_age_days', operator: 'gte', value: 90 }]),
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects inactive_days combined with session-only fields', async () => {
+    const { ruleConditionsSchema } = await import('@tracearr/shared');
+    const result = ruleConditionsSchema.safeParse({
+      groups: [
+        group([{ field: 'inactive_days', operator: 'gte', value: 30 }]),
+        group([{ field: 'is_transcoding', operator: 'eq', value: true }]),
+      ],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('inactive_days');
+    }
+  });
+
+  it('leaves rules without inactive_days unrestricted', async () => {
+    const { ruleConditionsSchema } = await import('@tracearr/shared');
+    const result = ruleConditionsSchema.safeParse({
+      groups: [
+        group([{ field: 'is_transcoding', operator: 'eq', value: true }]),
+        group([{ field: 'concurrent_streams', operator: 'gt', value: 2 }]),
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('rule V2 schemas - server scope vs cross-server enforcement', () => {
+  const baseRule = {
+    name: 'Concurrency cap',
+    conditions: {
+      groups: [{ conditions: [{ field: 'concurrent_streams', operator: 'gt', value: 3 }] }],
+    },
+    actions: { actions: [] },
+  };
+
+  it('rejects a server-scoped rule that enforces across servers', async () => {
+    const { createRuleV2Schema, RULE_CROSS_SERVER_ENFORCEMENT_ERROR_MESSAGE } =
+      await import('@tracearr/shared');
+    const result = createRuleV2Schema.safeParse({
+      ...baseRule,
+      serverId: randomUUID(),
+      enforceAcrossServers: true,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toBe(RULE_CROSS_SERVER_ENFORCEMENT_ERROR_MESSAGE);
+    }
+  });
+
+  it('accepts a server-scoped rule without cross-server enforcement', async () => {
+    const { createRuleV2Schema } = await import('@tracearr/shared');
+    const result = createRuleV2Schema.safeParse({
+      ...baseRule,
+      serverId: randomUUID(),
+      enforceAcrossServers: false,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts cross-server enforcement on a person-scoped rule', async () => {
+    const { createRuleV2Schema } = await import('@tracearr/shared');
+    const result = createRuleV2Schema.safeParse({
+      ...baseRule,
+      userId: randomUUID(),
+      enforceAcrossServers: true,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects the combination on partial updates too', async () => {
+    const { updateRuleV2Schema } = await import('@tracearr/shared');
+    const result = updateRuleV2Schema.safeParse({
+      serverId: randomUUID(),
+      enforceAcrossServers: true,
+    });
+    expect(result.success).toBe(false);
+  });
+});

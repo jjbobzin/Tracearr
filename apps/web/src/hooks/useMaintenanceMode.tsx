@@ -10,12 +10,15 @@ import {
 import type { RestoreProgress } from '@tracearr/shared';
 import { BASE_PATH } from '@/lib/basePath';
 
+type InitStep = 'migrations' | 'timescale' | 'services';
+
 interface HealthResponse {
   mode?: string;
   wasReady?: boolean;
   db?: boolean;
   redis?: boolean;
   restore?: RestoreProgress;
+  initStep?: InitStep | null;
 }
 
 interface MaintenanceState {
@@ -26,6 +29,9 @@ interface MaintenanceState {
   redis: boolean;
   /** Present when a database restore is in progress */
   restore: RestoreProgress | null;
+  /** Startup phase currently applying; migrations and timescale phases must
+   * not be interrupted by a restart */
+  initStep: InitStep | null;
 }
 
 const MAINTENANCE_POLL_MS = 5000;
@@ -38,6 +44,7 @@ const MaintenanceContext = createContext<MaintenanceState>({
   db: true,
   redis: true,
   restore: null,
+  initStep: null,
 });
 
 export function MaintenanceProvider({ children }: { children: ReactNode }) {
@@ -47,6 +54,7 @@ export function MaintenanceProvider({ children }: { children: ReactNode }) {
     db: true,
     redis: true,
     restore: null,
+    initStep: null,
   });
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sawRestoreRef = useRef(false);
@@ -76,15 +84,19 @@ export function MaintenanceProvider({ children }: { children: ReactNode }) {
         db: data.db ?? false,
         redis: data.redis ?? false,
         restore: data.restore ?? null,
+        initStep: data.initStep ?? null,
       });
     } catch {
-      // Server completely unreachable
+      // Server completely unreachable. Clear initStep too: keeping a stale
+      // 'migrations'/'timescale' value would leave the do-not-restart warning
+      // on screen for a process that is already dead
       setState((prev) => ({
         ...prev,
         isInMaintenance: true,
         db: false,
         redis: false,
         restore: null,
+        initStep: null,
       }));
     }
   }, []);

@@ -23,6 +23,14 @@ export interface SessionData {
   year?: number | null;
   thumbPath?: string | null;
   ratingKey?: string | null;
+  parentRatingKey?: string | null;
+  grandparentRatingKey?: string | null;
+  mediaId?: string | null;
+  showMediaId?: string | null;
+  imdbId?: string | null;
+  tmdbId?: number | null;
+  tvdbId?: number | null;
+  shortSession?: boolean;
   externalSessionId?: string | null;
   startedAt?: Date;
   stoppedAt?: Date | null;
@@ -89,6 +97,14 @@ export function buildSession(overrides: SessionData): Required<SessionData> {
     year: overrides.year ?? 2024,
     thumbPath: overrides.thumbPath ?? null,
     ratingKey: overrides.ratingKey ?? `ratingkey-${index}`,
+    parentRatingKey: overrides.parentRatingKey ?? null,
+    grandparentRatingKey: overrides.grandparentRatingKey ?? null,
+    mediaId: overrides.mediaId ?? null,
+    showMediaId: overrides.showMediaId ?? null,
+    imdbId: overrides.imdbId ?? null,
+    tmdbId: overrides.tmdbId ?? null,
+    tvdbId: overrides.tvdbId ?? null,
+    shortSession: overrides.shortSession ?? false,
     externalSessionId: overrides.externalSessionId ?? `ext-session-${index}`,
     startedAt: overrides.startedAt ?? now,
     stoppedAt: overrides.stoppedAt ?? null,
@@ -130,9 +146,11 @@ export async function createTestSession(data: SessionData): Promise<CreatedSessi
     INSERT INTO sessions (
       id, server_id, server_user_id, session_key, state, media_type,
       media_title, grandparent_title, season_number, episode_number,
-      year, thumb_path, rating_key, external_session_id,
+      year, thumb_path, rating_key, parent_rating_key, grandparent_rating_key,
+      media_id, show_media_id, imdb_id, tmdb_id, tvdb_id,
+      external_session_id,
       started_at, stopped_at, last_seen_at, duration_ms, total_duration_ms, progress_ms,
-      last_paused_at, paused_duration_ms, reference_id, watched,
+      last_paused_at, paused_duration_ms, reference_id, watched, short_session,
       ip_address, geo_location_name, geo_city, geo_region, geo_country, geo_lat, geo_lon,
       geo_asn_number, geo_asn_organization,
       player_name, device_id, product, device, platform,
@@ -151,6 +169,13 @@ export async function createTestSession(data: SessionData): Promise<CreatedSessi
       ${fullData.year ?? 'NULL'},
       ${fullData.thumbPath ? `'${fullData.thumbPath}'` : 'NULL'},
       ${fullData.ratingKey ? `'${fullData.ratingKey}'` : 'NULL'},
+      ${fullData.parentRatingKey ? `'${fullData.parentRatingKey}'` : 'NULL'},
+      ${fullData.grandparentRatingKey ? `'${fullData.grandparentRatingKey}'` : 'NULL'},
+      ${fullData.mediaId ? `'${fullData.mediaId}'` : 'NULL'},
+      ${fullData.showMediaId ? `'${fullData.showMediaId}'` : 'NULL'},
+      ${fullData.imdbId ? `'${fullData.imdbId}'` : 'NULL'},
+      ${fullData.tmdbId ?? 'NULL'},
+      ${fullData.tvdbId ?? 'NULL'},
       ${fullData.externalSessionId ? `'${fullData.externalSessionId}'` : 'NULL'},
       '${fullData.startedAt.toISOString()}',
       ${fullData.stoppedAt ? `'${fullData.stoppedAt.toISOString()}'` : 'NULL'},
@@ -162,6 +187,7 @@ export async function createTestSession(data: SessionData): Promise<CreatedSessi
       ${fullData.pausedDurationMs},
       ${fullData.referenceId ? `'${fullData.referenceId}'` : 'NULL'},
       ${fullData.watched},
+      ${fullData.shortSession},
       '${fullData.ipAddress}',
       ${fullData.geoLocationName ? `'${fullData.geoLocationName}'` : 'NULL'},
       ${fullData.geoCity ? `'${fullData.geoCity}'` : 'NULL'},

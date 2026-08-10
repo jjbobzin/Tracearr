@@ -47,6 +47,14 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     year: 2024,
     thumbPath: null,
     ratingKey: 'rk-1',
+    serverVersionKey: null,
+    parentRatingKey: null,
+    grandparentRatingKey: null,
+    mediaId: null,
+    showMediaId: null,
+    imdbId: null,
+    tmdbId: null,
+    tvdbId: null,
     externalSessionId: 'ext-1',
     startedAt: new Date(),
     stoppedAt: null,
@@ -113,7 +121,6 @@ function createMockServerUser(overrides: Partial<ServerUser> = {}): ServerUser {
     email: 'test@example.com',
     thumbUrl: null,
     isServerAdmin: false,
-    sessionCount: 10,
     joinedAt: new Date(),
     lastActivityAt: new Date(),
     trustScore: 100,
@@ -308,6 +315,68 @@ describe('Helper Functions', () => {
     it('keeps tv devices as tv even though chromecast/webos contain browser substrings', () => {
       expect(normalizeDeviceType(null, 'chromecast')).toBe('tv');
       expect(normalizeDeviceType(null, 'webos')).toBe('tv');
+    });
+
+    // JF/Emby DeviceName lands in playerName; normalizeClient synthesizes
+    // device/platform for those sessions, so playerName must win when it
+    // carries the stronger signal. Shapes below mirror what the pipeline
+    // stores, not nulls it never produces.
+    it('classifies jellyfin/emby sessions from playerName over synthesized fields', () => {
+      expect(normalizeDeviceType('iPhone', 'iOS', 'Jellyfin iOS', 'iPad')).toBe('tablet');
+      expect(normalizeDeviceType('Jellyfin', 'Jellyfin', 'Jellyfin', 'Living Room TV')).toBe('tv');
+      expect(
+        normalizeDeviceType('Jellyfin', 'Jellyfin', 'Jellyfin Media Player', 'DESKTOP-ABC123')
+      ).toBe('desktop');
+      expect(normalizeDeviceType(null, null, 'Emby Server DLNA', '49" Odyssey OLED G9')).toBe('tv');
+    });
+
+    it('classifies known desktop-only clients as desktop without an OS signal', () => {
+      expect(normalizeDeviceType(null, null, 'Jellyfin Media Player', null)).toBe('desktop');
+      expect(normalizeDeviceType(null, null, 'Emby Theater', null)).toBe('desktop');
+    });
+
+    it('matches tv in playerName on word boundaries so hostnames stay unclassified', () => {
+      expect(normalizeDeviceType(null, null, null, 'MATVEY-PC')).toBe('unknown');
+      expect(normalizeDeviceType(null, null, null, 'Living Room TV')).toBe('tv');
+      expect(normalizeDeviceType(null, null, 'Jellyfin Android TV', 'SHIELD Android TV')).toBe(
+        'tv'
+      );
+    });
+
+    it('device_type evaluator drops playerName on plex and keeps it on jellyfin', () => {
+      const evaluator = evaluatorRegistry.device_type;
+
+      const plexSession = createMockSession({
+        device: 'Windows',
+        platform: 'Windows',
+        product: 'Plex for Windows',
+        playerName: 'Living Room TV PC',
+      });
+      const plexResult = evaluator(
+        createTestContext({
+          session: plexSession,
+          server: createMockServer({ type: 'plex' }),
+        }),
+        createCondition({ field: 'device_type', operator: 'eq', value: 'desktop' })
+      ) as EvaluatorResult;
+      expect(matched(plexResult)).toBe(true);
+      expect(plexResult.actual).toBe('desktop');
+
+      const jellyfinSession = createMockSession({
+        device: 'iPhone',
+        platform: 'iOS',
+        product: 'Jellyfin iOS',
+        playerName: 'iPad',
+      });
+      const jellyfinResult = evaluator(
+        createTestContext({
+          session: jellyfinSession,
+          server: createMockServer({ type: 'jellyfin' }),
+        }),
+        createCondition({ field: 'device_type', operator: 'eq', value: 'tablet' })
+      ) as EvaluatorResult;
+      expect(matched(jellyfinResult)).toBe(true);
+      expect(jellyfinResult.actual).toBe('tablet');
     });
   });
 
@@ -1043,6 +1112,94 @@ describe('Session Behavior Evaluators', () => {
           )
         )
       ).toBe(true);
+    });
+
+    it('excludes LAN addresses from the count and the evidence', () => {
+      const now = new Date();
+      const mkSession = (id: string, ipAddress: string) =>
+        createMockSession({ id, serverUserId: 'user-1', startedAt: now, ipAddress });
+
+      const ctx = createTestContext({
+        session: mkSession('s1', '192.168.1.10'),
+        serverUser: createMockServerUser({ id: 'user-1' }),
+        recentSessions: [
+          mkSession('s1', '192.168.1.10'),
+          mkSession('s2', '10.0.0.5'),
+          mkSession('s3', '1.1.1.1'),
+          mkSession('s4', '2.2.2.2'),
+        ],
+      });
+
+      const result = evaluatorRegistry.unique_ips_in_window(
+        ctx,
+        createCondition({
+          field: 'unique_ips_in_window',
+          operator: 'gte',
+          value: 2,
+          params: { window_hours: 24 },
+        })
+      ) as EvaluatorResult;
+
+      expect(matched(result)).toBe(true);
+      expect(result.actual).toBe(2);
+      expect(result.details?.ips).toEqual(expect.arrayContaining(['1.1.1.1', '2.2.2.2']));
+      expect(result.details?.ips).toHaveLength(2);
+    });
+
+    it('counts zero for a LAN-only household', () => {
+      const now = new Date();
+      const mkSession = (id: string, ipAddress: string) =>
+        createMockSession({ id, serverUserId: 'user-1', startedAt: now, ipAddress });
+
+      const ctx = createTestContext({
+        session: mkSession('s1', '192.168.1.10'),
+        serverUser: createMockServerUser({ id: 'user-1' }),
+        recentSessions: [
+          mkSession('s1', '192.168.1.10'),
+          mkSession('s2', '192.168.1.20'),
+          mkSession('s3', '10.0.0.5'),
+        ],
+      });
+
+      const result = evaluatorRegistry.unique_ips_in_window(
+        ctx,
+        createCondition({
+          field: 'unique_ips_in_window',
+          operator: 'gte',
+          value: 2,
+          params: { window_hours: 24 },
+        })
+      ) as EvaluatorResult;
+
+      expect(matched(result)).toBe(false);
+      expect(result.actual).toBe(0);
+      expect(result.details?.ips).toEqual([]);
+    });
+
+    it('unmaps hex-form v4-mapped addresses before the LAN check', () => {
+      const now = new Date();
+      const mkSession = (id: string, ipAddress: string) =>
+        createMockSession({ id, serverUserId: 'user-1', startedAt: now, ipAddress });
+
+      // ::ffff:c0a8:10a is 192.168.1.10; without unmapping it would count as public
+      const ctx = createTestContext({
+        session: mkSession('s1', '::ffff:c0a8:10a'),
+        serverUser: createMockServerUser({ id: 'user-1' }),
+        recentSessions: [mkSession('s1', '::ffff:c0a8:10a'), mkSession('s2', '1.1.1.1')],
+      });
+
+      const result = evaluatorRegistry.unique_ips_in_window(
+        ctx,
+        createCondition({
+          field: 'unique_ips_in_window',
+          operator: 'gte',
+          value: 2,
+          params: { window_hours: 24 },
+        })
+      ) as EvaluatorResult;
+
+      expect(matched(result)).toBe(false);
+      expect(result.actual).toBe(1);
     });
 
     it('deduplicates same IPs', () => {
@@ -1832,6 +1989,66 @@ describe('Stream Quality Evaluators', () => {
       ).toBe(false);
     });
 
+    describe('neq / in / not_in operators', () => {
+      const evaluate = (
+        sessionOverrides: Parameters<typeof createMockSession>[0],
+        operator: 'eq' | 'neq' | 'in' | 'not_in',
+        value: string | string[]
+      ) =>
+        matched(
+          evaluatorRegistry.is_transcoding(
+            createTestContext({ session: createMockSession(sessionOverrides) }),
+            createCondition({ field: 'is_transcoding', operator, value })
+          )
+        );
+
+      const videoTranscoding = {
+        isTranscode: true,
+        videoDecision: 'transcode',
+        audioDecision: 'copy',
+      };
+      const audioTranscoding = {
+        isTranscode: true,
+        videoDecision: 'copy',
+        audioDecision: 'transcode',
+      };
+      const directPlay = {
+        isTranscode: false,
+        videoDecision: 'directplay',
+        audioDecision: 'directplay',
+      };
+
+      it('neq "video" does not fire while video IS transcoding', () => {
+        expect(evaluate(videoTranscoding, 'neq', 'video')).toBe(false);
+      });
+
+      it('neq "video" fires when video is not transcoding', () => {
+        expect(evaluate(audioTranscoding, 'neq', 'video')).toBe(true);
+      });
+
+      it('neq "video" fires on direct play with null videoDecision', () => {
+        expect(
+          evaluate({ isTranscode: false, videoDecision: null, audioDecision: null }, 'neq', 'video')
+        ).toBe(true);
+      });
+
+      it('not_in ["video"] mirrors neq instead of always firing', () => {
+        expect(evaluate(videoTranscoding, 'not_in', ['video'])).toBe(false);
+        expect(evaluate(audioTranscoding, 'not_in', ['video'])).toBe(true);
+      });
+
+      it('in ["video","audio"] fires when any listed stream transcodes', () => {
+        expect(evaluate(audioTranscoding, 'in', ['video', 'audio'])).toBe(true);
+        expect(evaluate(directPlay, 'in', ['video', 'audio'])).toBe(false);
+      });
+
+      it('unrecognized values never match under any operator', () => {
+        expect(evaluate(videoTranscoding, 'eq', 'transcode')).toBe(false);
+        expect(evaluate(videoTranscoding, 'neq', 'transcode')).toBe(false);
+        expect(evaluate(videoTranscoding, 'not_in', ['transcode'])).toBe(false);
+      });
+    });
+
     // Backwards compatibility tests
     it('backwards compatibility: boolean true behaves like video_or_audio', () => {
       const session = createMockSession({ isTranscode: true });
@@ -1914,10 +2131,11 @@ describe('Stream Quality Evaluators', () => {
   });
 
   describe('source_bitrate_mbps', () => {
-    it('evaluates source bitrate in Mbps', () => {
+    it('converts kbps-stored bitrates to Mbps', () => {
+      // Parsers store kbps for all three server types (see mediaServer/types.ts)
       const session = createMockSession({
-        bitrate: 25_000_000,
-        sourceVideoDetails: { bitrate: 25_000_000 },
+        bitrate: 25_000,
+        sourceVideoDetails: { bitrate: 25_000 },
       });
       const ctx = createTestContext({ session });
 
@@ -1938,6 +2156,35 @@ describe('Stream Quality Evaluators', () => {
           )
         )
       ).toBe(true);
+      const result = evaluator(
+        ctx,
+        createCondition({ field: 'source_bitrate_mbps', operator: 'gt', value: 20 })
+      );
+      if (result instanceof Promise) throw new Error('Use await for async evaluators');
+      expect(result.actual).toBe(25);
+    });
+
+    it('matches a 20 Mbps stream against thresholds above 1 Mbps', () => {
+      const session = createMockSession({ bitrate: 20_000 });
+      const ctx = createTestContext({ session });
+
+      const evaluator = evaluatorRegistry.source_bitrate_mbps;
+      expect(
+        matched(
+          evaluator(
+            ctx,
+            createCondition({ field: 'source_bitrate_mbps', operator: 'gt', value: 10 })
+          )
+        )
+      ).toBe(true);
+      expect(
+        matched(
+          evaluator(
+            ctx,
+            createCondition({ field: 'source_bitrate_mbps', operator: 'lt', value: 10 })
+          )
+        )
+      ).toBe(false);
     });
   });
 });
@@ -1971,6 +2218,38 @@ describe('User Attribute Evaluators', () => {
           )
         )
       ).toBe(true);
+    });
+
+    it("matches any of a merged person's accounts against the stored representative id", () => {
+      const evaluator = evaluatorRegistry.user_id;
+      // The builder stored the Plex account id; the trigger is the same
+      // person's Jellyfin account.
+      const ctx = createTestContext({
+        serverUser: createMockServerUser({ id: 'su-jellyfin' }),
+        identityServerUserIds: ['su-plex', 'su-jellyfin'],
+      });
+
+      expect(
+        matched(
+          evaluator(ctx, createCondition({ field: 'user_id', operator: 'eq', value: 'su-plex' }))
+        )
+      ).toBe(true);
+      expect(
+        matched(
+          evaluator(
+            ctx,
+            createCondition({ field: 'user_id', operator: 'not_in', value: ['su-plex'] })
+          )
+        )
+      ).toBe(false);
+      expect(
+        matched(
+          evaluator(
+            ctx,
+            createCondition({ field: 'user_id', operator: 'eq', value: 'su-someone-else' })
+          )
+        )
+      ).toBe(false);
     });
 
     it('returns identityName as actual when available', () => {
@@ -2075,6 +2354,26 @@ describe('Device/Client Evaluators', () => {
             ctx,
             createCondition({ field: 'device_type', operator: 'not_in', value: ['tv', 'desktop'] })
           )
+        )
+      ).toBe(true);
+    });
+
+    it('matches jellyfin sessions whose only device signal is playerName', () => {
+      const session = createMockSession({
+        device: null,
+        platform: null,
+        product: 'Jellyfin iOS',
+        playerName: 'iPad',
+      });
+      const ctx = createTestContext({
+        session,
+        server: createMockServer({ type: 'jellyfin' }),
+      });
+
+      const evaluator = evaluatorRegistry.device_type;
+      expect(
+        matched(
+          evaluator(ctx, createCondition({ field: 'device_type', operator: 'eq', value: 'tablet' }))
         )
       ).toBe(true);
     });
@@ -2198,6 +2497,74 @@ describe('Network/Location Evaluators', () => {
           )
         )
       ).toBe(true);
+    });
+
+    it('normalizes full country names before comparing', () => {
+      // geoCountry stores geo.countryCode ?? geo.country, so a missing code
+      // lands as "United States" and must still equal a 'US' rule value
+      const session = createMockSession({ geoCountry: 'United States' });
+      const ctx = createTestContext({ session });
+
+      const evaluator = evaluatorRegistry.country;
+      expect(
+        matched(evaluator(ctx, createCondition({ field: 'country', operator: 'eq', value: 'US' })))
+      ).toBe(true);
+      expect(
+        matched(evaluator(ctx, createCondition({ field: 'country', operator: 'neq', value: 'US' })))
+      ).toBe(false);
+    });
+
+    it('normalizes lowercase codes', () => {
+      const session = createMockSession({ geoCountry: 'us' });
+      const ctx = createTestContext({ session });
+
+      const evaluator = evaluatorRegistry.country;
+      expect(
+        matched(evaluator(ctx, createCondition({ field: 'country', operator: 'eq', value: 'US' })))
+      ).toBe(true);
+    });
+
+    it('normalizes country names in the condition value', () => {
+      const session = createMockSession({ geoCountry: 'DE' });
+      const ctx = createTestContext({ session });
+
+      const evaluator = evaluatorRegistry.country;
+      expect(
+        matched(
+          evaluator(
+            ctx,
+            createCondition({ field: 'country', operator: 'in', value: ['Germany', 'France'] })
+          )
+        )
+      ).toBe(true);
+    });
+
+    it('never matches local network sessions', () => {
+      const session = createMockSession({ geoCountry: 'Local Network' });
+      const ctx = createTestContext({ session });
+
+      const evaluator = evaluatorRegistry.country;
+      expect(
+        matched(evaluator(ctx, createCondition({ field: 'country', operator: 'neq', value: 'US' })))
+      ).toBe(false);
+      expect(
+        matched(
+          evaluator(
+            ctx,
+            createCondition({ field: 'country', operator: 'not_in', value: ['US', 'CA'] })
+          )
+        )
+      ).toBe(false);
+    });
+
+    it('never matches sessions without geo data', () => {
+      const session = createMockSession({ geoCountry: null });
+      const ctx = createTestContext({ session });
+
+      const evaluator = evaluatorRegistry.country;
+      expect(
+        matched(evaluator(ctx, createCondition({ field: 'country', operator: 'neq', value: 'US' })))
+      ).toBe(false);
     });
   });
 
@@ -2457,7 +2824,6 @@ describe('Evaluator Registry', () => {
       'country',
       'ip_in_range',
       'server_id',
-      'library_id',
       'media_type',
     ];
 
@@ -2465,5 +2831,85 @@ describe('Evaluator Registry', () => {
       expect(evaluatorRegistry).toHaveProperty(field);
       expect(typeof evaluatorRegistry[field as keyof typeof evaluatorRegistry]).toBe('function');
     }
+  });
+});
+
+describe('Rule server scope in identity aggregation', () => {
+  function scopedContext(ruleServerId: string | null) {
+    const server = createMockServer();
+    const serverUser = createMockServerUser({ id: 'su-plex', serverId: server.id });
+    const session = createMockSession({
+      id: 's-plex',
+      serverId: server.id,
+      serverUserId: 'su-plex',
+      deviceId: 'device-plex',
+      ipAddress: '1.1.1.1',
+    });
+    const jellyfinSession = createMockSession({
+      id: 's-jf',
+      serverId: 'server-2',
+      serverUserId: 'su-jf',
+      deviceId: 'device-jf',
+      ipAddress: '2.2.2.2',
+      startedAt: new Date(),
+    });
+
+    return createTestContext({
+      session,
+      serverUser,
+      rule: createMockRule({ serverId: ruleServerId }),
+      identityServerUserIds: ['su-plex', 'su-jf'],
+      activeSessions: [session, jellyfinSession],
+      recentSessions: [session, jellyfinSession],
+    });
+  }
+
+  function sync(result: EvaluatorResult | Promise<EvaluatorResult>): EvaluatorResult {
+    if (result instanceof Promise) throw new Error('Use await for async evaluators');
+    return result;
+  }
+
+  it('excludes other-server sessions from aggregates for a server-scoped rule', () => {
+    const ctx = scopedContext('server-1');
+
+    const concurrent = sync(
+      evaluatorRegistry.concurrent_streams(
+        ctx,
+        createCondition({ field: 'concurrent_streams', operator: 'gte', value: 2 })
+      )
+    );
+    expect(concurrent.matched).toBe(false);
+    expect(concurrent.actual).toBe(1);
+
+    const uniqueIps = sync(
+      evaluatorRegistry.unique_ips_in_window(
+        ctx,
+        createCondition({ field: 'unique_ips_in_window', operator: 'gte', value: 2 })
+      )
+    );
+    expect(uniqueIps.matched).toBe(false);
+    expect(uniqueIps.actual).toBe(1);
+  });
+
+  it('still aggregates across servers for a global rule', () => {
+    const ctx = scopedContext(null);
+
+    const concurrent = sync(
+      evaluatorRegistry.concurrent_streams(
+        ctx,
+        createCondition({ field: 'concurrent_streams', operator: 'gte', value: 2 })
+      )
+    );
+    expect(concurrent.matched).toBe(true);
+    expect(concurrent.actual).toBe(2);
+
+    const uniqueIps = sync(
+      evaluatorRegistry.unique_ips_in_window(
+        ctx,
+        createCondition({ field: 'unique_ips_in_window', operator: 'gte', value: 2 })
+      )
+    );
+    expect(uniqueIps.matched).toBe(true);
+    expect(uniqueIps.actual).toBe(2);
   });
 });

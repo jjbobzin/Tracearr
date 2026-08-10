@@ -10,6 +10,7 @@ import type { AppStateStatus } from 'react-native';
 import { useQueryClient } from '@tanstack/react-query';
 import { useShallow } from 'zustand/react/shallow';
 import * as Notifications from 'expo-notifications';
+import { ALL_SERVERS } from '@tracearr/shared';
 import { useAuthStateStore, getAccessToken } from '../lib/authStateStore';
 import { api, refreshAccessToken } from '../lib/api';
 import type {
@@ -25,6 +26,7 @@ interface SocketContextValue {
   isConnected: boolean;
 }
 
+import { queryKeys } from '@/lib/queryKeys';
 const SocketContext = createContext<SocketContextValue>({
   socket: null,
   isConnected: false,
@@ -112,9 +114,9 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       // are never pushed retroactively, so resync the core live-data caches
       // on every connect (including reconnects) rather than trusting the
       // cache to still be current.
-      void queryClient.invalidateQueries({ queryKey: ['sessions', 'active'] });
-      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'stats'] });
-      void queryClient.invalidateQueries({ queryKey: ['violations'] });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.activePrefix() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.statsPrefix() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.violations.all() });
     });
 
     newSocket.on('disconnect', (_reason) => {
@@ -159,30 +161,30 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     // This matches the web app pattern where socket events invalidate all server-filtered caches
     newSocket.on('session:started', (_session: ActiveSession) => {
       // Invalidate all active sessions caches (any server filter)
-      void queryClient.invalidateQueries({ queryKey: ['sessions', 'active'] });
-      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'stats'] });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.activePrefix() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.statsPrefix() });
     });
 
     newSocket.on('session:stopped', (_sessionId: string) => {
-      void queryClient.invalidateQueries({ queryKey: ['sessions', 'active'] });
-      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'stats'] });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.activePrefix() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.statsPrefix() });
     });
 
     newSocket.on('session:updated', (_session: ActiveSession) => {
       if (sessionUpdatedThrottleRef.current) return;
       sessionUpdatedThrottleRef.current = setTimeout(() => {
         sessionUpdatedThrottleRef.current = null;
-        void queryClient.invalidateQueries({ queryKey: ['sessions', 'active'] });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.activePrefix() });
       }, SESSION_UPDATED_THROTTLE_MS);
     });
 
     newSocket.on('violation:new', (_violation: ViolationWithDetails) => {
-      void queryClient.invalidateQueries({ queryKey: ['violations'] });
-      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'stats'] });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.violations.all() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.statsPrefix() });
     });
 
     newSocket.on('stats:updated', (_stats: DashboardStats) => {
-      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'stats'] });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.statsPrefix() });
     });
 
     socketRef.current = newSocket;
@@ -248,6 +250,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         void (async () => {
           try {
             const response = await api.violations.list({
+              scope: ALL_SERVERS,
               acknowledged: false,
               pageSize: 1,
             });

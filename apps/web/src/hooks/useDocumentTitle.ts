@@ -51,6 +51,11 @@ export function useDocumentTitle() {
       return;
     }
 
+    if (pathname.startsWith('/media/')) {
+      document.title = `Media Details | ${APP_NAME}`;
+      return;
+    }
+
     if (pathname.startsWith('/settings')) {
       document.title = `${t('settings')} | ${APP_NAME}`;
       return;

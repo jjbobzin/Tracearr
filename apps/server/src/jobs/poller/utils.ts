@@ -49,37 +49,6 @@ export function isPrivateIP(ip: string): boolean {
 }
 
 // ============================================================================
-// Formatting Utilities
-// ============================================================================
-
-/**
- * Format quality string from bitrate and transcoding info
- *
- * @param transcodeBitrate - Transcoded bitrate in bps (0 if not transcoding)
- * @param sourceBitrate - Original source bitrate in bps
- * @param isTranscoding - Whether the stream is being transcoded
- * @returns Formatted quality string (e.g., "12 Mbps", "Transcoding", "Direct")
- *
- * @example
- * formatQualityString(12000000, 20000000, true);  // "12 Mbps"
- * formatQualityString(0, 0, true);                 // "Transcoding"
- * formatQualityString(0, 0, false);                // "Direct"
- */
-export function formatQualityString(
-  transcodeBitrate: number,
-  sourceBitrate: number,
-  isTranscoding: boolean
-): string {
-  const bitrate = transcodeBitrate || sourceBitrate;
-  if (bitrate > 0) {
-    const mbps = bitrate / 1000000;
-    const formatted = mbps % 1 === 0 ? mbps.toFixed(0) : mbps.toFixed(1);
-    return `${formatted} Mbps`;
-  }
-  return isTranscoding ? 'Transcoding' : 'Direct';
-}
-
-// ============================================================================
 // Rule Evaluation Session Filtering
 // ============================================================================
 

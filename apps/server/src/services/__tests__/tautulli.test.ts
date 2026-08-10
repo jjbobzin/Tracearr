@@ -24,6 +24,7 @@ import {
   TautulliHistoryResponseSchema,
   TautulliUserRecordSchema,
   TautulliUsersResponseSchema,
+  parseHistoryGuid,
   type TautulliHistoryRecord,
   type TautulliUserRecord,
 } from '../tautulli.js';
@@ -918,6 +919,32 @@ describe('TautulliUsersResponseSchema', () => {
 });
 
 // ============================================================================
+// GUID PARSING TESTS
+// ============================================================================
+
+describe('parseHistoryGuid', () => {
+  it('parses legacy tvdb agent guids at series level', () => {
+    expect(parseHistoryGuid('com.plexapp.agents.thetvdb://121361/6/1?lang=en')).toEqual({
+      tvdbId: 121361,
+    });
+  });
+  it('parses legacy tmdb agent guids', () => {
+    expect(parseHistoryGuid('com.plexapp.agents.themoviedb://584?lang=en')).toEqual({
+      tmdbId: 584,
+    });
+  });
+  it('parses legacy imdb agent guids', () => {
+    expect(parseHistoryGuid('com.plexapp.agents.imdb://tt0322259?lang=en')).toEqual({
+      imdbId: 'tt0322259',
+    });
+  });
+  it('returns empty for new-style plex guids and null', () => {
+    expect(parseHistoryGuid('plex://movie/5d776b59ad5437001f79c6f8')).toEqual({});
+    expect(parseHistoryGuid(null)).toEqual({});
+  });
+});
+
+// ============================================================================
 // FIELD MAPPING TESTS
 // ============================================================================
 
@@ -1293,8 +1320,7 @@ describe('Deduplication Logic', () => {
           ? String(REAL_MOVIE_RECORD.rating_key)
           : null;
 
-      const emptyRatingKeyStr =
-        typeof ('' as number | '') === 'number' ? String('') : null;
+      const emptyRatingKeyStr = typeof ('' as number | '') === 'number' ? String('') : null;
 
       expect(ratingKeyStr).toBe('25314');
       expect(emptyRatingKeyStr).toBeNull();

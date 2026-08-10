@@ -116,7 +116,7 @@ timescale:
     - "-c"
     - "timescaledb.license=timescale"
     - "-c"
-    - "timescaledb.max_tuples_decompressed_per_dml_transaction=0"
+    - "timescaledb.max_tuples_decompressed_per_dml_transaction=100000"
     - "-c"
     - "max_locks_per_transaction=4096"
     - "-c"

@@ -29,9 +29,11 @@ export function QualityTimelineChart({ data, isLoading, height = 250 }: QualityT
       return {};
     }
 
+    const totalByDay = new Map(data.data.map((d) => [parseChartDate(d.day), d.totalItems]));
+
     return {
       chart: {
-        type: 'area',
+        type: 'line',
         height,
         backgroundColor: 'transparent',
         style: {
@@ -104,11 +106,9 @@ export function QualityTimelineChart({ data, isLoading, height = 250 }: QualityT
         },
         gridLineColor: 'hsl(var(--border))',
         min: 0,
-        reversedStacks: false, // First series (SD) at bottom, last series (4K) at top
       },
       plotOptions: {
-        area: {
-          stacking: 'normal',
+        line: {
           marker: {
             // Enable markers for single data points, otherwise hide them
             enabled: data.data.length < 3,
@@ -126,7 +126,6 @@ export function QualityTimelineChart({ data, isLoading, height = 250 }: QualityT
               lineWidth: 2,
             },
           },
-          threshold: null,
         },
       },
       tooltip: {
@@ -145,74 +144,42 @@ export function QualityTimelineChart({ data, isLoading, height = 250 }: QualityT
             year: 'numeric',
           });
 
+          // Tiers overlap (a 4K+1080p title counts in both), so the
+          // denominator is the day's real title count, never the tier sum
+          const total = totalByDay.get(Number(this.x)) ?? 0;
           let html = `<b>${dateStr}</b>`;
-          let total = 0;
-          points.forEach((point) => {
-            total += point.y || 0;
-          });
-          // Show in reverse order (4K first) with percentage
           [...points].reverse().forEach((point) => {
             const pct = total > 0 ? (((point.y || 0) / total) * 100).toFixed(1) : '0';
             html += `<br/><span style="color:${point.color}">●</span> ${point.series.name}: ${point.y?.toLocaleString()} (${pct}%)`;
           });
-          html += `<br/><b>Total: ${total.toLocaleString()} items</b>`;
+          html += `<br/><b>${total.toLocaleString()} titles</b>`;
           return html;
         },
       },
-      // Series order determines visual stacking (bottom to top)
-      // With reversedStacks: false, first series (SD) at bottom, last series (4K) at top
       series: [
         {
-          type: 'area',
+          type: 'line',
           name: 'SD',
           data: data.data.map((d) => [parseChartDate(d.day), d.countSd]),
           color: QUALITY_COLORS['SD'],
-          fillColor: {
-            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
-            stops: [
-              [0, 'rgba(239, 68, 68, 0.5)'], // Red with opacity
-              [1, 'rgba(239, 68, 68, 0.1)'],
-            ],
-          },
         },
         {
-          type: 'area',
+          type: 'line',
           name: '720p',
           data: data.data.map((d) => [parseChartDate(d.day), d.count720p]),
           color: QUALITY_COLORS['720p'],
-          fillColor: {
-            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
-            stops: [
-              [0, 'rgba(245, 158, 11, 0.5)'], // Amber with opacity
-              [1, 'rgba(245, 158, 11, 0.1)'],
-            ],
-          },
         },
         {
-          type: 'area',
+          type: 'line',
           name: '1080p',
           data: data.data.map((d) => [parseChartDate(d.day), d.count1080p]),
           color: QUALITY_COLORS['1080p'],
-          fillColor: {
-            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
-            stops: [
-              [0, 'rgba(59, 130, 246, 0.5)'], // Blue with opacity
-              [1, 'rgba(59, 130, 246, 0.1)'],
-            ],
-          },
         },
         {
-          type: 'area',
+          type: 'line',
           name: '4K',
           data: data.data.map((d) => [parseChartDate(d.day), d.count4k]),
           color: QUALITY_COLORS['4K'],
-          fillColor: {
-            linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },
-            stops: [
-              [0, 'rgba(16, 185, 129, 0.5)'], // Emerald with opacity
-              [1, 'rgba(16, 185, 129, 0.1)'],
-            ],
-          },
         },
       ],
       responsive: {

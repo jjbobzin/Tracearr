@@ -9,7 +9,7 @@ import { BlockList, isIP } from 'node:net';
  * count as v4 unique IPs. Handles dotted (::ffff:1.2.3.4) and hex
  * (::ffff:c0a8:164) forms.
  */
-function unmapIpv4Mapped(ip: string): string {
+export function unmapIpv4Mapped(ip: string): string {
   const lower = ip.toLowerCase();
 
   // ::ffff:192.168.1.100

@@ -1,35 +1,28 @@
 /**
  * Test database reset utilities
  *
- * Provides fast truncation between test files while preserving schema.
- * Uses TRUNCATE CASCADE for efficient cleanup.
+ * Provides fast truncation between tests while preserving schema.
+ * Only tables that actually hold rows are truncated; on an empty database
+ * the reset is a single cheap SELECT instead of a full TRUNCATE.
  */
 
 import { executeRawSql, closeTestPool } from './pool.js';
 
 /**
- * Tables to truncate in dependency order (leaf tables first)
- *
- * Order matters for CASCADE to work properly:
- * 1. violations (depends on rules, server_users, sessions)
- * 2. notification_preferences (depends on mobile_sessions)
- * 3. notification_channel_routing (standalone)
- * 4. mobile_sessions (depends on nothing)
- * 5. mobile_tokens (depends on users)
- * 6. sessions (depends on servers, server_users)
- * 7. rules (depends on server_users)
- * 8. server_users (depends on users, servers)
- * 9. servers (standalone)
- * 10. users (standalone)
- * 11. settings (standalone, key-value store)
+ * Root tables owned by tests. The real truncate set is the recursive FK
+ * closure of this list (any table that references one of these, directly or
+ * transitively), derived from pg_constraint at runtime so new referencing
+ * tables are covered without touching this file.
  */
-const TABLES_TO_TRUNCATE = [
+const ROOT_TABLES = [
   'violations',
   'notification_preferences',
   'notification_channel_routing',
   'mobile_sessions',
   'mobile_tokens',
   'sessions',
+  'library_items',
+  'media',
   'rules',
   'server_users',
   'servers',
@@ -37,26 +30,61 @@ const TABLES_TO_TRUNCATE = [
   'settings',
 ];
 
+let cachedTables: string[] | null = null;
+let cachedDirtyCheckSql: string | null = null;
+
+async function loadTruncateTargets(): Promise<string[] | null> {
+  if (cachedTables) return cachedTables;
+
+  const rootList = ROOT_TABLES.map((t) => `'${t}'`).join(', ');
+  const result = await executeRawSql(`
+    WITH RECURSIVE fk_closure(oid) AS (
+      SELECT c.oid
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname IN (${rootList})
+      UNION
+      SELECT con.conrelid
+      FROM pg_constraint con
+      JOIN fk_closure f ON con.confrelid = f.oid
+      WHERE con.contype = 'f'
+    )
+    SELECT c.relname
+    FROM fk_closure f
+    JOIN pg_class c ON c.oid = f.oid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+    ORDER BY c.relname
+  `);
+
+  const found = result.rows.map((row) => row.relname as string);
+  if (ROOT_TABLES.some((t) => !found.includes(t))) {
+    console.warn('[Test Reset] Tables do not exist yet, skipping truncation');
+    return null;
+  }
+
+  cachedTables = found;
+  cachedDirtyCheckSql = found
+    .map((t) => `SELECT '${t}'::text AS tbl WHERE EXISTS (SELECT 1 FROM "${t}")`)
+    .join(' UNION ALL ');
+  return cachedTables;
+}
+
 /**
- * Reset the test database between test files
+ * Reset the test database between tests
  *
- * Truncates all tables but preserves schema.
- * Fast and efficient for integration tests.
- *
- * Call this in afterEach() to ensure test isolation.
+ * Truncates all non-empty tables in the FK closure but preserves schema.
+ * Call this in beforeEach() to ensure test isolation.
  */
 export async function resetTestDb(): Promise<void> {
-  try {
-    // Use a single TRUNCATE command with CASCADE for efficiency
-    await executeRawSql(`TRUNCATE TABLE ${TABLES_TO_TRUNCATE.join(', ')} RESTART IDENTITY CASCADE`);
-  } catch (error) {
-    // Table might not exist yet if migrations haven't run
-    if (error instanceof Error && error.message.includes('does not exist')) {
-      console.warn('[Test Reset] Tables do not exist yet, skipping truncation');
-      return;
-    }
-    throw error;
-  }
+  const tables = await loadTruncateTargets();
+  if (!tables || !cachedDirtyCheckSql) return;
+
+  const dirty = await executeRawSql(cachedDirtyCheckSql);
+  if (dirty.rows.length === 0) return;
+
+  const dirtyList = dirty.rows.map((row) => `"${row.tbl as string}"`).join(', ');
+  await executeRawSql(`TRUNCATE TABLE ${dirtyList} RESTART IDENTITY CASCADE`);
 }
 
 /**

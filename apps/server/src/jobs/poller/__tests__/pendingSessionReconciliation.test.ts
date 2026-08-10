@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { PendingSessionData } from '../types.js';
+import type { RuleV2, Session, ServerUser, Server as MediaServer } from '@tracearr/shared';
 
 const {
   mockSseManager,
@@ -15,8 +16,9 @@ const {
   mockCreateMediaServerClient,
   mockMapMediaSession,
   mockUpdatePendingSession,
-  mockCreateSessionWithRulesAtomic,
+  mockConfirmAndPersistSession,
   mockBuildActiveSession,
+  mockBuildPendingActiveSession,
   mockFindActiveSession,
   mockProcessPollResults,
   mockHandleQualityChangeFallout,
@@ -55,7 +57,6 @@ const {
     thumbUrl: null,
     isServerAdmin: false,
     trustScore: 100,
-    sessionCount: 5,
     lastActivityAt: new Date(),
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -73,8 +74,9 @@ const {
     }),
     mockMapMediaSession: vi.fn(),
     mockUpdatePendingSession: vi.fn(),
-    mockCreateSessionWithRulesAtomic: vi.fn(),
+    mockConfirmAndPersistSession: vi.fn(),
     mockBuildActiveSession: vi.fn(),
+    mockBuildPendingActiveSession: vi.fn(),
     mockFindActiveSession: vi.fn().mockResolvedValue(null),
     mockProcessPollResults: vi.fn().mockResolvedValue(undefined),
     mockHandleQualityChangeFallout: vi.fn().mockResolvedValue(undefined),
@@ -85,7 +87,11 @@ const {
       select: vi.fn((columns?: unknown) => ({
         from: vi.fn(() => {
           if (columns === undefined) return chainResolving([mockServerRow]);
-          const obj: Record<string, unknown> = { where: () => obj, limit: () => obj };
+          const obj: Record<string, unknown> = {
+            where: () => obj,
+            orderBy: () => obj,
+            limit: () => obj,
+          };
           obj.innerJoin = () => chainResolving([mockServerUserRow]);
           obj.then = (resolve: (v: unknown[]) => void, reject?: (e: unknown) => void) =>
             Promise.resolve([]).then(resolve, reject);
@@ -99,7 +105,16 @@ const {
   };
 });
 
+vi.mock('../../../services/leaderLease.js', () => ({
+  isLeader: () => true,
+}));
+
 vi.mock('../../../db/client.js', () => ({ db: mockDb }));
+// Real rule engine used directly (not through the mocked sessionLifecycle.js) to prove the
+// concurrent_streams consequence of the fix below, not just that an array got longer.
+vi.mock('../../../services/geoip.js', () => ({
+  geoipService: { isPrivateIP: () => false },
+}));
 vi.mock('../../../routes/settings.js', () => ({
   getGeoIPSettings: vi.fn().mockResolvedValue({ usePlexGeoip: false }),
 }));
@@ -119,6 +134,7 @@ vi.mock('../../notificationQueue.js', () => ({ enqueueNotification: mockEnqueueN
 vi.mock('../database.js', () => ({
   getActiveRulesV2: vi.fn().mockResolvedValue([]),
   batchGetIdentityServerUserIds: vi.fn().mockResolvedValue(new Map()),
+  batchGetLibraryItemIdentity: vi.fn().mockResolvedValue(new Map()),
   batchGetRecentUserSessions: vi.fn().mockResolvedValue(new Map()),
   widenRecentSessionsForMergedIdentities: vi.fn().mockResolvedValue(undefined),
 }));
@@ -127,8 +143,9 @@ vi.mock('../sessionLifecycle.js', () => ({
   batchFindActiveSessionsByComposite: vi.fn().mockResolvedValue(new Map()),
   batchFindActiveSessionsByKey: vi.fn().mockResolvedValue(new Map()),
   buildActiveSession: mockBuildActiveSession,
-  buildPendingActiveSession: vi.fn(),
-  createSessionWithRulesAtomic: mockCreateSessionWithRulesAtomic,
+  buildPendingActiveSession: mockBuildPendingActiveSession,
+  confirmAndPersistSession: mockConfirmAndPersistSession,
+  createSessionWithRulesAtomic: vi.fn(),
   findActiveSession: mockFindActiveSession,
   findActiveSessionByComposite: vi.fn().mockResolvedValue(null),
   handleMediaChangeAtomic: vi.fn(),
@@ -145,6 +162,7 @@ vi.mock('../sessionMapper.js', () => ({
 vi.mock('../violations.js', () => ({ broadcastViolations: vi.fn() }));
 
 import { initializePoller, triggerServerPoll } from '../processor.js';
+import { evaluateRulesAsync } from '../../../services/rules/engine.js';
 
 function createPendingSessionData(): PendingSessionData {
   const now = Date.now();
@@ -171,7 +189,6 @@ function createPendingSessionData(): PendingSessionData {
       thumbUrl: null,
       identityName: 'Alice',
       trustScore: 100,
-      sessionCount: 5,
       lastActivityAt: new Date(),
       createdAt: new Date(),
       identityServerUserIds: ['server-user-1'],
@@ -210,6 +227,7 @@ describe('poller isNew branch defers to a pending session', () => {
     removeActiveSession: ReturnType<typeof vi.fn>;
     removeUserSession: ReturnType<typeof vi.fn>;
   };
+  let pubSubService: { publish: ReturnType<typeof vi.fn>; subscribe: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -245,19 +263,21 @@ describe('poller isNew branch defers to a pending session', () => {
       removeUserSession: vi.fn(),
     };
 
+    pubSubService = { publish: vi.fn(), subscribe: vi.fn() };
     initializePoller(
       cacheService as unknown as Parameters<typeof initializePoller>[0],
-      { publish: vi.fn(), subscribe: vi.fn() } as unknown as Parameters<typeof initializePoller>[1]
+      pubSubService as unknown as Parameters<typeof initializePoller>[1]
     );
   });
 
-  it('confirms the pending session with preGeneratedId instead of creating a duplicate', async () => {
+  it('confirms the pending session through confirmAndPersistSession with corrected startedAt', async () => {
+    const pendingSessionData = createPendingSessionData();
     mockUpdatePendingSession.mockReturnValue({
-      updatedData: createPendingSessionData(),
+      updatedData: pendingSessionData,
       isConfirmed: true,
     });
 
-    mockCreateSessionWithRulesAtomic.mockResolvedValue({
+    mockConfirmAndPersistSession.mockResolvedValue({
       insertedSession: { id: 'pending-uuid-123', sessionKey: 'test-session-key' },
       violationResults: [],
       qualityChange: null,
@@ -273,17 +293,24 @@ describe('poller isNew branch defers to a pending session', () => {
 
     await triggerServerPoll('server-1');
 
-    expect(mockCreateSessionWithRulesAtomic).toHaveBeenCalledTimes(1);
-    expect(mockCreateSessionWithRulesAtomic).toHaveBeenCalledWith(
-      expect.objectContaining({ preGeneratedId: 'pending-uuid-123' })
+    expect(mockConfirmAndPersistSession).toHaveBeenCalledTimes(1);
+    const call = mockConfirmAndPersistSession.mock.calls[0]?.[0] as {
+      pendingData: PendingSessionData;
+    };
+    expect(call.pendingData.id).toBe('pending-uuid-123');
+    // startedAt is the pending session's own creation time (31s ago), never the
+    // confirm tick's Date.now() - that's the bug this routing closes.
+    expect(call.pendingData.startedAt).toBe(pendingSessionData.startedAt);
+    expect(call.pendingData.confirmation.maxViewOffset).toBe(
+      pendingSessionData.confirmation.maxViewOffset
     );
 
     expect(cacheService.deletePendingSession).toHaveBeenCalledWith('server-1', 'test-session-key');
 
     expect(mockProcessPollResults).toHaveBeenCalledTimes(1);
-    const call = mockProcessPollResults.mock.calls[0]?.[0];
-    expect(call.newSessions).toHaveLength(1);
-    expect(call.newSessions[0].id).toBe('pending-uuid-123');
+    const pollCall = mockProcessPollResults.mock.calls[0]?.[0];
+    expect(pollCall.newSessions).toHaveLength(1);
+    expect(pollCall.newSessions[0].id).toBe('pending-uuid-123');
   });
 
   it('runs quality-change fallout for the stopped twin when confirming a pending session', async () => {
@@ -303,7 +330,7 @@ describe('poller isNew branch defers to a pending session', () => {
       referenceId: 'twin-session-id',
     };
 
-    mockCreateSessionWithRulesAtomic.mockResolvedValue({
+    mockConfirmAndPersistSession.mockResolvedValue({
       insertedSession: { id: 'pending-uuid-123', sessionKey: 'test-session-key' },
       violationResults: [],
       qualityChange,
@@ -334,7 +361,7 @@ describe('poller isNew branch defers to a pending session', () => {
 
     await triggerServerPoll('server-1');
 
-    expect(mockCreateSessionWithRulesAtomic).not.toHaveBeenCalled();
+    expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
     expect(cacheService.setPendingSession).toHaveBeenCalledTimes(1);
     expect(cacheService.deletePendingSession).not.toHaveBeenCalled();
   });
@@ -352,7 +379,7 @@ describe('poller isNew branch defers to a pending session', () => {
     await triggerServerPoll('server-1');
 
     expect(getPendingSessionCalls).toBeGreaterThanOrEqual(2);
-    expect(mockCreateSessionWithRulesAtomic).not.toHaveBeenCalled();
+    expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
     expect(mockProcessPollResults).not.toHaveBeenCalled();
   });
 
@@ -375,7 +402,7 @@ describe('poller isNew branch defers to a pending session', () => {
     await expect(triggerServerPoll('server-1')).resolves.not.toThrow();
 
     expect(getPendingSessionCalls).toBeGreaterThanOrEqual(2);
-    expect(mockCreateSessionWithRulesAtomic).not.toHaveBeenCalled();
+    expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
     expect(cacheService.deletePendingSession).not.toHaveBeenCalled();
     // Nothing new/updated/stopped for this session this tick, so processPollResults
     // is skipped entirely (same as the sibling "confirmed by other" path above).
@@ -410,7 +437,6 @@ describe('poller isNew branch defers to a pending session', () => {
       thumbUrl: null,
       isServerAdmin: false,
       trustScore: 100,
-      sessionCount: 5,
       lastActivityAt: new Date(),
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -448,7 +474,308 @@ describe('poller isNew branch defers to a pending session', () => {
 
     await triggerServerPoll('server-1');
 
-    expect(mockCreateSessionWithRulesAtomic).not.toHaveBeenCalled();
+    expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
     expect(cacheService.deletePendingSession).toHaveBeenCalledWith('server-1', 'test-session-key');
+  });
+
+  it('counts a pending confirm earlier in the same pass toward a later confirm in that pass', async () => {
+    // Same user, two devices, both pending and both about to cross the
+    // confirmation threshold on this single poll tick.
+    let mapCallCount = 0;
+    mockMapMediaSession.mockImplementation(() => {
+      mapCallCount += 1;
+      return {
+        sessionKey: `test-session-key-${mapCallCount}`,
+        ratingKey: `rating-${mapCallCount}`,
+        externalUserId: 'user-123',
+        username: 'alice',
+        userThumb: '',
+        mediaTitle: 'Test Movie',
+        mediaType: 'movie',
+        state: 'playing',
+        ipAddress: '1.2.3.4',
+        deviceId: `device-${mapCallCount}`,
+      };
+    });
+
+    mockCreateMediaServerClient.mockReturnValue({
+      getSessions: vi.fn().mockResolvedValue([{}, {}]),
+    });
+
+    // Restore the plain default (server lookup + single server user, no
+    // existingById match) - mockImplementation from an earlier test in this
+    // file survives vi.clearAllMocks(), which only resets calls, not impls.
+    const mockServerRow = {
+      id: 'server-1',
+      name: 'Test Server',
+      type: 'plex',
+      url: 'http://localhost:32400',
+      token: 'test-token',
+    };
+    const mockServerUserRow = {
+      id: 'server-user-1',
+      userId: 'identity-1',
+      serverId: 'server-1',
+      externalId: 'user-123',
+      username: 'alice',
+      email: null,
+      thumbUrl: null,
+      isServerAdmin: false,
+      trustScore: 100,
+      lastActivityAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      identityName: 'Alice',
+    };
+    mockDb.select.mockImplementation((columns?: unknown) => ({
+      from: vi.fn(() => {
+        if (columns === undefined) {
+          const s: Record<string, unknown> = {};
+          s.where = () => s;
+          s.limit = () => s;
+          s.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+            Promise.resolve([mockServerRow]).then(res, rej);
+          return s;
+        }
+        const o: Record<string, unknown> = {};
+        o.where = () => o;
+        o.limit = () => o;
+        o.innerJoin = () => {
+          const j: Record<string, unknown> = {};
+          j.where = () => j;
+          j.limit = () => j;
+          j.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+            Promise.resolve([mockServerUserRow]).then(res, rej);
+          return j;
+        };
+        o.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+          Promise.resolve([]).then(res, rej);
+        return o;
+      }),
+    }));
+
+    cacheService.getPendingSession = vi
+      .fn()
+      .mockImplementation(async (_serverId: string, key: string) => {
+        if (key !== 'test-session-key-1' && key !== 'test-session-key-2') return null;
+        return { ...createPendingSessionData(), id: `pending-uuid-${key.slice(-1)}` };
+      });
+
+    mockUpdatePendingSession.mockImplementation((pendingData: PendingSessionData) => ({
+      updatedData: pendingData,
+      isConfirmed: true,
+    }));
+
+    // mock.calls stores the live activeSessions array reference, which this fix mutates
+    // in place after each confirm - snapshot it at call-time or both entries would read
+    // back identically (the final, post-loop state) once the test inspects mock.calls.
+    const activeSessionsSnapshots: unknown[][] = [];
+    mockConfirmAndPersistSession.mockImplementation(
+      async (input: {
+        pendingData: { id: string; processed: { sessionKey: string } };
+        activeSessions: unknown[];
+      }) => {
+        activeSessionsSnapshots.push([...input.activeSessions]);
+        return {
+          insertedSession: {
+            id: input.pendingData.id,
+            sessionKey: input.pendingData.processed.sessionKey,
+          },
+          violationResults: [],
+          qualityChange: null,
+          referenceId: null,
+          wasTerminatedByRule: false,
+        };
+      }
+    );
+
+    mockBuildActiveSession.mockImplementation(
+      (input: {
+        session: { id: string; sessionKey: string };
+        processed: { deviceId: string };
+      }) => ({
+        id: input.session.id,
+        serverId: 'server-1',
+        serverUserId: 'server-user-1',
+        sessionKey: input.session.sessionKey,
+        deviceId: input.processed.deviceId,
+        ipAddress: '1.2.3.4',
+      })
+    );
+
+    await triggerServerPoll('server-1');
+
+    expect(mockConfirmAndPersistSession).toHaveBeenCalledTimes(2);
+    const [firstActiveSessions, secondActiveSessions] = activeSessionsSnapshots;
+
+    // The bug: the second confirm's snapshot never saw the first confirm from
+    // the same pass. The fix appends each confirm to the snapshot as it happens.
+    expect(firstActiveSessions).toHaveLength(0);
+    expect(secondActiveSessions).toHaveLength(1);
+    expect((secondActiveSessions![0] as { id: string }).id).toBe('pending-uuid-1');
+
+    // Prove that difference is not cosmetic: it flips a concurrent_streams>=2 kill rule.
+    const rule = {
+      id: 'rule-1',
+      name: 'Too many streams',
+      description: null,
+      serverId: null,
+      serverUserId: null,
+      userId: null,
+      enforceAcrossServers: false,
+      isActive: true,
+      severity: 'high',
+      conditions: {
+        groups: [{ conditions: [{ field: 'concurrent_streams', operator: 'gte', value: 2 }] }],
+      },
+      actions: { actions: [{ type: 'kill_stream' }] },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    } as unknown as RuleV2;
+
+    const serverUser = { id: 'server-user-1', serverId: 'server-1' } as unknown as ServerUser;
+    const server = { id: 'server-1', type: 'plex' } as unknown as MediaServer;
+    const secondSession = {
+      id: 'pending-uuid-2',
+      serverUserId: 'server-user-1',
+      deviceId: 'device-2',
+      ipAddress: '1.2.3.4',
+    } as unknown as Session;
+
+    const withoutFirstConfirm = await evaluateRulesAsync(
+      {
+        session: secondSession,
+        serverUser,
+        server,
+        activeSessions: [secondSession],
+        recentSessions: [],
+      },
+      [rule]
+    );
+    // evaluateRulesAsync only returns matched rules, so no entry means no match.
+    expect(withoutFirstConfirm).toHaveLength(0);
+
+    const withFirstConfirm = await evaluateRulesAsync(
+      {
+        session: secondSession,
+        serverUser,
+        server,
+        activeSessions: [...secondActiveSessions!, secondSession] as unknown as Session[],
+        recentSessions: [],
+      },
+      [rule]
+    );
+    expect(withFirstConfirm).toHaveLength(1);
+    expect(withFirstConfirm[0]?.matched).toBe(true);
+  });
+
+  it('creates independent pending entries for two brand-new sessions in the same tick', async () => {
+    // Same user, two devices, neither pending - both hit the isNew branch's
+    // pending-create path. Confirmation (and rule evaluation) is deferred to
+    // a later tick, so no same-pass accumulation applies to fresh creates
+    // anymore - that only happens once each entry confirms individually.
+    let mapCallCount = 0;
+    mockMapMediaSession.mockImplementation(() => {
+      mapCallCount += 1;
+      return {
+        sessionKey: `test-session-key-${mapCallCount}`,
+        ratingKey: `rating-${mapCallCount}`,
+        externalUserId: 'user-123',
+        username: 'alice',
+        userThumb: '',
+        mediaTitle: 'Test Movie',
+        mediaType: 'movie',
+        state: 'playing',
+        ipAddress: '1.2.3.4',
+        deviceId: `device-${mapCallCount}`,
+      };
+    });
+
+    mockCreateMediaServerClient.mockReturnValue({
+      getSessions: vi.fn().mockResolvedValue([{}, {}]),
+    });
+
+    const mockServerRow = {
+      id: 'server-1',
+      name: 'Test Server',
+      type: 'plex',
+      url: 'http://localhost:32400',
+      token: 'test-token',
+    };
+    const mockServerUserRow = {
+      id: 'server-user-1',
+      userId: 'identity-1',
+      serverId: 'server-1',
+      externalId: 'user-123',
+      username: 'alice',
+      email: null,
+      thumbUrl: null,
+      isServerAdmin: false,
+      trustScore: 100,
+      lastActivityAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      identityName: 'Alice',
+    };
+    mockDb.select.mockImplementation((columns?: unknown) => ({
+      from: vi.fn(() => {
+        if (columns === undefined) {
+          const s: Record<string, unknown> = {};
+          s.where = () => s;
+          s.limit = () => s;
+          s.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+            Promise.resolve([mockServerRow]).then(res, rej);
+          return s;
+        }
+        const o: Record<string, unknown> = {};
+        o.where = () => o;
+        o.limit = () => o;
+        o.innerJoin = () => {
+          const j: Record<string, unknown> = {};
+          j.where = () => j;
+          j.limit = () => j;
+          j.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+            Promise.resolve([mockServerUserRow]).then(res, rej);
+          return j;
+        };
+        // Plex duplicate-content check (no pending, no existing row for this content).
+        o.then = (res: (v: unknown[]) => void, rej?: (e: unknown) => void) =>
+          Promise.resolve([]).then(res, rej);
+        return o;
+      }),
+    }));
+
+    // Neither session is pending yet - both hit the isNew branch fresh.
+    cacheService.getPendingSession = vi.fn().mockResolvedValue(null);
+    mockBuildPendingActiveSession.mockImplementation((data: { id: string }) => ({
+      id: data.id,
+      pending: true,
+    }));
+
+    await triggerServerPoll('server-1');
+
+    // No DB row, no rule evaluation for either session on first sight.
+    expect(mockConfirmAndPersistSession).not.toHaveBeenCalled();
+    expect(cacheService.setPendingSession).toHaveBeenCalledTimes(2);
+    expect(cacheService.addActiveSession).toHaveBeenCalledTimes(2);
+
+    // Each pending entry is keyed and persisted independently.
+    const setPendingKeys = cacheService.setPendingSession.mock.calls.map((call) => call[1]);
+    expect(setPendingKeys).toEqual(['test-session-key-1', 'test-session-key-2']);
+    const pendingIds = cacheService.setPendingSession.mock.calls.map(
+      (call) => (call[2] as { id: string }).id
+    );
+    expect(new Set(pendingIds).size).toBe(2);
+
+    // Both display immediately - session:started fires for each, with no DB write.
+    expect(pubSubService.publish).toHaveBeenCalledTimes(2);
+    expect(pubSubService.publish).toHaveBeenCalledWith('session:started', expect.anything());
+    expect(mockEnqueueNotification).toHaveBeenCalledTimes(2);
+    expect(mockEnqueueNotification).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session_started' })
+    );
+
+    // Nothing goes through the batched new/updated/stopped pipeline this tick.
+    expect(mockProcessPollResults).not.toHaveBeenCalled();
   });
 });

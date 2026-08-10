@@ -54,7 +54,7 @@ Tracearr is a monitoring platform for **Plex**, **Jellyfin**, and **Emby**. Trac
 
 **Real-Time Alerts** — Discord webhooks and custom notifications fire instantly when rules trigger.
 
-**Public API** — Read-only REST API for third-party integrations. Generate an API key in Settings, then explore endpoints at `/api-docs` (Swagger UI). Works with Homarr, Home Assistant, or anything that speaks HTTP.
+**Public API** — Read-only REST API for third-party integrations. Generate an API key in Settings, then browse the [API reference](https://docs.tracearr.com/api) or the interactive docs built into your instance.
 
 **Bulk Actions** — Multi-select operations across tables. Acknowledge or dismiss violations in bulk, reset trust scores, enable/disable rules, delete session history.
 

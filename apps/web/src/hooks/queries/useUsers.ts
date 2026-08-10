@@ -1,7 +1,12 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { MERGE_SAME_SERVER_CONFIRMATION_REQUIRED, type UserSortField } from '@tracearr/shared';
+import {
+  MERGE_SAME_SERVER_CONFIRMATION_REQUIRED,
+  serverScopeFromIds,
+  serverScopeKey,
+  type UserSortField,
+} from '@tracearr/shared';
 import { api } from '@/lib/api';
 
 export function useUsers(
@@ -16,7 +21,7 @@ export function useUsers(
     orderDir?: 'asc' | 'desc';
   } = {}
 ) {
-  const serverIdsKey = params.serverIds?.length ? [...params.serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(params.serverIds));
   return useQuery({
     queryKey: ['users', 'list', { ...params, serverIds: serverIdsKey }],
     queryFn: () => api.users.list(params),

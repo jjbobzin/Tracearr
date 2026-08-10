@@ -1,4 +1,5 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { serverScopeFromIds, serverScopeKey } from '@tracearr/shared';
 import type { HistoryQueryInput, HistoryAggregatesQueryInput } from '@tracearr/shared';
 import { api } from '@/lib/api';
 
@@ -26,7 +27,7 @@ export interface HistoryFilters {
 }
 
 export function useHistorySessions(filters: HistoryFilters = {}, pageSize = 50) {
-  const serverIdsKey = filters.serverIds?.length ? [...filters.serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(filters.serverIds));
   return useInfiniteQuery({
     queryKey: ['sessions', 'history', { ...filters, serverIds: serverIdsKey }, pageSize],
     queryFn: async ({ pageParam }) => {
@@ -48,7 +49,7 @@ export function useHistorySessions(filters: HistoryFilters = {}, pageSize = 50) 
 export type AggregateFilters = Partial<HistoryAggregatesQueryInput> & { serverIds?: string[] };
 
 export function useHistoryAggregates(filters: AggregateFilters = {}) {
-  const serverIdsKey = filters.serverIds?.length ? [...filters.serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(filters.serverIds));
   return useQuery({
     queryKey: ['sessions', 'history', 'aggregates', { ...filters, serverIds: serverIdsKey }],
     queryFn: () => api.sessions.historyAggregates(filters),
@@ -62,7 +63,7 @@ export function useFilterOptions(params?: {
   startDate?: Date;
   endDate?: Date;
 }) {
-  const serverIdsKey = params?.serverIds?.length ? [...params.serverIds].sort().join(',') : 'all';
+  const serverIdsKey = serverScopeKey(serverScopeFromIds(params?.serverIds));
   return useQuery({
     queryKey: [
       'sessions',

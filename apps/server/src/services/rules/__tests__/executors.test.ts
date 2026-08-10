@@ -39,6 +39,14 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     year: 2024,
     thumbPath: null,
     ratingKey: '12345',
+    serverVersionKey: null,
+    parentRatingKey: null,
+    grandparentRatingKey: null,
+    mediaId: null,
+    showMediaId: null,
+    imdbId: null,
+    tmdbId: null,
+    tvdbId: null,
     externalSessionId: null,
     startedAt: new Date(),
     stoppedAt: null,
@@ -118,7 +126,6 @@ function createMockServerUser(overrides: Partial<ServerUser> = {}): ServerUser {
     thumbUrl: null,
     isServerAdmin: false,
     trustScore: 100,
-    sessionCount: 10,
     joinedAt: new Date(),
     lastActivityAt: new Date(),
     removedAt: null,
@@ -281,8 +288,29 @@ describe('Action Executor Registry', () => {
           data: expect.objectContaining({
             ruleId: context.rule.id,
             sessionId: context.session.id,
+            serverUserId: context.serverUser.id,
+            username: context.serverUser.username,
+            displayName: context.serverUser.username,
           }),
         });
+      });
+
+      it('prefers the identity name over the account username for display', async () => {
+        const context = createMockContext();
+        context.serverUser.identityName = 'Alice Smith';
+        const action: NotifyAction = { type: 'notify', channels: ['discord'] };
+
+        const result = await executeAction(context, action);
+
+        expect(result.success).toBe(true);
+        expect(mockDeps.sendNotification).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              username: context.serverUser.username,
+              displayName: 'Alice Smith',
+            }),
+          })
+        );
       });
 
       it('should not send notification if no channels specified', async () => {
@@ -782,6 +810,57 @@ describe('Action Executor Registry', () => {
         await executeAction(context, action);
 
         expect(mockDeps.checkCooldown).not.toHaveBeenCalled();
+      });
+
+      it('scopes cooldown keys per action type so a notify cooldown cannot suppress kill_stream', async () => {
+        (mockDeps.checkCooldown as ReturnType<typeof vi.fn>).mockImplementation(
+          (_ruleId: string, targetId: string) => targetId.endsWith(':notify')
+        );
+        const context = createMockContext();
+        const actions: Action[] = [
+          { type: 'notify', channels: ['discord'], cooldown_minutes: 5 },
+          { type: 'kill_stream', cooldown_minutes: 10 },
+        ];
+
+        const results = await executeActions(context, actions);
+
+        expect(results[0]?.skipped).toBe(true);
+        expect(results[0]?.skipReason).toContain('cooldown');
+        expect(mockDeps.checkCooldown).toHaveBeenCalledWith(
+          context.rule.id,
+          `${context.rule.id}:${context.serverUser.id}:notify`,
+          5
+        );
+        expect(mockDeps.checkCooldown).toHaveBeenCalledWith(
+          context.rule.id,
+          `${context.rule.id}:${context.serverUser.id}:kill_stream`,
+          10
+        );
+        expect(mockDeps.terminateSession).toHaveBeenCalledWith(
+          context.session.id,
+          context.server.id,
+          context.rule.id,
+          null,
+          0,
+          undefined,
+          undefined,
+          { minutes: 10, triggeringServerUserId: context.serverUser.id },
+          context.session.id
+        );
+      });
+
+      it('arms the cooldown key with the action type', async () => {
+        (mockDeps.checkCooldown as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+        const context = createMockContext();
+        const action: NotifyAction = { type: 'notify', channels: ['discord'], cooldown_minutes: 5 };
+
+        await executeAction(context, action);
+
+        expect(mockDeps.setCooldown).toHaveBeenCalledWith(
+          context.rule.id,
+          `${context.rule.id}:${context.serverUser.id}:notify`,
+          5
+        );
       });
     });
 

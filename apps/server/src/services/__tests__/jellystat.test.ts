@@ -1409,6 +1409,34 @@ const THEME_SONG_ACTIVITY = {
   imported: false,
 };
 
+// Trailer activity - exercises the broadened ExtraType allowlist (any non-empty
+// ExtraType is an extra, not just ThemeSong/ThemeVideo)
+const TRAILER_ACTIVITY = {
+  Id: '1601',
+  IsPaused: null,
+  UserId: 'a91468af8ed947e0add77f191736dab5',
+  UserName: 'TestUser',
+  Client: 'Jellyfin Web',
+  DeviceName: 'Chrome',
+  DeviceId: 'chrome-device-789',
+  ApplicationVersion: null,
+  NowPlayingItemId: 'trailer-item-id',
+  NowPlayingItemName: 'Trailer',
+  SeasonId: null,
+  SeriesName: null,
+  EpisodeId: null,
+  PlaybackDuration: '30',
+  ActivityDateInserted: '2025-04-09T12:00:00.000Z',
+  PlayMethod: 'DirectPlay' as const,
+  MediaStreams: null,
+  TranscodingInfo: null,
+  PlayState: null,
+  OriginalContainer: null,
+  RemoteEndPoint: '73.160.197.140',
+  ServerId: '1',
+  imported: false,
+};
+
 // Mock modules
 vi.mock('../geoip.js', () => ({
   geoipService: {
@@ -1440,11 +1468,17 @@ vi.mock('../../db/client.js', () => ({
   db: {
     select: vi.fn(),
     insert: vi.fn(),
+    transaction: vi.fn(),
   },
 }));
 
 vi.mock('../../db/timescale.js', () => ({
   refreshAggregates: vi.fn().mockResolvedValue(undefined),
+  uncapDecompressionForTx: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../jobs/poller/database.js', () => ({
+  batchGetLibraryItemIdentity: vi.fn(async () => new Map()),
 }));
 
 // Shared mock for JellyfinClient.getItems - can be configured per test
@@ -1544,6 +1578,12 @@ describe('importJellystatBackup', () => {
     const mockValues = vi.fn().mockResolvedValue(undefined);
     mockDbInsert = vi.fn().mockReturnValue({ values: mockValues });
     (db.insert as ReturnType<typeof vi.fn>) = mockDbInsert;
+
+    // batchProcessor wraps chunk inserts in db.transaction - hand the same
+    // mocked db back as `tx` so mockDbInsert still sees the calls.
+    (db.transaction as ReturnType<typeof vi.fn>) = vi.fn(
+      async (callback: (tx: typeof db) => Promise<unknown>) => callback(db)
+    );
 
     // Default: return server, users, and empty sessions
     mockLimit.mockImplementation(() => {
@@ -2475,26 +2515,99 @@ describe('Theme Music Filtering', () => {
     expect(result.filtered).toBe(1);
   });
 
+  it('should filter out trailer items during import (broadened ExtraType coverage)', async () => {
+    const { db } = await import('../../db/client.js');
+
+    const mockServer = {
+      id: 'server-1',
+      name: 'Test Server',
+      type: 'jellyfin' as const,
+      url: 'http://jellyfin.local:8096',
+      token: 'test-token',
+    };
+
+    const mockServerUser = {
+      id: 'user-1',
+      serverId: 'server-1',
+      externalId: 'a91468af8ed947e0add77f191736dab5',
+    };
+
+    // Configure mock to return trailer metadata for the trailer item
+    // and normal metadata for the regular episode
+    configureMockJellyfinClient([
+      {
+        Id: 'e5a547eef1d6ed70045cc4bc83e0dad5',
+        Type: 'Episode',
+        ParentIndexNumber: 1,
+        IndexNumber: 1,
+        ProductionYear: 2015,
+        ImageTags: { Primary: 'abc123' },
+      },
+      {
+        Id: 'trailer-item-id',
+        Type: 'Video',
+        ExtraType: 'Trailer',
+      },
+    ]);
+
+    let callCount = 0;
+    (db.select as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      callCount++;
+      const mockLimit = vi.fn();
+      const mockWhere = vi.fn().mockReturnValue({ limit: mockLimit });
+      const mockFrom = vi.fn().mockReturnValue({ where: mockWhere });
+
+      if (callCount === 1) {
+        mockLimit.mockResolvedValue([mockServer]);
+      } else if (callCount === 2) {
+        mockWhere.mockResolvedValue([mockServerUser]);
+      } else {
+        mockWhere.mockResolvedValue([]);
+      }
+
+      return { from: mockFrom };
+    });
+
+    const insertedSessions: unknown[] = [];
+    const mockValues = vi.fn().mockImplementation((data) => {
+      insertedSessions.push(...(Array.isArray(data) ? data : [data]));
+      return Promise.resolve(undefined);
+    });
+    (db.insert as ReturnType<typeof vi.fn>).mockReturnValue({ values: mockValues });
+
+    const backup = JSON.stringify([
+      {
+        jf_playback_activity: [REAL_BACKUP_ACTIVITY_1, TRAILER_ACTIVITY],
+      },
+    ]);
+
+    const result = await importJellystatBackup('server-1', backup, true);
+
+    expect(result.success).toBe(true);
+    expect(result.imported).toBe(1); // Only the episode, not the trailer
+    expect(result.filtered).toBe(1); // Trailer was filtered
+    expect(insertedSessions).toHaveLength(1);
+
+    // Verify the inserted session is the episode, not the trailer
+    const session = insertedSessions[0] as Record<string, unknown>;
+    expect(session.mediaTitle).toBe('Pilot');
+  });
+
   it('should still transform theme song activities correctly', () => {
     // transformActivityToSession should work regardless - the filtering
     // happens at the import level, not the transformation level
-    const session = transformActivityToSession(
-      THEME_SONG_ACTIVITY,
-      'server-1',
-      'user-1',
-      {
-        city: null,
-        region: null,
-        country: null,
-        countryCode: null,
-        continent: null,
-        postal: null,
-        lat: null,
-        lon: null,
-        asnNumber: null,
-        asnOrganization: null,
-      }
-    );
+    const session = transformActivityToSession(THEME_SONG_ACTIVITY, 'server-1', 'user-1', {
+      city: null,
+      region: null,
+      country: null,
+      countryCode: null,
+      continent: null,
+      postal: null,
+      lat: null,
+      lon: null,
+      asnNumber: null,
+      asnOrganization: null,
+    });
 
     expect(session.mediaTitle).toBe('Theme Song');
     expect(session.serverId).toBe('server-1');

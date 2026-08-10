@@ -16,21 +16,113 @@ import {
   type ViolationSeverity,
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { sessions, rules, serverUsers, terminationLogs } from '../../db/schema.js';
+import {
+  sessions,
+  rules,
+  servers,
+  serverUsers,
+  terminationLogs,
+  libraryItems,
+  media,
+} from '../../db/schema.js';
 import { mapSessionRow } from './sessionMapper.js';
+
+/** Canonical media identity for a library item, stamped onto sessions at insert. */
+export interface SessionIdentity {
+  mediaId: string | null;
+  showMediaId: string | null;
+  imdbId: string | null;
+  tmdbId: number | null;
+  tvdbId: number | null;
+  parentRatingKey: string | null;
+  grandparentRatingKey: string | null;
+}
+
+/**
+ * Batch load canonical media identity for a set of rating keys on one server
+ * (eliminates a per-session lookup in the polling loop).
+ *
+ * @param serverId - Server the rating keys belong to
+ * @param ratingKeys - Rating keys to resolve identity for
+ * @returns Map of ratingKey -> SessionIdentity
+ */
+export async function batchGetLibraryItemIdentity(
+  serverId: string,
+  ratingKeys: string[]
+): Promise<Map<string, SessionIdentity>> {
+  const result = new Map<string, SessionIdentity>();
+  if (ratingKeys.length === 0) return result;
+
+  const rows = await db
+    .select({
+      ratingKey: libraryItems.ratingKey,
+      mediaId: libraryItems.mediaId,
+      imdbId: libraryItems.imdbId,
+      tmdbId: libraryItems.tmdbId,
+      tvdbId: libraryItems.tvdbId,
+      parentRatingKey: libraryItems.parentRatingKey,
+      grandparentRatingKey: libraryItems.grandparentRatingKey,
+      showMediaId: media.showMediaId,
+      itemMediaType: libraryItems.mediaType,
+    })
+    .from(libraryItems)
+    .leftJoin(media, eq(media.id, libraryItems.mediaId))
+    .where(and(eq(libraryItems.serverId, serverId), inArray(libraryItems.ratingKey, ratingKeys)));
+
+  for (const r of rows) {
+    result.set(r.ratingKey, {
+      mediaId: r.mediaId,
+      showMediaId: r.itemMediaType === 'episode' ? r.showMediaId : null,
+      imdbId: r.imdbId,
+      tmdbId: r.tmdbId,
+      tvdbId: r.tvdbId,
+      parentRatingKey: r.parentRatingKey,
+      grandparentRatingKey: r.grandparentRatingKey,
+    });
+  }
+
+  return result;
+}
 
 // ============================================================================
 // Session Batch Loading
 // ============================================================================
 
+// Fetch-window ceiling: 7 days keeps the query inside the uncompressed
+// chunks of the sessions hypertable and matches the builder's largest window.
+const MAX_RULE_WINDOW_HOURS = 168;
+
+/**
+ * Largest window_hours any of the given rules asks for, floored at 24 so
+ * evaluators without windows keep their day of context, capped at
+ * MAX_RULE_WINDOW_HOURS.
+ */
+export function maxWindowHoursFromRules(rulesList: RuleV2[]): number {
+  let max = 24;
+  for (const rule of rulesList) {
+    for (const group of rule.conditions?.groups ?? []) {
+      for (const condition of group.conditions) {
+        const windowHours = condition.params?.window_hours;
+        if (typeof windowHours === 'number' && windowHours > max) max = windowHours;
+      }
+    }
+  }
+  return Math.min(max, MAX_RULE_WINDOW_HOURS);
+}
+
+// Refreshed on every rules-cache fill; read synchronously by the history
+// fetch below so a 72h unique-IP rule really evaluates over 72h.
+let activeRuleMaxWindowHours = 24;
+
 /**
  * Batch load recent sessions for multiple server users (eliminates N+1 in polling loop)
  *
- * This function fetches sessions from the last N hours for a batch of server users
- * in a single query, avoiding the performance penalty of querying per-user.
+ * This function fetches sessions for a batch of server users in a single
+ * query, avoiding the performance penalty of querying per-user.
  *
  * @param serverUserIds - Array of server user IDs to load sessions for
- * @param hours - Number of hours to look back (default: 24)
+ * @param hours - Number of hours to look back; defaults to the largest
+ *   window_hours any active rule uses (at least 24)
  * @returns Map of serverUserId -> Session[] for each server user
  *
  * @example
@@ -39,11 +131,15 @@ import { mapSessionRow } from './sessionMapper.js';
  */
 export async function batchGetRecentUserSessions(
   serverUserIds: string[],
-  hours = 24
+  hours?: number
 ): Promise<Map<string, Session[]>> {
   if (serverUserIds.length === 0) return new Map();
 
-  const since = new Date(Date.now() - hours * TIME_MS.HOUR);
+  const windowHours = hours ?? activeRuleMaxWindowHours;
+  const since = new Date(Date.now() - windowHours * TIME_MS.HOUR);
+  // The per-user cap scales with the window so a longer window doesn't
+  // silently truncate at one day's worth of rows
+  const perUserCap = Math.ceil(windowHours / 24) * SESSION_LIMITS.MAX_RECENT_PER_USER;
   const result = new Map<string, Session[]>();
 
   // Initialize empty arrays for all server users
@@ -51,17 +147,20 @@ export async function batchGetRecentUserSessions(
     result.set(serverUserId, []);
   }
 
-  // Single query to get recent sessions for all server users using inArray
+  // Single query to get recent sessions for all server users using inArray.
+  // The LIMIT bounds the transfer; per-user fairness comes from the JS cap
+  // below (newest-first ordering means a capped-out user loses old rows).
   const recentSessions = await db
     .select()
     .from(sessions)
     .where(and(inArray(sessions.serverUserId, serverUserIds), gte(sessions.startedAt, since)))
-    .orderBy(desc(sessions.startedAt));
+    .orderBy(desc(sessions.startedAt))
+    .limit(serverUserIds.length * perUserCap);
 
   // Group by server user (limit per user to prevent memory issues)
   for (const s of recentSessions) {
     const userSessions = result.get(s.serverUserId) ?? [];
-    if (userSessions.length < SESSION_LIMITS.MAX_RECENT_PER_USER) {
+    if (userSessions.length < perUserCap) {
       userSessions.push(mapSessionRow(s));
     }
     result.set(s.serverUserId, userSessions);
@@ -115,7 +214,8 @@ export function mergeRecentSessionsForIdentity(
  */
 export async function widenRecentSessionsForMergedIdentities(
   recentSessionsMap: Map<string, Session[]>,
-  identityServerUserIdsMap: Map<string, string[]>
+  identityServerUserIdsMap: Map<string, string[]>,
+  hours?: number
 ): Promise<void> {
   const siblingIdsNeeded = new Set<string>();
   for (const ids of identityServerUserIdsMap.values()) {
@@ -126,7 +226,7 @@ export async function widenRecentSessionsForMergedIdentities(
   }
 
   if (siblingIdsNeeded.size > 0) {
-    const supplemental = await batchGetRecentUserSessions([...siblingIdsNeeded]);
+    const supplemental = await batchGetRecentUserSessions([...siblingIdsNeeded], hours);
     for (const [id, sessionsForId] of supplemental) {
       recentSessionsMap.set(id, sessionsForId);
     }
@@ -240,6 +340,32 @@ export function invalidateRulesCache(): void {
   rulesCache = null;
 }
 
+// Same TTL story as the rules cache: a server change on another instance can
+// take up to this long to reach this instance's poll loop.
+const SERVERS_CACHE_TTL_MS = 10_000;
+
+let serversCache: { data: (typeof servers.$inferSelect)[]; expiresAt: number } | null = null;
+
+/** Invalidate the servers cache. Call from every server create/update/delete path. */
+export function invalidateServersCache(): void {
+  serversCache = null;
+}
+
+/**
+ * All servers, cached briefly: the poll tick and the reconciliation poll each
+ * read the full list several times a minute and the list almost never changes.
+ */
+export async function getCachedServers(): Promise<(typeof servers.$inferSelect)[]> {
+  const now = Date.now();
+  if (serversCache && serversCache.expiresAt > now) {
+    return serversCache.data;
+  }
+
+  const rows = await db.select().from(servers);
+  serversCache = { data: rows, expiresAt: now + SERVERS_CACHE_TTL_MS };
+  return rows;
+}
+
 /**
  * Get all active V2 rules (rules with conditions/actions defined).
  *
@@ -289,5 +415,6 @@ export async function getActiveRulesV2(): Promise<RuleV2[]> {
   const mapped = activeRules.map(mapRuleRowToRuleV2);
 
   rulesCache = { data: mapped, expiresAt: now + RULES_CACHE_TTL_MS };
+  activeRuleMaxWindowHours = maxWindowHoursFromRules(mapped);
   return mapped;
 }

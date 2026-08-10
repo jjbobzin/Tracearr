@@ -81,6 +81,24 @@ import type {
   MergeSuggestion,
   ServerUserSplitResult,
   UserSortField,
+  // Media browsing types
+  WatchedState,
+  CatalogResponse,
+  CatalogLettersResponse,
+  ShelvesResponse,
+  GenresResponse,
+  LibrariesResponse,
+  MediaDetailResponse,
+  MediaChildrenResponse,
+  MediaStatsResponse,
+  MediaWatchersResponse,
+  MediaPlatformBreakdownResponse,
+  MediaSeasonHeatResponse,
+  ServerResourceDataPoint,
+  ServerBandwidthDataPoint,
+  BandwidthSample,
+  BandwidthAccount,
+  BandwidthDevice,
 } from '@tracearr/shared';
 
 // Re-export shared types needed by frontend components
@@ -97,6 +115,37 @@ import { BASE_PATH } from '@/lib/basePath';
 export { BASE_PATH, BASE_URL, imageProxyUrl } from '@/lib/basePath';
 import { MAINTENANCE_EVENT } from '@/hooks/useMaintenanceMode';
 
+// GET /library/media/:id/history has no shared-package response type yet (its
+// query builder still returns the public v2 snake_case play shape rather than
+// the internal camelCase convention other Task-18-era routes use) - minimal
+// shape only, refine once a dedicated internal history type lands. `user` is
+// typed to match mapHistoryRow's actual serialization (snake_case keys,
+// username already resolved to identity name over server username).
+export interface MediaHistoryPlayEntry {
+  id: string;
+  server_id: string;
+  server_name: string;
+  state: string;
+  media_type: string;
+  media_title: string;
+  started_at: string;
+  stopped_at: string | null;
+  duration_ms: number | null;
+  watched: boolean;
+  user: {
+    id: string;
+    username: string;
+    thumb_url: string | null;
+    avatar_url: string | null;
+  };
+  [key: string]: unknown;
+}
+
+export interface MediaHistoryPageResponse {
+  data: MediaHistoryPlayEntry[];
+  meta: { nextCursor: string | null; pageSize: number };
+}
+
 export interface LibraryStatusResponse {
   isSynced: boolean;
   isSyncRunning: boolean;
@@ -108,6 +157,9 @@ export interface LibraryStatusResponse {
   earliestItemDate: string | null;
   earliestSnapshotDate: string | null;
   backfillDays: number | null;
+  /** True while items on the server still carry placeholder version rows;
+   * a full library sync replaces them with observed file versions. */
+  versionsBackfillPending: boolean;
 }
 
 // Stats time range parameters
@@ -237,6 +289,17 @@ export const tokenStorage = {
 // Used by both ApiClient and authClient so they always target the same origin/basePath.
 export const API_BASE_URL = `${BASE_PATH}${API_BASE_PATH}`;
 
+/** Carries the response status so callers can distinguish e.g. a 404 from a network failure. */
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 class ApiClient {
   private baseUrl: string;
 
@@ -295,8 +358,9 @@ class ApiClient {
 
     if (!response.ok) {
       const errorBody = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-      throw new Error(
-        ((errorBody.message ?? errorBody.error) as string) ?? `Request failed: ${response.status}`
+      throw new ApiError(
+        ((errorBody.message ?? errorBody.error) as string) ?? `Request failed: ${response.status}`,
+        response.status
       );
     }
 
@@ -487,30 +551,16 @@ class ApiClient {
         method: 'PATCH',
         body: JSON.stringify({ servers }),
       }),
-    statistics: (id: string) =>
+    liveStats: (id: string) =>
       this.request<{
         serverId: string;
-        data: {
-          at: number;
-          timespan: number;
-          hostCpuUtilization: number;
-          processCpuUtilization: number;
-          hostMemoryUtilization: number;
-          processMemoryUtilization: number;
-        }[];
+        statistics: ServerResourceDataPoint[];
+        bandwidth: ServerBandwidthDataPoint[];
+        bandwidthSamples: BandwidthSample[];
+        bandwidthAccounts: BandwidthAccount[];
+        bandwidthDevices: BandwidthDevice[];
         fetchedAt: string;
-      }>(`/servers/${id}/statistics`),
-    bandwidth: (id: string) =>
-      this.request<{
-        serverId: string;
-        data: {
-          at: number;
-          timespan: number;
-          lanBytes: number;
-          wanBytes: number;
-        }[];
-        fetchedAt: string;
-      }>(`/servers/${id}/bandwidth`),
+      }>(`/servers/${id}/live-stats`),
     health: async () => {
       const response = await this.request<{
         data: { serverId: string; serverName: string }[];
@@ -1154,7 +1204,13 @@ class ApiClient {
       params.set('timezone', getBrowserTimezone());
       return this.request<LibraryStatsResponse>(`/library/stats?${params.toString()}`);
     },
-    growth: (serverIds?: string[], libraryId?: string, period: string = '30d') => {
+    growth: (
+      serverIds?: string[],
+      libraryId?: string,
+      period: string = '30d',
+      startDate?: string,
+      endDate?: string
+    ) => {
       const params = new URLSearchParams();
       if (serverIds?.length) {
         for (const id of serverIds) {
@@ -1163,6 +1219,8 @@ class ApiClient {
       }
       if (libraryId) params.set('libraryId', libraryId);
       params.set('period', period);
+      if (startDate) params.set('startDate', startDate);
+      if (endDate) params.set('endDate', endDate);
       params.set('timezone', getBrowserTimezone());
       return this.request<LibraryGrowthResponse>(`/library/growth?${params.toString()}`);
     },
@@ -1182,6 +1240,17 @@ class ApiClient {
       const params = new URLSearchParams();
       if (serverId) params.set('serverId', serverId);
       if (libraryId) params.set('libraryId', libraryId);
+      params.set('period', period);
+      params.set('timezone', getBrowserTimezone());
+      return this.request<LibraryStorageResponse>(`/library/storage?${params.toString()}`);
+    },
+    // Scoped variant: one request over the whole selection, so the server's
+    // mirror dedup sees every server at once instead of per-server sums
+    storageScoped: (serverIds: string[], period: string = '30d') => {
+      const params = new URLSearchParams();
+      for (const id of serverIds) {
+        params.append('serverIds', id);
+      }
       params.set('period', period);
       params.set('timezone', getBrowserTimezone());
       return this.request<LibraryStorageResponse>(`/library/storage?${params.toString()}`);
@@ -1352,6 +1421,209 @@ class ApiClient {
         `/library/status?${params.toString()}`
       );
     },
+    catalog: (params: {
+      type: 'movie' | 'show';
+      serverIds?: string[];
+      resolution?: string;
+      genre?: string;
+      yearFrom?: number;
+      yearTo?: number;
+      watched?: WatchedState;
+      lens?: string;
+      search?: string;
+      sort?: 'title' | 'added' | 'year' | 'plays' | 'watch_time' | 'viewers';
+      offset?: number;
+      pageSize?: number;
+      libraryKey?: string;
+      hdr?: boolean;
+      sizeGbMin?: number;
+      sizeGbMax?: number;
+    }) => {
+      const searchParams = new URLSearchParams();
+      searchParams.set('type', params.type);
+      if (params.serverIds?.length) {
+        for (const id of params.serverIds) {
+          searchParams.append('serverIds', id);
+        }
+      }
+      if (params.resolution) searchParams.set('resolution', params.resolution);
+      if (params.genre) searchParams.set('genre', params.genre);
+      if (params.yearFrom !== undefined) searchParams.set('yearFrom', String(params.yearFrom));
+      if (params.yearTo !== undefined) searchParams.set('yearTo', String(params.yearTo));
+      if (params.watched) searchParams.set('watched', params.watched);
+      if (params.lens) searchParams.set('lens', params.lens);
+      if (params.search) searchParams.set('search', params.search);
+      if (params.sort) searchParams.set('sort', params.sort);
+      if (params.offset !== undefined) searchParams.set('offset', String(params.offset));
+      if (params.pageSize) searchParams.set('pageSize', String(params.pageSize));
+      if (params.libraryKey) searchParams.set('libraryKey', params.libraryKey);
+      if (params.hdr) searchParams.set('hdr', 'true');
+      if (params.sizeGbMin !== undefined) searchParams.set('sizeGbMin', String(params.sizeGbMin));
+      if (params.sizeGbMax !== undefined) searchParams.set('sizeGbMax', String(params.sizeGbMax));
+      return this.request<CatalogResponse>(`/library/catalog?${searchParams.toString()}`);
+    },
+    catalogLetters: (params: {
+      type: 'movie' | 'show';
+      serverIds?: string[];
+      resolution?: string;
+      genre?: string;
+      yearFrom?: number;
+      yearTo?: number;
+      watched?: WatchedState;
+      lens?: string;
+      search?: string;
+      sort?: 'title' | 'added' | 'year' | 'plays' | 'watch_time' | 'viewers';
+      libraryKey?: string;
+      hdr?: boolean;
+      sizeGbMin?: number;
+      sizeGbMax?: number;
+    }) => {
+      const searchParams = new URLSearchParams();
+      searchParams.set('type', params.type);
+      if (params.serverIds?.length) {
+        for (const id of params.serverIds) {
+          searchParams.append('serverIds', id);
+        }
+      }
+      if (params.resolution) searchParams.set('resolution', params.resolution);
+      if (params.genre) searchParams.set('genre', params.genre);
+      if (params.yearFrom !== undefined) searchParams.set('yearFrom', String(params.yearFrom));
+      if (params.yearTo !== undefined) searchParams.set('yearTo', String(params.yearTo));
+      if (params.watched) searchParams.set('watched', params.watched);
+      if (params.lens) searchParams.set('lens', params.lens);
+      if (params.search) searchParams.set('search', params.search);
+      if (params.sort) searchParams.set('sort', params.sort);
+      if (params.libraryKey) searchParams.set('libraryKey', params.libraryKey);
+      if (params.hdr) searchParams.set('hdr', 'true');
+      if (params.sizeGbMin !== undefined) searchParams.set('sizeGbMin', String(params.sizeGbMin));
+      if (params.sizeGbMax !== undefined) searchParams.set('sizeGbMax', String(params.sizeGbMax));
+      return this.request<CatalogLettersResponse>(
+        `/library/catalog/letters?${searchParams.toString()}`
+      );
+    },
+    shelves: (
+      params: {
+        timeRange?: StatsTimeRange;
+        serverIds?: string[];
+        includeDeadWeight?: boolean;
+      } = {}
+    ) => {
+      const searchParams = new URLSearchParams();
+      if (params.timeRange?.period) searchParams.set('period', params.timeRange.period);
+      if (params.timeRange?.startDate) searchParams.set('startDate', params.timeRange.startDate);
+      if (params.timeRange?.endDate) searchParams.set('endDate', params.timeRange.endDate);
+      if (params.includeDeadWeight === false) searchParams.set('includeDeadWeight', 'false');
+      if (params.serverIds?.length) {
+        for (const id of params.serverIds) {
+          searchParams.append('serverIds', id);
+        }
+      }
+      return this.request<ShelvesResponse>(`/library/shelves?${searchParams.toString()}`);
+    },
+    genres: (type: 'movie' | 'show', serverIds?: string[]) => {
+      const searchParams = new URLSearchParams();
+      searchParams.set('type', type);
+      if (serverIds?.length) {
+        for (const id of serverIds) {
+          searchParams.append('serverIds', id);
+        }
+      }
+      return this.request<GenresResponse>(`/library/genres?${searchParams.toString()}`);
+    },
+    libraries: (serverIds?: string[]) => {
+      const searchParams = new URLSearchParams();
+      if (serverIds?.length) {
+        for (const id of serverIds) {
+          searchParams.append('serverIds', id);
+        }
+      }
+      return this.request<LibrariesResponse>(`/library/libraries?${searchParams.toString()}`);
+    },
+    media: {
+      detail: (id: string, serverIds?: string[]) => {
+        const searchParams = new URLSearchParams();
+        if (serverIds?.length) {
+          for (const serverId of serverIds) {
+            searchParams.append('serverIds', serverId);
+          }
+        }
+        const query = searchParams.toString();
+        return this.request<MediaDetailResponse>(`/library/media/${id}${query ? `?${query}` : ''}`);
+      },
+      children: (id: string, serverIds?: string[]) => {
+        const searchParams = new URLSearchParams();
+        if (serverIds?.length) {
+          for (const serverId of serverIds) {
+            searchParams.append('serverIds', serverId);
+          }
+        }
+        const query = searchParams.toString();
+        return this.request<MediaChildrenResponse>(
+          `/library/media/${id}/children${query ? `?${query}` : ''}`
+        );
+      },
+      stats: (id: string, serverIds?: string[]) => {
+        const searchParams = new URLSearchParams();
+        if (serverIds?.length) {
+          for (const serverId of serverIds) {
+            searchParams.append('serverIds', serverId);
+          }
+        }
+        const query = searchParams.toString();
+        return this.request<MediaStatsResponse>(
+          `/library/media/${id}/stats${query ? `?${query}` : ''}`
+        );
+      },
+      watchers: (id: string, window?: 'all_time' | 'last_30' | 'last_7', serverIds?: string[]) => {
+        const searchParams = new URLSearchParams();
+        if (window) searchParams.set('window', window);
+        if (serverIds?.length) {
+          for (const serverId of serverIds) {
+            searchParams.append('serverIds', serverId);
+          }
+        }
+        return this.request<MediaWatchersResponse>(
+          `/library/media/${id}/watchers?${searchParams.toString()}`
+        );
+      },
+      history: (id: string, cursor?: string, pageSize?: number, serverIds?: string[]) => {
+        const searchParams = new URLSearchParams();
+        if (cursor) searchParams.set('cursor', cursor);
+        if (pageSize) searchParams.set('pageSize', String(pageSize));
+        if (serverIds?.length) {
+          for (const serverId of serverIds) {
+            searchParams.append('serverIds', serverId);
+          }
+        }
+        return this.request<MediaHistoryPageResponse>(
+          `/library/media/${id}/history?${searchParams.toString()}`
+        );
+      },
+      platforms: (id: string, serverIds?: string[]) => {
+        const searchParams = new URLSearchParams();
+        if (serverIds?.length) {
+          for (const serverId of serverIds) {
+            searchParams.append('serverIds', serverId);
+          }
+        }
+        const query = searchParams.toString();
+        return this.request<MediaPlatformBreakdownResponse>(
+          `/library/media/${id}/platforms${query ? `?${query}` : ''}`
+        );
+      },
+      seasonHeat: (id: string, serverIds?: string[]) => {
+        const searchParams = new URLSearchParams();
+        if (serverIds?.length) {
+          for (const serverId of serverIds) {
+            searchParams.append('serverIds', serverId);
+          }
+        }
+        const query = searchParams.toString();
+        return this.request<MediaSeasonHeatResponse>(
+          `/library/media/${id}/season-heat${query ? `?${query}` : ''}`
+        );
+      },
+    },
   };
 
   // Settings
@@ -1499,6 +1771,61 @@ class ApiClient {
         }>(`/import/jellystat/${jobId}`),
       cancel: (jobId: string) =>
         this.request<{ status: string; jobId: string }>(`/import/jellystat/${jobId}`, {
+          method: 'DELETE',
+        }),
+    },
+    playbackReporting: {
+      test: (serverId: string) =>
+        this.request<{
+          success: boolean;
+          installed: boolean;
+          message: string;
+          records?: number;
+          oldestDate?: string;
+          newestDate?: string;
+        }>('/import/playback-reporting/test', {
+          method: 'POST',
+          body: JSON.stringify({ serverId }),
+        }),
+      start: (
+        serverId: string,
+        timezone: string,
+        enrichMedia: boolean = true,
+        importFullRange: boolean = false
+      ) =>
+        this.request<{ status: string; jobId?: string; message: string }>(
+          '/import/playback-reporting',
+          {
+            method: 'POST',
+            body: JSON.stringify({ serverId, timezone, enrichMedia, importFullRange }),
+          }
+        ),
+      getActive: (serverId: string) =>
+        this.request<{
+          active: boolean;
+          jobId?: string;
+          state?: string;
+          progress?: number | object;
+          createdAt?: number;
+        }>(`/import/playback-reporting/active/${serverId}`),
+      getStatus: (jobId: string) =>
+        this.request<{
+          jobId: string;
+          state: string;
+          progress: number | object | null;
+          result?: {
+            success: boolean;
+            imported: number;
+            skipped: number;
+            errors: number;
+            message: string;
+          };
+          failedReason?: string;
+          createdAt?: number;
+          finishedAt?: number;
+        }>(`/import/playback-reporting/${jobId}`),
+      cancel: (jobId: string) =>
+        this.request<{ status: string; jobId: string }>(`/import/playback-reporting/${jobId}`, {
           method: 'DELETE',
         }),
     },

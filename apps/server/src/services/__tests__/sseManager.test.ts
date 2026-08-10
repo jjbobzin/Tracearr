@@ -288,3 +288,74 @@ describe('SSEManager.removeServer', () => {
     expect(internals.lastNudgeAt.has('jf-1')).toBe(false);
   });
 });
+
+describe('SSEManager.nudgeReconnect', () => {
+  let manager: SSEManager;
+  let cache: CacheService;
+
+  beforeEach(() => {
+    manager = new SSEManager();
+    cache = makeCacheService();
+  });
+
+  afterEach(async () => {
+    await manager.stop();
+    vi.clearAllMocks();
+  });
+
+  function fakeStatus(state: string) {
+    return {
+      serverId: 'jf-1',
+      serverName: 'Jellyfin Server',
+      state,
+      connectedAt: null,
+      lastEventAt: null,
+      reconnectAttempts: 0,
+      error: null,
+    };
+  }
+
+  it('retries an unsupported server so a wrong 404 verdict heals on poll success', async () => {
+    await manager.initialize(cache, makePubSubService());
+    await manager.addServer('jf-1', 'Jellyfin Server', 'jellyfin', 'http://jf.local', 'token');
+
+    const internals = manager as unknown as PrivateManagerInternals;
+    internals.handleConnectionStateChange(
+      'jf-1',
+      'Jellyfin Server',
+      'unsupported',
+      fakeStatus('unsupported')
+    );
+
+    manager.nudgeReconnect('jf-1');
+
+    const { JellyfinEmbyEventSource } =
+      await import('../mediaServer/shared/jellyfinEmbyEventSource.js');
+    const instance = vi.mocked(JellyfinEmbyEventSource).mock.results[0]?.value as {
+      retryFromFallback: ReturnType<typeof vi.fn>;
+    };
+    expect(instance.retryFromFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry a connected server', async () => {
+    await manager.initialize(cache, makePubSubService());
+    await manager.addServer('jf-1', 'Jellyfin Server', 'jellyfin', 'http://jf.local', 'token');
+
+    const internals = manager as unknown as PrivateManagerInternals;
+    internals.handleConnectionStateChange(
+      'jf-1',
+      'Jellyfin Server',
+      'connected',
+      fakeStatus('connected')
+    );
+
+    manager.nudgeReconnect('jf-1');
+
+    const { JellyfinEmbyEventSource } =
+      await import('../mediaServer/shared/jellyfinEmbyEventSource.js');
+    const instance = vi.mocked(JellyfinEmbyEventSource).mock.results[0]?.value as {
+      retryFromFallback: ReturnType<typeof vi.fn>;
+    };
+    expect(instance.retryFromFallback).not.toHaveBeenCalled();
+  });
+});

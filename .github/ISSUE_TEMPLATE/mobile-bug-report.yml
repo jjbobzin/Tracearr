@@ -12,6 +12,9 @@ body:
 
       **Before submitting:** Search [existing issues](https://github.com/connorgallopo/tracearr/issues) first.
 
+      **What gets a report closed:** replacing this template with your own format, or pasting
+      AI-generated analysis and suggested fixes in place of the facts the form asks for.
+
 - type: dropdown
   id: platform
   attributes:

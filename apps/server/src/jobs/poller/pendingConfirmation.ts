@@ -1,5 +1,8 @@
 /**
- * Pending session confirmation — shared between SSE and poller paths.
+ * Pending session confirmation for the poller path. SSE runs its own
+ * inline confirmation logic in sseProcessor.ts; both create pending entries
+ * with the same PendingSessionData shape, but the poller uses these helpers
+ * to advance/confirm them while SSE does not import this module.
  */
 
 import type { SessionState } from '@tracearr/shared';

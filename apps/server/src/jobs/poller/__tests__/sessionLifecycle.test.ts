@@ -8,8 +8,75 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import type { Session } from '@tracearr/shared';
+import { DEFAULT_STREAM_DETAILS, type Session } from '@tracearr/shared';
 import type { ActionResult } from '../../../services/rules/executors/index.js';
+import type { GeoLocation } from '../../../services/geoip.js';
+import type { BuildActiveSessionInput } from '../sessionLifecycle.js';
+
+const NULL_GEO: GeoLocation = {
+  city: null,
+  region: null,
+  country: null,
+  countryCode: null,
+  continent: null,
+  postal: null,
+  lat: null,
+  lon: null,
+  asnNumber: null,
+  asnOrganization: null,
+};
+
+function createMockBuildActiveSessionInput(
+  overrides: Partial<BuildActiveSessionInput['processed']> = {}
+): BuildActiveSessionInput {
+  return {
+    session: {
+      id: 'session-1',
+      startedAt: new Date(),
+      lastPausedAt: null,
+      pausedDurationMs: 0,
+      referenceId: null,
+      watched: false,
+    },
+    processed: {
+      ...DEFAULT_STREAM_DETAILS,
+      sessionKey: 'sk-1',
+      state: 'playing',
+      mediaType: 'episode',
+      mediaTitle: 'Episode Title',
+      grandparentTitle: 'Show Title',
+      seasonNumber: 1,
+      episodeNumber: 2,
+      year: 2024,
+      thumbPath: '/thumb.jpg',
+      ratingKey: 'rk-1',
+      totalDurationMs: 1000,
+      progressMs: 500,
+      ipAddress: '10.0.0.1',
+      playerName: 'Player',
+      deviceId: 'device-1',
+      product: 'Plex',
+      device: 'TV',
+      platform: 'Roku',
+      quality: '1080p',
+      isTranscode: false,
+      videoDecision: 'directplay',
+      audioDecision: 'directplay',
+      bitrate: 8000,
+      channelTitle: null,
+      channelIdentifier: null,
+      channelThumb: null,
+      artistName: null,
+      albumName: null,
+      trackNumber: null,
+      discNumber: null,
+      ...overrides,
+    },
+    user: { id: 'user-1', username: 'testuser', thumbUrl: null, identityName: null },
+    geo: NULL_GEO,
+    server: { id: 'server-1', name: 'Server', type: 'plex' },
+  };
+}
 
 function createMockSession(overrides: Partial<Session> = {}): Session {
   return {
@@ -26,6 +93,14 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     year: 2024,
     thumbPath: null,
     ratingKey: 'rk-1',
+    serverVersionKey: null,
+    parentRatingKey: null,
+    grandparentRatingKey: null,
+    mediaId: null,
+    showMediaId: null,
+    imdbId: null,
+    tmdbId: null,
+    tvdbId: null,
     externalSessionId: 'ext-1',
     startedAt: new Date(),
     stoppedAt: null,
@@ -816,5 +891,47 @@ describe('buildRuleContextSessions', () => {
     const result = buildRuleContextSessions([twin, other], triggering, twin.id);
 
     expect(result.map((s) => s.id)).toEqual(['other-id', 'triggering-id']);
+  });
+});
+
+describe('buildActiveSession identity passthrough', () => {
+  it('carries media identity fields from processed.identity onto the ActiveSession', async () => {
+    const { buildActiveSession } = await import('../sessionLifecycle.js');
+
+    const input = createMockBuildActiveSessionInput({
+      identity: {
+        mediaId: 'media-uuid-1',
+        showMediaId: 'show-uuid-1',
+        imdbId: 'tt1234567',
+        tmdbId: 111,
+        tvdbId: 222,
+        parentRatingKey: 'parent-1',
+        grandparentRatingKey: 'grandparent-1',
+      },
+    });
+
+    const activeSession = buildActiveSession(input);
+
+    expect(activeSession.mediaId).toBe('media-uuid-1');
+    expect(activeSession.showMediaId).toBe('show-uuid-1');
+    expect(activeSession.imdbId).toBe('tt1234567');
+    expect(activeSession.tmdbId).toBe(111);
+    expect(activeSession.tvdbId).toBe(222);
+    expect(activeSession.parentRatingKey).toBe('parent-1');
+    expect(activeSession.grandparentRatingKey).toBe('grandparent-1');
+  });
+
+  it('defaults identity fields to null when processed.identity is absent', async () => {
+    const { buildActiveSession } = await import('../sessionLifecycle.js');
+
+    const activeSession = buildActiveSession(createMockBuildActiveSessionInput());
+
+    expect(activeSession.mediaId).toBeNull();
+    expect(activeSession.showMediaId).toBeNull();
+    expect(activeSession.imdbId).toBeNull();
+    expect(activeSession.tmdbId).toBeNull();
+    expect(activeSession.tvdbId).toBeNull();
+    expect(activeSession.parentRatingKey).toBeNull();
+    expect(activeSession.grandparentRatingKey).toBeNull();
   });
 });

@@ -1,0 +1,3 @@
+CREATE INDEX "idx_library_items_added_active" ON "library_items" USING btree ("created_at","id") WHERE "library_items"."removed_at" IS NULL;--> statement-breakpoint
+CREATE INDEX "idx_library_items_type_added_active" ON "library_items" USING btree ("media_type","created_at") WHERE "library_items"."removed_at" IS NULL;--> statement-breakpoint
+CREATE INDEX "idx_library_items_resolution_active" ON "library_items" USING btree ("video_resolution") WHERE "library_items"."removed_at" IS NULL;

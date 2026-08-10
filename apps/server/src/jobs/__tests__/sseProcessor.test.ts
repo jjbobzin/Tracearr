@@ -66,7 +66,11 @@ vi.mock('../poller/stateTracker.js', () => ({
 }));
 
 vi.mock('../poller/database.js', () => ({
+  getServerUserIdByExternalId: vi.fn(() => {
+    throw new Error('getServerUserIdByExternalId not configured in this test');
+  }),
   getActiveRulesV2: vi.fn(),
+  batchGetLibraryItemIdentity: vi.fn().mockResolvedValue(new Map()),
   batchGetRecentUserSessions: vi.fn(),
   mergeRecentSessionsForIdentity: (map: Map<string, unknown[]>, ids: string[]) =>
     ids.flatMap((id) => map.get(id) ?? []),

@@ -89,13 +89,10 @@ const MediaInfo = z.object({
     .string()
     .nullable()
     .openapi({ description: 'Artist name (music tracks only)', example: 'Pink Floyd' }),
-  albumName: z
-    .string()
-    .nullable()
-    .openapi({
-      description: 'Album name (music tracks only)',
-      example: 'The Dark Side of the Moon',
-    }),
+  albumName: z.string().nullable().openapi({
+    description: 'Album name (music tracks only)',
+    example: 'The Dark Side of the Moon',
+  }),
   trackNumber: z
     .number()
     .int()
@@ -798,6 +795,8 @@ export function generateOpenAPIDocument(): unknown {
       version: '1.0.0',
       description: `
 External API for third-party integrations.
+
+Available in Tracearr 1.4.6 and later.
 
 ## Authentication
 

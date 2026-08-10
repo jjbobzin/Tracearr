@@ -7,10 +7,11 @@
  * Plex exposes SSE at: /:/eventsource/notifications
  *
  * Event types we care about:
- * - playing: Session started or resumed
+ * - playing: Session started, resumed, or a periodic position tick - Plex
+ *   re-sends state 'playing' with an advancing viewOffset during playback
+ *   and has no distinct progress state, so this IS the progress stream
  * - paused: Session paused
  * - stopped: Session ended
- * - progress: Playback position updated
  */
 
 import { EventEmitter } from 'events';
@@ -18,9 +19,19 @@ import {
   SSE_CONFIG,
   type PlexSSENotification,
   type PlexPlaySessionNotification,
+  type PlexTimelineEntry,
   type SSEConnectionState,
 } from '@tracearr/shared';
 import { plexHeaders } from '../../../utils/http.js';
+
+// Library section scope for TimelineEntry - other identifiers (DVR, etc.) reuse
+// the same 'timeline' event name for unrelated things
+const LIBRARY_IDENTIFIER = 'com.plexapp.plugins.library';
+
+// TimelineEntry.state: fully processed/added. See PlexTimelineEntry doc comment
+// for why these values are inferred rather than documented.
+const TIMELINE_STATE_ADDED = 5;
+const TIMELINE_STATE_DELETED = 9;
 
 // Re-probe cadence once the reconnect budget is spent; polling covers data meanwhile
 const FALLBACK_RETRY_MS = 3 * 60 * 1000;
@@ -59,6 +70,8 @@ export interface PlexEventSourceEvents {
   'session:paused': PlexPlaySessionNotification;
   'session:stopped': PlexPlaySessionNotification;
   'session:progress': PlexPlaySessionNotification;
+  'library:added': { ratingKey: string };
+  'library:removed': { ratingKey: string };
   'connection:state': SSEConnectionState;
   'connection:error': Error;
 }
@@ -99,6 +112,7 @@ export class PlexEventSource extends EventEmitter {
   private messageListener: ((e: EventSourceMessage) => void) | null = null;
   private playingListener: ((e: EventSourceMessage) => void) | null = null;
   private notificationListener: ((e: EventSourceMessage) => void) | null = null;
+  private timelineListener: ((e: EventSourceMessage) => void) | null = null;
   private pingListener: ((e: EventSourceMessage) => void) | null = null;
 
   constructor(config: { serverId: string; serverName: string; url: string; token: string }) {
@@ -189,6 +203,10 @@ export class PlexEventSource extends EventEmitter {
       this.messageListener = (event: EventSourceMessage) => this.handleMessage(event);
       this.playingListener = (event: EventSourceMessage) => this.handleMessage(event);
       this.notificationListener = (event: EventSourceMessage) => this.handleMessage(event);
+      // Library add/scan/delete lifecycle - unconfirmed whether Plex names this
+      // event 'timeline' or folds it into 'notification'; handleMessage checks
+      // both shapes, so this listener is a best-effort extra, not a requirement
+      this.timelineListener = (event: EventSourceMessage) => this.handleMessage(event);
       this.pingListener = (_event: EventSourceMessage) => this.resetHeartbeatMonitor();
 
       // eventsource v4 requires addEventListener instead of onmessage
@@ -196,6 +214,7 @@ export class PlexEventSource extends EventEmitter {
       this.eventSource.addEventListener('message', this.messageListener);
       this.eventSource.addEventListener('playing', this.playingListener);
       this.eventSource.addEventListener('notification', this.notificationListener);
+      this.eventSource.addEventListener('timeline', this.timelineListener);
 
       // Plex sends ping events every 10 seconds as keepalive
       this.eventSource.addEventListener('ping', this.pingListener);
@@ -247,6 +266,9 @@ export class PlexEventSource extends EventEmitter {
     if (this.notificationListener) {
       this.eventSource.removeEventListener('notification', this.notificationListener);
     }
+    if (this.timelineListener) {
+      this.eventSource.removeEventListener('timeline', this.timelineListener);
+    }
     if (this.pingListener) {
       this.eventSource.removeEventListener('ping', this.pingListener);
     }
@@ -256,6 +278,7 @@ export class PlexEventSource extends EventEmitter {
     this.messageListener = null;
     this.playingListener = null;
     this.notificationListener = null;
+    this.timelineListener = null;
     this.pingListener = null;
   }
 
@@ -284,6 +307,15 @@ export class PlexEventSource extends EventEmitter {
         return;
       }
 
+      // Handle direct TimelineEntry (in case Plex sends 'timeline' unwrapped, like 'playing')
+      if ('TimelineEntry' in data && !('NotificationContainer' in data)) {
+        const entries = data.TimelineEntry as PlexTimelineEntry | PlexTimelineEntry[];
+        for (const entry of Array.isArray(entries) ? entries : [entries]) {
+          this.handleTimelineEntry(entry);
+        }
+        return;
+      }
+
       // Handle wrapped NotificationContainer format (legacy/message events)
       const container = (data as unknown as PlexSSENotification).NotificationContainer;
       if (container?.PlaySessionStateNotification) {
@@ -292,6 +324,11 @@ export class PlexEventSource extends EventEmitter {
           : [container.PlaySessionStateNotification];
         for (const notification of notifications) {
           this.handlePlaySessionNotification(notification, container.type);
+        }
+      }
+      if (container?.TimelineEntry) {
+        for (const entry of container.TimelineEntry) {
+          this.handleTimelineEntry(entry);
         }
       }
     } catch (error) {
@@ -326,6 +363,25 @@ export class PlexEventSource extends EventEmitter {
         // Treat buffering as playing (will resume shortly)
         this.emit('session:playing', notification);
         break;
+    }
+  }
+
+  /**
+   * Handle a library timeline entry (item added/scanning/deleted).
+   *
+   * itemID doubles as the item's ratingKey. Only the terminal states are
+   * acted on - in-progress metadata states (0-4) are noise; 'added' fires
+   * once state reaches 5 (fully processed), not on the initial 'created' tick.
+   */
+  private handleTimelineEntry(entry: PlexTimelineEntry): void {
+    if (entry.identifier !== LIBRARY_IDENTIFIER || !entry.itemID) {
+      return;
+    }
+    const ratingKey = String(entry.itemID);
+    if (entry.state === TIMELINE_STATE_DELETED) {
+      this.emit('library:removed', { ratingKey });
+    } else if (entry.state === TIMELINE_STATE_ADDED) {
+      this.emit('library:added', { ratingKey });
     }
   }
 

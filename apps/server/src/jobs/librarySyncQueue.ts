@@ -10,16 +10,19 @@
 
 import { Queue, Worker, type Job, type ConnectionOptions } from 'bullmq';
 import { isMaintenance } from '../serverState.js';
-import { getRedisPrefix } from '@tracearr/shared';
+import { getRedisPrefix, LEGACY_VERSION_SENTINEL } from '@tracearr/shared';
 import { Redis } from 'ioredis';
 import { sql } from 'drizzle-orm';
 import { WS_EVENTS, REDIS_KEYS } from '@tracearr/shared';
 import type { LibrarySyncProgress } from '@tracearr/shared';
 import { db } from '../db/client.js';
+import { getSetting, setSetting } from '../services/settings.js';
 import { servers } from '../db/schema.js';
 import { librarySyncService, initLibrarySyncRedis } from '../services/librarySync.js';
 import { getPubSubService } from '../services/cache.js';
-import { enqueueMaintenanceJob } from './maintenanceQueue.js';
+import { enqueueMaintenanceJob, maybeEnqueueMaintenanceJob } from './maintenanceQueue.js';
+import { enqueueImagePrecache } from './imagePrecacheQueue.js';
+import { resolvePrecachePass } from './precachePassPolicy.js';
 import { VALID_LIBRARY_ITEM_CONDITION } from '../utils/snapshotValidation.js';
 
 // Job data interface
@@ -32,6 +35,9 @@ export interface LibrarySyncJobData {
 // Queue configuration
 const QUEUE_NAME = 'library-sync';
 
+// Matches libraryEventSync.ts's debounce window - see enqueueLibrarySyncFromEvent
+const EVENT_SYNC_JOB_BUCKET_MS = 30_000;
+
 // Module-level state
 let connectionOptions: ConnectionOptions | null = null;
 let librarySyncQueue: Queue<LibrarySyncJobData> | null = null;
@@ -43,41 +49,111 @@ const activeSyncs = new Map<string, boolean>();
 let lastBackfillCheck: number = 0;
 const BACKFILL_CHECK_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
+// MIN(created_at) over library_items is a plain-table scan and only moves
+// earlier when an import adds older history - cache it for a day. Worst case
+// a backfill triggered by freshly imported old items starts one day late.
+const EARLIEST_ITEM_CACHE_MS = 24 * 60 * 60 * 1000;
+let earliestItemCache: { value: string | null; fetchedAt: number } | null = null;
+
+/**
+ * True when the job was produced by a BullMQ job scheduler (our per-server
+ * auto-sync cron), as opposed to a manual, boot, or event sync.
+ *
+ * A registered scheduler always keeps exactly one job parked in `delayed` for
+ * the next cron slot - up to a full 12h period out - so anything that treats
+ * "a delayed job exists" as "work is already pending" is permanently true and
+ * suppresses every other code path. `repeatJobKey` is how we tell them apart:
+ * BullMQ writes the scheduler id to the job hash's `rjk` field and `getJobs`
+ * hydrates it back onto the Job (Job.fromId -> Job.fromJSON). It's also the
+ * field BullMQ's own removal guard reads (isJobSchedulerJob.lua), which makes
+ * it more reliable than sniffing the `repeat:<id>:<ms>` job id prefix.
+ * Verified against bullmq 5.80.2 on a live Redis.
+ *
+ * The flag survives promotion - a scheduler job that reached waiting or active
+ * still carries repeatJobKey - so only apply this to jobs read from `delayed`.
+ * A promoted one is genuinely imminent work and must count as pending.
+ *
+ * One case this knowingly discounts: a scheduler job sitting in retry-backoff
+ * also lives in `delayed` with repeatJobKey set, so it reads as a placeholder
+ * too even though it's a real pending retry. Accepted trade-off - the cost is
+ * one redundant enqueue, which fails toward extra work rather than a missed
+ * sync.
+ */
+function isSchedulerJob(job: Pick<Job<LibrarySyncJobData>, 'repeatJobKey'>): boolean {
+  return Boolean(job.repeatJobKey);
+}
+
 /**
  * Invalidate library-related caches after sync completes.
  * Uses pattern matching to clear all variants (per-server, per-library, with timezone, etc.)
  */
-async function invalidateLibraryCaches(serverId: string): Promise<void> {
+// Shared namespace for every cache family below - keep in sync with the prefix list in invalidateLibraryCaches.
+const LIBRARY_CACHE_SCAN_PREFIX = `${getRedisPrefix()}tracearr:library:`;
+
+export async function invalidateLibraryCaches(serverId: string): Promise<void> {
   if (!redisClient) return;
 
-  const patterns = [
-    `${REDIS_KEYS.LIBRARY_STATS}*`,
-    `${REDIS_KEYS.LIBRARY_GROWTH}*`,
-    `${REDIS_KEYS.LIBRARY_QUALITY}*`,
-    `${REDIS_KEYS.LIBRARY_STORAGE}*`,
-    `${REDIS_KEYS.LIBRARY_DUPLICATES}*`,
-    `${REDIS_KEYS.LIBRARY_STALE}*`,
-    `${REDIS_KEYS.LIBRARY_WATCH}*`,
-    `${REDIS_KEYS.LIBRARY_COMPLETION}*`,
-    `${REDIS_KEYS.LIBRARY_PATTERNS}*`,
-    `${REDIS_KEYS.LIBRARY_ROI}*`,
-    `${REDIS_KEYS.LIBRARY_TOP_MOVIES}*`,
-    `${REDIS_KEYS.LIBRARY_TOP_SHOWS}*`,
-    `${REDIS_KEYS.LIBRARY_CODECS}*`,
-    `${REDIS_KEYS.LIBRARY_RESOLUTION}*`,
+  // Narrower than LIBRARY_CACHE_SCAN_PREFIX - sync state and precache watermarks also live there and must survive this sweep.
+  const prefixes = [
+    REDIS_KEYS.LIBRARY_STATS,
+    REDIS_KEYS.LIBRARY_GROWTH,
+    REDIS_KEYS.LIBRARY_QUALITY,
+    REDIS_KEYS.LIBRARY_STORAGE,
+    REDIS_KEYS.LIBRARY_DUPLICATES,
+    REDIS_KEYS.LIBRARY_STALE,
+    REDIS_KEYS.LIBRARY_WATCH,
+    REDIS_KEYS.LIBRARY_COMPLETION,
+    REDIS_KEYS.LIBRARY_PATTERNS,
+    REDIS_KEYS.LIBRARY_ROI,
+    REDIS_KEYS.LIBRARY_TOP_MOVIES,
+    REDIS_KEYS.LIBRARY_TOP_SHOWS,
+    REDIS_KEYS.LIBRARY_CODECS,
+    REDIS_KEYS.LIBRARY_RESOLUTION,
+    REDIS_KEYS.LIBRARY_SHELVES,
+    REDIS_KEYS.LIBRARY_GENRES,
+    REDIS_KEYS.LIBRARY_CATALOG_LETTERS,
+    REDIS_KEYS.LIBRARY_CATALOG_WATCHED,
+    REDIS_KEYS.LIBRARY_CATALOG_TOTALS,
+    REDIS_KEYS.LIBRARY_MEDIA_DETAIL(''),
+    REDIS_KEYS.LIBRARY_LIBRARIES,
   ];
 
-  let totalDeleted = 0;
-  for (const pattern of patterns) {
-    const keys = await redisClient.keys(pattern);
-    if (keys.length > 0) {
-      await redisClient.del(...keys);
-      totalDeleted += keys.length;
+  // SCAN, not KEYS (blocks Redis) - one cursor walk over the shared namespace instead of one per cache family.
+  const keys: string[] = [];
+  let cursor = '0';
+  do {
+    const [next, batch] = await redisClient.scan(
+      cursor,
+      'MATCH',
+      `${LIBRARY_CACHE_SCAN_PREFIX}*`,
+      'COUNT',
+      500
+    );
+    cursor = next;
+    for (const key of batch) {
+      if (prefixes.some((prefix) => key.startsWith(prefix))) keys.push(key);
     }
-  }
+  } while (cursor !== '0');
 
-  if (totalDeleted > 0) {
-    console.log(`[LibrarySync] Invalidated ${totalDeleted} cache keys for server ${serverId}`);
+  // The public API stats namespace lives outside the library scan prefix but
+  // serves the same library-derived numbers; sweep it too so v2 consumers
+  // never read pre-sync values for a full TTL.
+  let publicCursor = '0';
+  do {
+    const [next, batch] = await redisClient.scan(
+      publicCursor,
+      'MATCH',
+      `${REDIS_KEYS.PUBLIC_MEDIA_STATS('')}*`,
+      'COUNT',
+      500
+    );
+    publicCursor = next;
+    keys.push(...batch);
+  } while (publicCursor !== '0');
+
+  if (keys.length > 0) {
+    await redisClient.del(...keys);
+    console.log(`[LibrarySync] Invalidated ${keys.length} cache keys for server ${serverId}`);
   }
 }
 
@@ -172,8 +248,26 @@ export function startLibrarySyncWorker(): void {
         // Execute sync
         const results = await librarySyncService.syncServer(serverId, onProgress, triggeredBy);
 
-        // Invalidate library caches after successful sync
-        await invalidateLibraryCaches(serverId);
+        // Event-driven syncs re-run every 30s during a long scan; invalidating
+        // on every no-op pass would keep the whole cache layer cold, so this
+        // only fires when the sync actually touched an item.
+        // itemsRemoved also catches a full-tombstone scan and orphan-cleanup deletes (itemsProcessed stays 0 for both).
+        const hadChanges = results.some((r) => r.itemsProcessed > 0 || r.itemsRemoved > 0);
+        if (hadChanges) {
+          await invalidateLibraryCaches(serverId);
+        }
+
+        // Warm the poster cache for this server's newly synced items (no-op if
+        // disabled, or if nothing changed and the periodic full pass isn't due)
+        const precachePass = await resolvePrecachePass(
+          redisClient,
+          serverId,
+          triggeredBy,
+          hadChanges
+        );
+        if (precachePass) {
+          await enqueueImagePrecache(serverId, null, precachePass.sinceUpdatedAt);
+        }
 
         const duration = Math.round((Date.now() - startTime) / 1000);
         console.log(`[LibrarySync] Job ${job.id} completed in ${duration}s:`, {
@@ -238,12 +332,16 @@ export function startLibrarySyncWorker(): void {
 
   // After sync completes, check if snapshot backfill is needed (with cooldown)
   // Only runs once per hour to avoid constant queries after every server sync
-  librarySyncWorker.on('completed', () => {
+  librarySyncWorker.on('completed', (job) => {
+    // Skipped duplicates did no work; a backlog drain completes hundreds in
+    // seconds and the sentinel probe scans library_item_versions per call
+    if ((job.returnvalue as { skipped?: boolean } | undefined)?.skipped) return;
     const now = Date.now();
     if (now - lastBackfillCheck > BACKFILL_CHECK_COOLDOWN_MS) {
       lastBackfillCheck = now;
       void checkAndTriggerSnapshotBackfill();
     }
+    void stampVersionsBackfillComplete();
   });
 
   console.log('Library sync worker started');
@@ -264,36 +362,96 @@ export function startLibrarySyncWorker(): void {
  *
  * Runs non-blocking - errors are logged but don't affect other operations.
  */
+/**
+ * Stamp mediaVersionsBackfilledAt the first time the last 'legacy:1' version
+ * sentinel clears. The stamp marks where storage numbers change meaning
+ * (multi-version rollups); the storage regression clamp and the release-note
+ * plot line both read it. Write-once: never cleared or moved. Once stamped,
+ * chase the snapshot normalization until its marker lands.
+ */
+let normalizationConfirmed = false;
+
+async function stampVersionsBackfillComplete(): Promise<void> {
+  try {
+    if ((await getSetting('mediaVersionsBackfilledAt')) !== null) {
+      await maybeTriggerSnapshotNormalization();
+      return;
+    }
+    const result = await db.execute(sql`
+      SELECT 1 FROM library_item_versions
+      WHERE server_version_key = ${LEGACY_VERSION_SENTINEL} AND removed_at IS NULL
+      LIMIT 1
+    `);
+    if (result.rows.length === 0) {
+      await setSetting('mediaVersionsBackfilledAt', new Date().toISOString());
+      console.log('[LibrarySync] Version backfill complete; stamped mediaVersionsBackfilledAt');
+      await maybeTriggerSnapshotNormalization();
+    }
+  } catch (error) {
+    console.warn('[LibrarySync] Version backfill stamp check failed:', error);
+  }
+}
+
+async function maybeTriggerSnapshotNormalization(): Promise<void> {
+  if (normalizationConfirmed) return;
+  if ((await getSetting('snapshotsNormalizedAt')) !== null) {
+    normalizationConfirmed = true;
+    return;
+  }
+  const enqueued = await maybeEnqueueMaintenanceJob('normalize_library_snapshots', 'system');
+  if (enqueued) {
+    console.log('[LibrarySync] Snapshot normalization job queued');
+  }
+}
+
 async function checkAndTriggerSnapshotBackfill(): Promise<void> {
   try {
-    // Get earliest item date (only items with valid size) and earliest aggregate date
+    // Aggregate-side facts every run (library_stats_daily is tiny), but the
+    // library_items side is a plain-table scan: the count is only an
+    // existence question, and MIN(created_at) only moves when an import adds
+    // older history, so it's cached below. The staleness gap detection stays
+    // live on every run - it exists to catch the incremental-sync snapshot
+    // bug and must not be cached away.
     // We check library_stats_daily (aggregate) instead of raw library_snapshots
     // because the aggregate persists after raw chunks are cleaned up
     const result = await db.execute(sql`
       SELECT
-        (SELECT MIN(created_at)::date FROM library_items
-         WHERE ${VALID_LIBRARY_ITEM_CONDITION}) AS earliest_item,
         (SELECT MIN(day)::date FROM library_stats_daily) AS earliest_aggregate,
         (SELECT MAX(day)::date FROM library_stats_daily) AS latest_aggregate,
-        (SELECT COUNT(*) FROM library_items) AS item_count,
-        (SELECT COUNT(DISTINCT day) FROM library_stats_daily) AS aggregate_days
+        (SELECT COUNT(DISTINCT day) FROM library_stats_daily) AS aggregate_days,
+        EXISTS (
+          SELECT 1 FROM library_items
+          WHERE ${VALID_LIBRARY_ITEM_CONDITION} AND removed_at IS NULL
+        ) AS has_items
     `);
 
     const row = result.rows[0] as {
-      earliest_item: string | null;
       earliest_aggregate: string | null;
       latest_aggregate: string | null;
-      item_count: string;
       aggregate_days: string;
+      has_items: boolean;
     };
 
-    const itemCount = parseInt(row.item_count, 10);
     const aggregateDays = parseInt(row.aggregate_days, 10);
 
     // No items = nothing to backfill
-    if (itemCount === 0) {
+    if (!row.has_items) {
       return;
     }
+
+    const now = Date.now();
+    if (!earliestItemCache || now - earliestItemCache.fetchedAt >= EARLIEST_ITEM_CACHE_MS) {
+      const earliestResult = await db.execute(sql`
+        SELECT MIN(created_at)::date AS earliest_item
+        FROM library_items
+        WHERE ${VALID_LIBRARY_ITEM_CONDITION} AND removed_at IS NULL
+      `);
+      earliestItemCache = {
+        value: (earliestResult.rows[0] as { earliest_item: string | null }).earliest_item,
+        fetchedAt: now,
+      };
+    }
+    const earliestItem = earliestItemCache.value;
 
     // Detect mid-timeline gaps: aggregate exists but hasn't been updated in 2+ days.
     // This catches the incremental sync snapshot bug where syncs ran but no snapshots
@@ -307,15 +465,29 @@ async function checkAndTriggerSnapshotBackfill(): Promise<void> {
     // No aggregate data yet, aggregate starts after items, or mid-timeline gap
     const needsBackfill =
       aggregateDays === 0 ||
-      (row.earliest_item &&
+      (earliestItem &&
         row.earliest_aggregate &&
-        new Date(row.earliest_item) < new Date(row.earliest_aggregate)) ||
+        new Date(earliestItem) < new Date(row.earliest_aggregate)) ||
       isStale;
 
     if (needsBackfill) {
+      // A pending normalization includes a full backfill; running the plain
+      // backfill first would fill the gap with rows normalization is about
+      // to drop and regenerate anyway
+      if (
+        (await getSetting('mediaVersionsBackfilledAt')) !== null &&
+        (await getSetting('snapshotsNormalizedAt')) === null
+      ) {
+        console.log(
+          '[LibrarySync] Snapshot backfill needed but normalization is pending; deferring to it'
+        );
+        await maybeTriggerSnapshotNormalization();
+        return;
+      }
+
       const reason = isStale
         ? `stale aggregate (last: ${row.latest_aggregate})`
-        : `items from ${row.earliest_item}, aggregate from ${row.earliest_aggregate || 'none'}`;
+        : `items from ${earliestItem}, aggregate from ${row.earliest_aggregate || 'none'}`;
       console.log(`[LibrarySync] Snapshot backfill needed: ${reason}`);
 
       // Trigger backfill job (non-blocking, will be queued)
@@ -384,9 +556,34 @@ export async function scheduleAutoSync(): Promise<void> {
   );
 
   // Queue an immediate sync on boot (non-blocking, staggered to avoid overwhelming startup)
-  // Check for any pending/delayed jobs first to avoid duplicates after rapid restarts
+  // Check for any pending/delayed jobs first to avoid duplicates after rapid restarts.
+  // The schedulers re-added just above each park a delayed job for their next
+  // cron slot, matching every server - counting those would skip boot sync
+  // every time, which is exactly what shipped. Only non-scheduler jobs count.
   const pendingJobs = await librarySyncQueue.getJobs(['delayed', 'waiting']);
-  const pendingServerIds = new Set(pendingJobs.map((j) => j.data.serverId));
+  const queuedSyncJobs = pendingJobs.filter((j) => !isSchedulerJob(j));
+
+  // Backlogs survive restarts in Redis (older releases banked one event-sync
+  // job per 30s bucket during long scans). A sync reads current server state
+  // when it runs, so the newest queued job per server covers all of them.
+  const newestPerServer = new Map<string, Job<LibrarySyncJobData>>();
+  for (const job of queuedSyncJobs) {
+    const current = newestPerServer.get(job.data.serverId);
+    if (!current || (job.timestamp ?? 0) > (current.timestamp ?? 0)) {
+      newestPerServer.set(job.data.serverId, job);
+    }
+  }
+  let sweptCount = 0;
+  for (const job of queuedSyncJobs) {
+    if (newestPerServer.get(job.data.serverId) === job) continue;
+    await job.remove().catch(() => undefined);
+    sweptCount++;
+  }
+  if (sweptCount > 0) {
+    console.log(`[LibrarySync] Swept ${sweptCount} stale queued sync job(s) from a previous run`);
+  }
+
+  const pendingServerIds = new Set(newestPerServer.keys());
 
   for (let i = 0; i < allServers.length; i++) {
     const server = allServers[i];
@@ -430,6 +627,24 @@ export async function enqueueLibrarySync(serverId: string, userId?: string): Pro
     throw new Error('A sync is already in progress for this server');
   }
 
+  // A manual sync supersedes queued scheduled/event syncs for the same server -
+  // they'd redo strictly less work than the manual full pass that's about to run.
+  // Scheduler-owned jobs are left alone: BullMQ refuses to remove the parked
+  // cron placeholder outright, and a promoted one costs at most one redundant
+  // pass that the worker's activeSyncs guard already collapses.
+  const queuedJobs = await librarySyncQueue.getJobs(['waiting', 'delayed']);
+  for (const queued of queuedJobs) {
+    if (
+      queued.data.serverId === serverId &&
+      queued.data.triggeredBy === 'scheduled' &&
+      !isSchedulerJob(queued)
+    ) {
+      await queued.remove().catch(() => {
+        /* raced to active or already gone - the active check above stands */
+      });
+    }
+  }
+
   // Add job with unique ID
   const job = await librarySyncQueue.add(
     `manual-sync-${serverId}`,
@@ -445,6 +660,42 @@ export async function enqueueLibrarySync(serverId: string, userId?: string): Pro
 
   console.log(`[LibrarySync] Enqueued manual sync for server ${serverId} (job ${job.id})`);
   return job.id ?? `manual-${serverId}-${Date.now()}`;
+}
+
+/**
+ * Enqueue a targeted sync triggered by a real-time library event (Plex SSE or
+ * the Jellyfin/Emby plugin SSE). Uses triggeredBy 'scheduled' so the incremental
+ * path stays eligible - unlike a manual sync, an event doesn't warrant forcing
+ * a full scan every time.
+ *
+ * jobId is bucketed to a window matching the event debouncer's collection
+ * window (see libraryEventSync.ts), so if multiple app instances each observed
+ * the same event, their enqueue calls collapse into a single BullMQ job instead
+ * of stacking up duplicate syncs.
+ */
+export async function enqueueLibrarySyncFromEvent(serverId: string): Promise<void> {
+  if (!librarySyncQueue) return;
+
+  // One pending sync per server is all that's ever needed: a sync job reads
+  // the server's current state when it runs. But a job SCHEDULER's parked
+  // delayed job (id "repeat:...") is a placeholder for the next cron slot -
+  // possibly hours out - not pending work, so it must not suppress event
+  // syncs. Scheduler jobs that reached waiting/active ARE real work and do.
+  const [runningJobs, delayedJobs] = await Promise.all([
+    librarySyncQueue.getJobs(['active', 'waiting']),
+    librarySyncQueue.getJobs(['delayed']),
+  ]);
+  const covered =
+    runningJobs.some((job) => job.data.serverId === serverId) ||
+    delayedJobs.some((job) => job.data.serverId === serverId && !isSchedulerJob(job));
+  if (covered) return;
+
+  const bucket = Math.floor(Date.now() / EVENT_SYNC_JOB_BUCKET_MS);
+  await librarySyncQueue.add(
+    `event-sync-${serverId}`,
+    { serverId, triggeredBy: 'scheduled' },
+    { jobId: `event-sync-${serverId}-${bucket}` }
+  );
 }
 
 /**
@@ -492,7 +743,15 @@ export async function getAllActiveLibrarySyncs(): Promise<
     return [];
   }
 
-  const jobs = await librarySyncQueue.getJobs(['active', 'waiting', 'delayed']);
+  // A delayed scheduler placeholder (see isSchedulerJob) is a parked cron
+  // slot, not a pending sync - counting it here is what surfaced as "every
+  // server shows a permanently queued sync" in the tasks UI. Scheduler jobs
+  // that reached waiting/active are real runs and stay in the list.
+  const [runningJobs, delayedJobs] = await Promise.all([
+    librarySyncQueue.getJobs(['active', 'waiting']),
+    librarySyncQueue.getJobs(['delayed']),
+  ]);
+  const jobs = [...runningJobs, ...delayedJobs.filter((job) => !isSchedulerJob(job))];
 
   return Promise.all(
     jobs.map(async (job) => {

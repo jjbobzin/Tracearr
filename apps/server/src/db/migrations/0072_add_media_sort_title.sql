@@ -1,0 +1,2 @@
+ALTER TABLE "media" ADD COLUMN "sort_title" text GENERATED ALWAYS AS (lower(regexp_replace(regexp_replace(normalize("media"."title", NFKC), '^\s*(the|an|a)\s+', '', 'i'), '[^[:alnum:]]+', '', 'g'))) STORED;--> statement-breakpoint
+CREATE INDEX "idx_media_type_sort_title_id" ON "media" USING btree ("media_type","sort_title","id") WHERE "media"."merged_into_id" IS NULL;

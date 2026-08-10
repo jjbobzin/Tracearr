@@ -13,6 +13,7 @@
 import { eq } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import { sessions } from '../../db/schema.js';
+import { uncapDecompressionForTx } from '../../db/timescale.js';
 import { normalizeClient, normalizePlatformName } from '../../utils/platformNormalizer.js';
 import { scrubStringFields } from '../../utils/sanitizeText.js';
 
@@ -104,7 +105,15 @@ export async function flushInsertBatch(
 
   for (let i = 0; i < normalizedSessions.length; i += chunkSize) {
     const chunk = normalizedSessions.slice(i, i + chunkSize);
-    await db.insert(sessions).values(chunk);
+    // Historical rows landing in already-compressed chunk ranges trigger
+    // unique-index verification against compressed segments; the per-DML
+    // decompression cap (default 100000 tuples) could abort a large chunk.
+    // Imports ran uncapped before the cap was restored globally, so keep that
+    // - transaction-scoped, not global.
+    await db.transaction(async (tx) => {
+      await uncapDecompressionForTx(tx);
+      await tx.insert(sessions).values(chunk);
+    });
     insertedCount += chunk.length;
   }
 
@@ -116,6 +125,9 @@ export async function flushInsertBatch(
  *
  * Each update is independent, so we can safely parallelize within chunks.
  * Pool has max 20 connections - keep chunk size within pool limits.
+ *
+ * Every UPDATE deliberately runs in its own implicit transaction, so each row
+ * gets a fresh decompression budget - do not wrap this loop in db.transaction.
  *
  * @param updates - Array of session updates to apply
  * @param options - Options for batch processing

@@ -1,0 +1,2 @@
+ALTER TABLE "library_items" ADD COLUMN "video_dynamic_range" varchar(20);--> statement-breakpoint
+CREATE INDEX "idx_library_items_dynamic_range_active" ON "library_items" USING btree ("video_dynamic_range") WHERE "library_items"."removed_at" IS NULL;

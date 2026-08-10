@@ -31,7 +31,8 @@ export interface ActionResult {
  */
 export interface ActionExecutorDeps {
   logAudit: (params: {
-    sessionId: string;
+    /** null for violations with no session, e.g. account inactivity */
+    sessionId: string | null;
     serverUserId: string;
     serverId: string;
     ruleId: string;
@@ -227,7 +228,9 @@ const executeNotify: ActionExecutor = async (
     data: {
       ruleId: rule.id,
       sessionId: session.id,
-      userId: serverUser.id,
+      serverUserId: serverUser.id,
+      username: serverUser.username,
+      displayName: serverUser.identityName ?? serverUser.username,
       mediaTitle: session.mediaTitle,
       // Image data for rich push notifications
       serverId: server.id,
@@ -407,6 +410,20 @@ export const executorRegistry: Record<ActionType, ActionExecutor> = {
 // ============================================================================
 
 /**
+ * Cooldown keys are scoped per action type so one action's cooldown never
+ * suppresses a different action on the same rule (a notify cooldown must not
+ * swallow the kill_stream). killQueue arms the kill_stream key through this
+ * same builder once a kill actually executes.
+ */
+export function cooldownTargetId(
+  ruleId: string,
+  serverUserId: string,
+  actionType: Action['type']
+): string {
+  return `${ruleId}:${serverUserId}:${actionType}`;
+}
+
+/**
  * Execute a single action, handling cooldowns and confirmation requirements.
  */
 export async function executeAction(
@@ -427,7 +444,7 @@ export async function executeAction(
   // Check cooldown
   const cooldownMinutes = getCooldownMinutes(action);
   if (cooldownMinutes && cooldownMinutes > 0) {
-    const targetId = `${rule.id}:${serverUser.id}`;
+    const targetId = cooldownTargetId(rule.id, serverUser.id, action.type);
     const onCooldown = await currentDeps.checkCooldown(rule.id, targetId, cooldownMinutes);
 
     if (onCooldown) {
@@ -467,7 +484,7 @@ export async function executeAction(
     // cooldown arms later, once the queue reports the kill actually executed
     // (see killQueue.ts) - an aborted kill must not start the cooldown.
     if (cooldownMinutes && cooldownMinutes > 0 && action.type !== 'kill_stream') {
-      const targetId = `${rule.id}:${serverUser.id}`;
+      const targetId = cooldownTargetId(rule.id, serverUser.id, action.type);
       await currentDeps.setCooldown(rule.id, targetId, cooldownMinutes);
     }
 

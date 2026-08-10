@@ -24,6 +24,12 @@ function makeItem(id: string, dateCreated: string) {
   };
 }
 
+/** A Movie-typed item that the extras filter drops (ExtraType set), matching
+ *  how a page full of trailers/behind-the-scenes items parses to zero. */
+function makeExtraItem(id: string, dateCreated: string) {
+  return { ...makeItem(id, dateCreated), ExtraType: 'Trailer' };
+}
+
 function makeItemsResponse(items: unknown[] = [], totalRecordCount?: number) {
   return { Items: items, TotalRecordCount: totalRecordCount ?? items.length };
 }
@@ -180,6 +186,26 @@ describe('BaseMediaServerClient incremental fetch methods', () => {
       expect(result.totalCount).toBe(0);
       expect(result.items).toEqual([]);
     });
+
+    it('does not end the scan on an all-extras page and advances past it by the raw count', async () => {
+      const since = new Date('2024-06-01T00:00:00Z');
+      const extrasPage = Array.from({ length: 200 }, (_, i) =>
+        makeExtraItem(`extra-${i}`, '2024-07-01T00:00:00Z')
+      );
+
+      mockFetchJson
+        .mockResolvedValueOnce(makeItemsResponse(extrasPage, 201))
+        .mockResolvedValueOnce(makeItemsResponse([makeItem('real-1', '2024-07-02T00:00:00Z')], 201))
+        .mockResolvedValueOnce(makeItemsResponse([]));
+
+      const client = makeClient();
+      const result = await client.getLibraryItemsSince('lib-1', since);
+
+      expect(result.items).toHaveLength(1);
+      expect(mockFetchJson).toHaveBeenCalledTimes(3);
+      const secondUrl = mockFetchJson.mock.calls[1]?.[0] as string;
+      expect(secondUrl).toContain('StartIndex=200');
+    });
   });
 
   describe('getLibraryLeavesSince', () => {
@@ -308,6 +334,42 @@ describe('BaseMediaServerClient incremental fetch methods', () => {
 
       expect(result.totalCount).toBe(0);
       expect(result.items).toEqual([]);
+    });
+
+    it('does not end the scan on an all-extras page and advances past it by the raw count', async () => {
+      const since = new Date('2024-06-01T00:00:00Z');
+      const extrasPage = Array.from({ length: 200 }, (_, i) => ({
+        Id: `extra-${i}`,
+        Name: `Extra ${i}`,
+        Type: 'Episode',
+        DateCreated: '2024-07-01T00:00:00Z',
+        SeriesName: 'Test Show',
+        SeriesId: 'series-1',
+        ExtraType: 'BehindTheScenes',
+      }));
+      const realEpisode = {
+        Id: 'real-1',
+        Name: 'Real Episode',
+        Type: 'Episode',
+        DateCreated: '2024-07-02T00:00:00Z',
+        SeriesName: 'Test Show',
+        SeriesId: 'series-1',
+        ParentIndexNumber: 1,
+        IndexNumber: 1,
+      };
+
+      mockFetchJson
+        .mockResolvedValueOnce(makeItemsResponse(extrasPage, 201))
+        .mockResolvedValueOnce(makeItemsResponse([realEpisode], 201))
+        .mockResolvedValueOnce(makeItemsResponse([]));
+
+      const client = makeClient();
+      const result = await client.getLibraryLeavesSince('lib-2', since);
+
+      expect(result.items).toHaveLength(1);
+      expect(mockFetchJson).toHaveBeenCalledTimes(3);
+      const secondUrl = mockFetchJson.mock.calls[1]?.[0] as string;
+      expect(secondUrl).toContain('StartIndex=200');
     });
   });
 });

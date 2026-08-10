@@ -28,7 +28,9 @@ vi.mock('../../../db/client.js', () => ({
       from: () => ({
         where: () => {
           const promise = Promise.resolve(supplementalRows);
-          return Object.assign(promise, { orderBy: () => promise });
+          return Object.assign(promise, {
+            orderBy: () => Object.assign(promise, { limit: () => promise }),
+          });
         },
       }),
     }),
@@ -59,6 +61,14 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     year: 2024,
     thumbPath: null,
     ratingKey: 'rk-1',
+    serverVersionKey: null,
+    parentRatingKey: null,
+    grandparentRatingKey: null,
+    mediaId: null,
+    showMediaId: null,
+    imdbId: null,
+    tmdbId: null,
+    tvdbId: null,
     externalSessionId: 'ext-1',
     startedAt: new Date(),
     stoppedAt: null,
@@ -124,7 +134,6 @@ function createMockServerUser(overrides: Partial<ServerUser> = {}): ServerUser {
     email: 'test@example.com',
     thumbUrl: null,
     isServerAdmin: false,
-    sessionCount: 10,
     joinedAt: new Date(),
     lastActivityAt: new Date(),
     trustScore: 100,

@@ -32,6 +32,7 @@ import { testServerConnections } from '../services/mediaServer/plex/connectionTe
 import { syncServer } from '../services/sync.js';
 import { getUserById, getUserByPlexAccountId } from '../services/userService.js';
 import { getRedis } from './redisShared.js';
+import { invalidateServersCache } from '../jobs/poller/database.js';
 import { assertSignupAllowed, assertClaimCode } from './authGuards.js';
 
 const PLEX_TEMP_TOKEN_TTL = 10 * 60; // 10 minutes for server selection
@@ -188,6 +189,7 @@ export const plexPlugin = () =>
                   .set({ token: authResult.token, updatedAt: new Date() })
                   .where(eq(servers.plexAccountId, account.id))
                   .returning({ id: servers.id, name: servers.name });
+                if (refreshed.length > 0) invalidateServersCache();
 
                 if (refreshed.length > 0) {
                   ctx.context.logger.info('Refreshed Plex token for linked servers', {
@@ -481,6 +483,7 @@ export const plexPlugin = () =>
                 })
                 .where(eq(servers.id, existingServer.id));
             }
+            invalidateServersCache();
 
             const serverId = server[0]!.id;
 
@@ -533,6 +536,7 @@ export const plexPlugin = () =>
               .update(servers)
               .set({ plexAccountId: newPlexAccount.id })
               .where(eq(servers.id, serverId));
+            invalidateServersCache();
 
             await db.insert(serverUsers).values({
               userId: newUser.id,

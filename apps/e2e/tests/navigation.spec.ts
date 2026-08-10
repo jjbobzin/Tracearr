@@ -63,36 +63,44 @@ test.describe('Stats Navigation', () => {
   });
 });
 
-test.describe('Library Navigation', () => {
-  test('can navigate to library overview page', async ({ page }) => {
+test.describe('Media Navigation', () => {
+  test('can navigate to the media overview page', async ({ page }) => {
     await page.goto('/');
-    const libraryGroup = page.locator('li', { has: page.getByRole('button', { name: 'Library' }) });
-    await libraryGroup.getByRole('button', { name: 'Library' }).click();
-    await libraryGroup.getByRole('link', { name: 'Overview' }).click();
+    const mediaGroup = page.locator('li', { has: page.getByRole('button', { name: 'Media' }) });
+    await mediaGroup.getByRole('button', { name: 'Media' }).click();
+    await mediaGroup.getByRole('link', { name: 'Overview' }).click();
     await expect(page.getByRole('heading', { name: 'Library', level: 1 })).toBeVisible();
+  });
+
+  test('can navigate to the browse page', async ({ page }) => {
+    await page.goto('/');
+    const mediaGroup = page.locator('li', { has: page.getByRole('button', { name: 'Media' }) });
+    await mediaGroup.getByRole('button', { name: 'Media' }).click();
+    await mediaGroup.getByRole('link', { name: 'Browse' }).click();
+    await expect(page).toHaveURL(/\/media\/browse$/);
   });
 
   test('can navigate to quality page', async ({ page }) => {
     await page.goto('/');
-    const libraryGroup = page.locator('li', { has: page.getByRole('button', { name: 'Library' }) });
-    await libraryGroup.getByRole('button', { name: 'Library' }).click();
-    await libraryGroup.getByRole('link', { name: 'Quality' }).click();
+    const mediaGroup = page.locator('li', { has: page.getByRole('button', { name: 'Media' }) });
+    await mediaGroup.getByRole('button', { name: 'Media' }).click();
+    await mediaGroup.getByRole('link', { name: 'Quality' }).click();
     await expect(page.getByRole('heading', { name: 'Quality', level: 1 })).toBeVisible();
   });
 
   test('can navigate to storage page', async ({ page }) => {
     await page.goto('/');
-    const libraryGroup = page.locator('li', { has: page.getByRole('button', { name: 'Library' }) });
-    await libraryGroup.getByRole('button', { name: 'Library' }).click();
-    await libraryGroup.getByRole('link', { name: 'Storage' }).click();
+    const mediaGroup = page.locator('li', { has: page.getByRole('button', { name: 'Media' }) });
+    await mediaGroup.getByRole('button', { name: 'Media' }).click();
+    await mediaGroup.getByRole('link', { name: 'Storage' }).click();
     await expect(page.getByRole('heading', { name: 'Storage', level: 1 })).toBeVisible();
   });
 
   test('can navigate to watch page', async ({ page }) => {
     await page.goto('/');
-    const libraryGroup = page.locator('li', { has: page.getByRole('button', { name: 'Library' }) });
-    await libraryGroup.getByRole('button', { name: 'Library' }).click();
-    await libraryGroup.getByRole('link', { name: 'Watch' }).click();
+    const mediaGroup = page.locator('li', { has: page.getByRole('button', { name: 'Media' }) });
+    await mediaGroup.getByRole('button', { name: 'Media' }).click();
+    await mediaGroup.getByRole('link', { name: 'Watch' }).click();
     await expect(page.getByRole('heading', { name: 'Watch Analytics', level: 1 })).toBeVisible();
   });
 });

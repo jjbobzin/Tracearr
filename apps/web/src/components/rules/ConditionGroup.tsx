@@ -15,6 +15,7 @@ interface ConditionGroupProps {
   onRemove: () => void;
   showRemove?: boolean;
   filterOptions?: RulesFilterOptions;
+  allowedFields?: ReadonlySet<string>;
 }
 
 export function ConditionGroup({
@@ -24,6 +25,7 @@ export function ConditionGroup({
   onRemove,
   showRemove = true,
   filterOptions,
+  allowedFields,
 }: ConditionGroupProps) {
   // Add a new condition to the group
   const addCondition = () => {
@@ -96,6 +98,7 @@ export function ConditionGroup({
               onRemove={() => removeCondition(index)}
               showRemove={group.conditions.length > 1}
               filterOptions={filterOptions}
+              allowedFields={allowedFields}
             />
           </div>
         ))}

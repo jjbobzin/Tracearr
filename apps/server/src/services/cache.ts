@@ -39,6 +39,10 @@ export interface CacheService {
   setDashboardStats(stats: DashboardStats): Promise<void>;
   invalidateDashboardStatsCache(): Promise<void>;
 
+  // Public API v2 per-media stats/watchers (TTL-based, no active invalidation)
+  getMediaStats<T>(cacheKey: string): Promise<T | null>;
+  setMediaStats(cacheKey: string, value: unknown): Promise<void>;
+
   // Session by ID
   getSessionById(id: string): Promise<ActiveSession | null>;
   setSessionById(id: string, session: ActiveSession): Promise<void>;
@@ -379,6 +383,24 @@ export function createCacheService(redis: Redis): CacheService {
 
     async invalidateDashboardStatsCache(): Promise<void> {
       await invalidateDashboardStats();
+    },
+
+    async getMediaStats<T>(cacheKey: string): Promise<T | null> {
+      const data = await redis.get(REDIS_KEYS.PUBLIC_MEDIA_STATS(cacheKey));
+      if (!data) return null;
+      try {
+        return JSON.parse(data) as T;
+      } catch {
+        return null;
+      }
+    },
+
+    async setMediaStats(cacheKey: string, value: unknown): Promise<void> {
+      await redis.setex(
+        REDIS_KEYS.PUBLIC_MEDIA_STATS(cacheKey),
+        CACHE_TTL.PUBLIC_MEDIA_STATS,
+        JSON.stringify(value)
+      );
     },
 
     // Session by ID

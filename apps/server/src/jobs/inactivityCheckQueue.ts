@@ -11,16 +11,24 @@ import type { Redis } from 'ioredis';
 import { isMaintenance } from '../serverState.js';
 import { eq, and, isNull } from 'drizzle-orm';
 import type {
-  Rule,
   AccountInactivityParams,
   ViolationWithDetails,
   RuleConditions,
   Operator,
 } from '@tracearr/shared';
-import { WS_EVENTS, TIME_MS } from '@tracearr/shared';
+import { WS_EVENTS, TIME_MS, INACTIVITY_COMPATIBLE_FIELDS } from '@tracearr/shared';
 import { db } from '../db/client.js';
 import { rules, serverUsers, violations, users, servers } from '../db/schema.js';
 import { ruleEngine } from '../services/rules.js';
+import { compare } from '../services/rules/comparisons.js';
+import { batchGetIdentityServerUserIds } from './poller/database.js';
+import {
+  getActionExecutorDeps,
+  cooldownTargetId,
+  type ActionResult,
+} from '../services/rules/executors/index.js';
+import { storeActionResults } from '../services/rules/v2Integration.js';
+import { recomputeIdentityAggregatesForServerUser } from '../services/userService.js';
 import { enqueueNotification } from './notificationQueue.js';
 
 // Queue name
@@ -64,6 +72,68 @@ export function extractInactiveDaysFromConditions(
     }
   }
   return null;
+}
+
+/**
+ * True when some group can never match in this worker because every condition
+ * in it needs a session. Groups AND together, so one such group makes the
+ * whole rule unmatchable here.
+ */
+export function hasSessionOnlyGroup(conditions: RuleConditions): boolean {
+  const compatible = INACTIVITY_COMPATIBLE_FIELDS as readonly string[];
+  return conditions.groups.some((group) =>
+    group.conditions.every((c) => !compatible.includes(c.field))
+  );
+}
+
+/**
+ * Evaluate a rule's conditions for a dormant account. Mirrors engine.ts
+ * semantics: groups AND together, conditions within a group OR together.
+ * Session-only fields cannot match without a session and evaluate false.
+ * inactiveDays is null for never-active accounts; each inactive_days leaf
+ * compares with its OWN operator and threshold, since a band rule like
+ * "gte 30 AND lte 60" has two leaves that must not share one result.
+ */
+export function evaluateUserLevelConditions(
+  conditions: RuleConditions,
+  user: { id: string; serverId: string; trustScore: number; createdAt: Date },
+  inactiveDays: number | null,
+  identityServerUserIds: readonly string[] = []
+): boolean {
+  return conditions.groups.every((group) =>
+    group.conditions.some((c) => {
+      switch (c.field) {
+        case 'inactive_days': {
+          // Never-active semantics match evaluateAccountInactivity: infinite
+          // inactivity satisfies gte/gt/neq, never eq/lt/lte.
+          if (inactiveDays === null) {
+            return c.operator === 'gte' || c.operator === 'gt' || c.operator === 'neq';
+          }
+          return compare(inactiveDays, c.operator, c.value);
+        }
+        case 'server_id':
+          return compare(user.serverId, c.operator, c.value);
+        case 'user_id': {
+          // Person semantics, mirroring evaluateUserId: the stored value is a
+          // representative account id, so membership in this account's
+          // identity is the match, not id equality.
+          const identityIds = new Set(identityServerUserIds);
+          identityIds.add(user.id);
+          const values = Array.isArray(c.value) ? c.value : [c.value];
+          const anyMember = values.some((v) => typeof v === 'string' && identityIds.has(v));
+          return c.operator === 'neq' || c.operator === 'not_in' ? !anyMember : anyMember;
+        }
+        case 'trust_score':
+          return compare(user.trustScore, c.operator, c.value);
+        case 'account_age_days': {
+          const ageDays = Math.floor((Date.now() - user.createdAt.getTime()) / TIME_MS.DAY);
+          return compare(ageDays, c.operator, c.value);
+        }
+        default:
+          return false;
+      }
+    })
+  );
 }
 
 // Connection options (set during initialization)
@@ -272,6 +342,13 @@ async function processInactivityCheck(job: Job<InactivityCheckJobData>): Promise
       );
       continue;
     }
+    if (rule.conditions && hasSessionOnlyGroup(rule.conditions)) {
+      console.warn(
+        `[Inactivity] Rule ${rule.name} (${rule.id}) has a group of session-only conditions ` +
+          `that can never match outside a session, skipping`
+      );
+      continue;
+    }
     const params: AccountInactivityParams = {
       inactivityValue: inactivityCondition.value,
       inactivityUnit: 'days',
@@ -280,45 +357,71 @@ async function processInactivityCheck(job: Job<InactivityCheckJobData>): Promise
 
     console.log(`[Inactivity] Checking rule: ${rule.name} (${rule.id})`);
 
-    // Get users to check based on rule scope (exclude removed users)
-    let usersToCheck;
+    // Rule scope narrows the account set: per-account, per-server, or
+    // per-identity. All three server types flow through here identically.
+    const scopeFilters = [isNull(serverUsers.removedAt)];
     if (rule.serverUserId) {
-      // Per-user rule - only check this specific user (if not removed)
-      usersToCheck = await db
-        .select({
-          id: serverUsers.id,
-          username: serverUsers.username,
-          lastActivityAt: serverUsers.lastActivityAt,
-          serverId: serverUsers.serverId,
-        })
-        .from(serverUsers)
-        .where(and(eq(serverUsers.id, rule.serverUserId), isNull(serverUsers.removedAt)));
-    } else {
-      // Global rule - check all active users
-      usersToCheck = await db
-        .select({
-          id: serverUsers.id,
-          username: serverUsers.username,
-          lastActivityAt: serverUsers.lastActivityAt,
-          serverId: serverUsers.serverId,
-        })
-        .from(serverUsers)
-        .where(isNull(serverUsers.removedAt));
+      scopeFilters.push(eq(serverUsers.id, rule.serverUserId));
     }
+    if (rule.serverId) {
+      scopeFilters.push(eq(serverUsers.serverId, rule.serverId));
+    }
+    if (rule.userId) {
+      scopeFilters.push(eq(serverUsers.userId, rule.userId));
+    }
+
+    const usersToCheck = await db
+      .select({
+        id: serverUsers.id,
+        userId: serverUsers.userId,
+        username: serverUsers.username,
+        lastActivityAt: serverUsers.lastActivityAt,
+        serverId: serverUsers.serverId,
+        trustScore: serverUsers.trustScore,
+        createdAt: serverUsers.createdAt,
+      })
+      .from(serverUsers)
+      .where(and(...scopeFilters));
 
     console.log(`[Inactivity] Checking ${usersToCheck.length} users for rule ${rule.name}`);
 
+    // user_id conditions use person semantics; one batched lookup per rule
+    // resolves each account's identity siblings
+    const identityIdsByUser = await batchGetIdentityServerUserIds([
+      ...new Set(usersToCheck.map((u) => u.userId)),
+    ]);
+
     for (const user of usersToCheck) {
-      // Evaluate inactivity for this user
+      // Evaluate inactivity for this user, then the rule's remaining
+      // user-level conditions (trust score, account age, server, user)
       const result = ruleEngine.evaluateAccountInactivity(user, params, operator);
 
-      if (result.violated) {
-        // Only create violation if no existing unacknowledged violation exists
-        const shouldCreate = await shouldCreateViolation(user.id, rule.id);
+      const inactiveDays = user.lastActivityAt
+        ? Math.floor((Date.now() - user.lastActivityAt.getTime()) / TIME_MS.DAY)
+        : null;
+      const matched = rule.conditions
+        ? evaluateUserLevelConditions(
+            rule.conditions,
+            user,
+            inactiveDays,
+            identityIdsByUser.get(user.userId) ?? []
+          )
+        : result.violated;
 
-        if (shouldCreate) {
-          await createInactivityViolation(rule as unknown as Rule, user, result);
-          totalViolations++;
+      if (matched && result.violated) {
+        try {
+          // Only create violation if no existing unacknowledged violation exists
+          const shouldCreate = await shouldCreateViolation(user.id, rule.id);
+
+          if (shouldCreate) {
+            await createInactivityViolation(rule, user, result);
+            totalViolations++;
+          }
+        } catch (error) {
+          console.error(
+            `[Inactivity] Failed to process violation for ${user.username} on rule ${rule.name}:`,
+            error
+          );
         }
       }
     }
@@ -327,7 +430,11 @@ async function processInactivityCheck(job: Job<InactivityCheckJobData>): Promise
   console.log(`[Inactivity] Check complete. Created ${totalViolations} violations.`);
 }
 
-/** Skip if any violation already exists for this user+rule (dismissed ones are deleted, so those won't block) */
+/**
+ * Skip if any violation already exists for this user+rule. Dismissed rows are
+ * soft-deleted and deliberately included: a dismissed inactivity violation
+ * must never re-arm, or the hourly tick re-runs the rule's actions forever.
+ */
 async function shouldCreateViolation(serverUserId: string, ruleId: string): Promise<boolean> {
   const existing = await db
     .select({ id: violations.id })
@@ -342,7 +449,7 @@ async function shouldCreateViolation(serverUserId: string, ruleId: string): Prom
  * Create an inactivity violation (no associated session)
  */
 async function createInactivityViolation(
-  rule: Rule,
+  rule: typeof rules.$inferSelect,
   user: { id: string; username: string; serverId: string },
   result: { severity: string; data: Record<string, unknown> }
 ): Promise<void> {
@@ -354,14 +461,18 @@ async function createInactivityViolation(
         ruleId: rule.id,
         serverUserId: user.id,
         sessionId: null, // No session for inactivity violations
-        severity: result.severity as 'low' | 'warning' | 'high',
+        severity: rule.severity as 'low' | 'warning' | 'high',
         ruleType: 'account_inactivity',
         data: result.data,
       })
       .onConflictDoNothing()
       .returning();
 
-    return insertedRows[0];
+    const inserted = insertedRows[0];
+    if (inserted) {
+      await recomputeIdentityAggregatesForServerUser(user.id, tx);
+    }
+    return inserted;
   });
 
   if (!created) {
@@ -427,6 +538,138 @@ async function createInactivityViolation(
     // Enqueue notification for async dispatch (Discord, webhooks, push)
     await enqueueNotification({ type: 'violation', payload: violationWithDetails });
   }
+
+  await executeInactivityActions(
+    rule,
+    {
+      serverUserId: details.userId,
+      username: details.username,
+      displayName: details.identityName ?? details.username,
+      serverId: details.serverId,
+      thumbUrl: details.thumbUrl,
+    },
+    created.id,
+    result.data
+  );
+}
+
+/**
+ * Run the rule's configured actions for an inactivity violation. There is no
+ * session, so session-bound actions (kill_stream, message_client) record a
+ * skipped result instead of executing; the rest go through the same executor
+ * deps and per-action-type cooldown keys as the session path
+ * (services/rules/executors/index.ts).
+ */
+export async function executeInactivityActions(
+  rule: Pick<typeof rules.$inferSelect, 'id' | 'name' | 'actions'>,
+  target: {
+    serverUserId: string;
+    username: string;
+    displayName: string;
+    serverId: string;
+    thumbUrl: string | null;
+  },
+  violationId: string,
+  data: Record<string, unknown>
+): Promise<void> {
+  const actions = rule.actions?.actions ?? [];
+  if (actions.length === 0) return;
+
+  const deps = getActionExecutorDeps();
+  const results: ActionResult[] = [];
+
+  for (const action of actions) {
+    if (action.type === 'kill_stream' || action.type === 'message_client') {
+      results.push({
+        action,
+        success: true,
+        skipped: true,
+        skipReason: 'No active session for an inactivity violation',
+      });
+      continue;
+    }
+
+    const cooldownMinutes =
+      'cooldown_minutes' in action && typeof action.cooldown_minutes === 'number'
+        ? action.cooldown_minutes
+        : undefined;
+    const targetId = cooldownTargetId(rule.id, target.serverUserId, action.type);
+
+    if (cooldownMinutes && cooldownMinutes > 0) {
+      const onCooldown = await deps.checkCooldown(rule.id, targetId, cooldownMinutes);
+      if (onCooldown) {
+        results.push({
+          action,
+          success: true,
+          skipped: true,
+          skipReason: `On cooldown (${cooldownMinutes} minutes)`,
+        });
+        continue;
+      }
+    }
+
+    try {
+      switch (action.type) {
+        case 'notify': {
+          if (action.channels.length > 0) {
+            const message = data.neverActive
+              ? `Account "${target.username}" has never been active`
+              : `Account "${target.username}" has been inactive for ${String(data.inactiveDays)} days`;
+            await deps.sendNotification({
+              channels: action.channels,
+              title: `Rule Triggered: ${rule.name}`,
+              message,
+              data: {
+                ruleId: rule.id,
+                serverUserId: target.serverUserId,
+                username: target.username,
+                displayName: target.displayName,
+                serverId: target.serverId,
+                userThumbUrl: target.thumbUrl,
+              },
+            });
+          }
+          break;
+        }
+        case 'adjust_trust':
+          if (action.amount !== 0) {
+            await deps.adjustUserTrust(target.serverUserId, action.amount);
+          }
+          break;
+        case 'set_trust':
+          await deps.setUserTrust(target.serverUserId, action.value);
+          break;
+        case 'reset_trust':
+          await deps.resetUserTrust(target.serverUserId);
+          break;
+        case 'log_only':
+          await deps.logAudit({
+            sessionId: null,
+            serverUserId: target.serverUserId,
+            serverId: target.serverId,
+            ruleId: rule.id,
+            ruleName: rule.name,
+            message: action.message,
+            details: data,
+          });
+          break;
+      }
+
+      results.push({ action, success: true, message: `Executed ${action.type}` });
+
+      if (cooldownMinutes && cooldownMinutes > 0) {
+        await deps.setCooldown(rule.id, targetId, cooldownMinutes);
+      }
+    } catch (error) {
+      results.push({
+        action,
+        success: false,
+        message: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  await storeActionResults(violationId, rule.id, results);
 }
 
 /**

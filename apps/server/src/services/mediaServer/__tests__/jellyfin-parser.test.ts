@@ -80,6 +80,35 @@ describe('Jellyfin Parser - DirectStream Behavior', () => {
 });
 
 // ============================================================================
+// Jellyfin-Specific: Version Identity
+// ============================================================================
+
+describe('Jellyfin Parser - version identity', () => {
+  it('stamps serverVersionKey from PlayState.MediaSourceId', () => {
+    const session = parseSession({
+      Id: 'session-1',
+      NowPlayingItem: { Id: '1', Name: 'Test', Type: 'Movie' },
+      PlayState: {
+        IsPaused: false,
+        MediaSourceId: 'afae55612a42810f43ad292d9a910ff8',
+      },
+    });
+
+    expect(session!.serverVersionKey).toBe('afae55612a42810f43ad292d9a910ff8');
+  });
+
+  it('leaves serverVersionKey unset when PlayState omits MediaSourceId', () => {
+    const session = parseSession({
+      Id: 'session-1',
+      NowPlayingItem: { Id: '1', Name: 'Test', Type: 'Movie' },
+      PlayState: { IsPaused: false },
+    });
+
+    expect(session!.serverVersionKey).toBeUndefined();
+  });
+});
+
+// ============================================================================
 // Jellyfin-Specific: LastPausedDate Support
 // ============================================================================
 
@@ -121,5 +150,54 @@ describe('Jellyfin Parser - LastPausedDate', () => {
     });
 
     expect(session!.lastPausedDate).toBeUndefined();
+  });
+});
+
+describe('Jellyfin Parser - transcode progress parity', () => {
+  it('parses progress, derived speed, and hardware acceleration', () => {
+    const session = parseSession({
+      Id: 'session-1',
+      NowPlayingItem: {
+        Id: '1',
+        Name: 'Test',
+        Type: 'Movie',
+        MediaStreams: [{ Type: 'Video', RealFrameRate: 23.976, Codec: 'hevc' }],
+      },
+      PlayState: { IsPaused: false },
+      TranscodingInfo: {
+        IsVideoDirect: false,
+        CompletionPercentage: 42.5,
+        Framerate: 96,
+        HardwareAccelerationType: 'qsv',
+        Container: 'ts',
+      },
+    });
+
+    const info = session!.quality.transcodeInfo;
+    expect(info?.progress).toBe(42.5);
+    expect(info?.speed).toBe(4);
+    expect(info?.hwRequested).toBe(true);
+    expect(info?.hwEncoding).toBe('qsv');
+    expect(info?.throttled).toBeUndefined();
+    expect(info?.maxOffsetAvailable).toBeUndefined();
+  });
+
+  it('sets no hardware fields when acceleration is none', () => {
+    const session = parseSession({
+      Id: 'session-1',
+      NowPlayingItem: { Id: '1', Name: 'Test', Type: 'Movie' },
+      PlayState: { IsPaused: false },
+      TranscodingInfo: {
+        IsVideoDirect: false,
+        CompletionPercentage: 10,
+        HardwareAccelerationType: 'none',
+      },
+    });
+
+    const info = session!.quality.transcodeInfo;
+    expect(info?.progress).toBe(10);
+    expect(info?.hwRequested).toBeUndefined();
+    expect(info?.hwEncoding).toBeUndefined();
+    expect(info?.speed).toBeUndefined();
   });
 });

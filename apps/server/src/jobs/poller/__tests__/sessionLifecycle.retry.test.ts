@@ -13,12 +13,17 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { stopSessionAtomic } from '../sessionLifecycle.js';
+import { getWatchedThreshold } from '../../../services/settings.js';
 
 // Mock the db module
 vi.mock('../../../db/client.js', () => ({
   db: {
     update: vi.fn(),
   },
+}));
+
+vi.mock('../../../services/settings.js', () => ({
+  getWatchedThreshold: vi.fn().mockResolvedValue(0.85),
 }));
 
 describe('stopSessionAtomic retry logic', () => {
@@ -92,5 +97,69 @@ describe('stopSessionAtomic retry logic', () => {
 
     expect(result.wasUpdated).toBe(false);
     expect(result.needsRetry).toBe(true);
+  });
+});
+
+describe('stopSessionAtomic watched threshold wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('resolves the watched threshold from the session media type', async () => {
+    const { db } = await import('../../../db/client.js');
+    const mockUpdate = db.update as ReturnType<typeof vi.fn>;
+    mockUpdate.mockImplementation(() => ({
+      set: () => ({
+        where: () => ({
+          returning: async () => [{ id: 'session-1' }],
+        }),
+      }),
+    }));
+
+    await stopSessionAtomic({
+      session: {
+        id: 'session-1',
+        mediaType: 'episode',
+        startedAt: new Date(Date.now() - 87000),
+        lastPausedAt: null,
+        pausedDurationMs: 0,
+        progressMs: 87000,
+        totalDurationMs: 100000,
+        watched: false,
+      } as Parameters<typeof stopSessionAtomic>[0]['session'],
+      stoppedAt: new Date(),
+    });
+
+    expect(getWatchedThreshold).toHaveBeenCalledWith('episode');
+  });
+
+  it('marks watched using the resolved per-media-type threshold, not the shared default', async () => {
+    const { db } = await import('../../../db/client.js');
+    const mockUpdate = db.update as ReturnType<typeof vi.fn>;
+    mockUpdate.mockImplementation(() => ({
+      set: () => ({
+        where: () => ({
+          returning: async () => [{ id: 'session-1' }],
+        }),
+      }),
+    }));
+    (getWatchedThreshold as ReturnType<typeof vi.fn>).mockResolvedValueOnce(0.9);
+
+    // 87% progress: passes the 85% default but not a 90% threshold.
+    const result = await stopSessionAtomic({
+      session: {
+        id: 'session-1',
+        mediaType: 'episode',
+        startedAt: new Date(Date.now() - 87000),
+        lastPausedAt: null,
+        pausedDurationMs: 0,
+        progressMs: 87000,
+        totalDurationMs: 100000,
+        watched: false,
+      } as Parameters<typeof stopSessionAtomic>[0]['session'],
+      stoppedAt: new Date(),
+    });
+
+    expect(result.watched).toBe(false);
   });
 });

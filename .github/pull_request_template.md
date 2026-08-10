@@ -12,7 +12,9 @@
 
 ## Related Issue
 
-<!-- Link to issue if applicable. Features should have been discussed first in Discussions or Discord. -->
+<!-- Feature PRs REQUIRE a prior discussion with a code owner (Discussions or Discord).
+     Link it here. Undiscussed feature PRs are closed regardless of code quality.
+     See CONTRIBUTING.md, "Autonomous Agents and Undiscussed Features". -->
 
 Closes #
 
@@ -44,6 +46,7 @@ Closes #
 ## Checklist
 
 - [ ] Code follows project style (ran `pnpm lint` and `pnpm format`)
-- [ ] Self-reviewed
+- [ ] Self-reviewed, and I can explain every part of this diff
+- [ ] For features: discussed with a code owner first (linked above)
 - [ ] No new warnings from `pnpm typecheck`
 - [ ] Tests pass locally

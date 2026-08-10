@@ -55,9 +55,13 @@ function ResolutionDonut({
       return {};
     }
 
+    // Bars, not a donut: tiers overlap (a 4K+1080p title counts in both), so
+    // slices would claim a part-to-whole relationship the data does not have.
+    // Percentages are share-of-titles-having, against the real title count.
+    const total = data?.total ?? 0;
     return {
       chart: {
-        type: 'pie',
+        type: 'bar',
         height,
         backgroundColor: 'transparent',
         style: {
@@ -77,33 +81,54 @@ function ResolutionDonut({
         style: {
           color: 'hsl(var(--popover-foreground))',
         },
-        pointFormat: '<b>{point.y}</b> items ({point.percentage:.1f}%)',
+        formatter: function () {
+          const pct = total > 0 ? (((this.y ?? 0) / total) * 100).toFixed(1) : '0';
+          return `<b>${this.key}</b>: ${this.y?.toLocaleString()} of ${total.toLocaleString()} titles (${pct}%)`;
+        },
+      },
+      xAxis: {
+        type: 'category',
+        labels: {
+          style: {
+            color: 'hsl(var(--foreground))',
+            fontSize: '11px',
+          },
+        },
+        lineColor: 'hsl(var(--border))',
+        tickLength: 0,
+      },
+      yAxis: {
+        title: { text: undefined },
+        labels: {
+          style: {
+            color: 'hsl(var(--muted-foreground))',
+            fontSize: '11px',
+          },
+        },
+        gridLineColor: 'hsl(var(--border))',
+        min: 0,
       },
       plotOptions: {
-        pie: {
-          innerSize: '60%',
+        bar: {
           borderWidth: 0,
+          borderRadius: 3,
+          colorByPoint: true,
           dataLabels: {
-            enabled: false,
+            enabled: true,
+            style: {
+              color: 'hsl(var(--muted-foreground))',
+              fontSize: '10px',
+              textOutline: 'none',
+            },
           },
-          showInLegend: true,
         },
       },
       legend: {
-        align: 'right',
-        verticalAlign: 'middle',
-        layout: 'vertical',
-        itemStyle: {
-          color: 'hsl(var(--foreground))',
-          fontSize: '11px',
-        },
-        itemHoverStyle: {
-          color: 'hsl(var(--primary))',
-        },
+        enabled: false,
       },
       series: [
         {
-          type: 'pie',
+          type: 'bar',
           name: 'Quality',
           data: chartData,
         },
@@ -128,7 +153,7 @@ function ResolutionDonut({
         ],
       },
     };
-  }, [chartData, height]);
+  }, [chartData, data, height]);
 
   if (isLoading) {
     return (

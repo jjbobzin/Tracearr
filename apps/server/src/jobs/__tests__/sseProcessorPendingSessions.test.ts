@@ -31,6 +31,7 @@ const {
   mockDetectMediaChange,
   mockGetActiveRulesV2,
   mockBatchGetRecentUserSessions,
+  mockBatchGetLibraryItemIdentity,
   mockBroadcastViolations,
   mockMapMediaSession,
   mockCreateMediaServerClient,
@@ -66,6 +67,7 @@ const {
     mockDetectMediaChange: vi.fn().mockReturnValue(false),
     mockGetActiveRulesV2: vi.fn().mockResolvedValue([]),
     mockBatchGetRecentUserSessions: vi.fn().mockResolvedValue(new Map()),
+    mockBatchGetLibraryItemIdentity: vi.fn().mockResolvedValue(new Map()),
     mockBroadcastViolations: vi.fn(),
     mockMapMediaSession: vi.fn(),
     mockCreateMediaServerClient: vi.fn().mockReturnValue({
@@ -146,8 +148,12 @@ vi.mock('../poller/stateTracker.js', () => ({
 }));
 
 vi.mock('../poller/database.js', () => ({
+  getServerUserIdByExternalId: vi.fn(() => {
+    throw new Error('getServerUserIdByExternalId not configured in this test');
+  }),
   getActiveRulesV2: mockGetActiveRulesV2,
   batchGetRecentUserSessions: mockBatchGetRecentUserSessions,
+  batchGetLibraryItemIdentity: mockBatchGetLibraryItemIdentity,
   mergeRecentSessionsForIdentity: (map: Map<string, unknown[]>, ids: string[]) =>
     ids.flatMap((id) => map.get(id) ?? []),
 }));
@@ -278,7 +284,6 @@ function createMockPendingSession(overrides: Partial<PendingSessionData> = {}): 
       thumbUrl: null,
       identityName: 'Test User',
       trustScore: 100,
-      sessionCount: 10,
       lastActivityAt: new Date(),
       createdAt: new Date(),
       identityServerUserIds: ['server-user-123'],
@@ -336,7 +341,6 @@ describe('SSE Processor - Pending Session Flow', () => {
         thumbUrl: null,
         identityName: 'Test User',
         trustScore: 100,
-        sessionCount: 10,
         lastActivityAt: new Date(),
         createdAt: new Date(),
       };
@@ -385,6 +389,83 @@ describe('SSE Processor - Pending Session Flow', () => {
 
       const cachedSession = mockCacheService.addActiveSession.mock.calls[0]?.[0];
       expect(cachedSession?.pending).toBe(true);
+    });
+
+    it('stamps media identity on the pending session like the poller does', async () => {
+      const mockServerRow = {
+        id: 'server-123',
+        name: 'Test Server',
+        type: 'plex',
+        url: 'http://localhost:32400',
+        token: 'test-token',
+      };
+      const mockServerUserRow = {
+        id: 'server-user-123',
+        userId: 'identity-123',
+        username: 'testuser',
+        thumbUrl: null,
+        identityName: 'Test User',
+        trustScore: 100,
+        lastActivityAt: new Date(),
+        createdAt: new Date(),
+      };
+
+      mockDb.select.mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([mockServerRow]),
+          }),
+        }),
+      });
+      mockDb.select.mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([mockServerUserRow]),
+            }),
+          }),
+        }),
+      });
+
+      mockCreateMediaServerClient.mockReturnValueOnce({
+        getSessions: vi
+          .fn()
+          .mockResolvedValue([{ sessionKey: 'test-session-key', ratingKey: '12345' }]),
+      });
+      mockMapMediaSession.mockReturnValueOnce({
+        sessionKey: 'test-session-key',
+        ratingKey: '12345',
+        externalUserId: 'user-123',
+        ipAddress: '192.168.1.100',
+        mediaTitle: 'Test Movie',
+        state: 'playing',
+      });
+
+      const identity = {
+        mediaId: 'media-uuid-1',
+        showMediaId: null,
+        imdbId: 'tt1375666',
+        tmdbId: 27205,
+        tvdbId: null,
+        parentRatingKey: null,
+        grandparentRatingKey: null,
+      };
+      mockBatchGetLibraryItemIdentity.mockResolvedValueOnce(new Map([['12345', identity]]));
+
+      mockSseManager.emit('plex:session:playing', {
+        serverId: 'server-123',
+        notification: { sessionKey: 'test-session-key', viewOffset: 0 },
+      });
+
+      await vi.waitFor(() => {
+        expect(mockCacheService.setPendingSession).toHaveBeenCalled();
+      });
+
+      expect(mockBatchGetLibraryItemIdentity).toHaveBeenCalledWith('server-123', ['12345']);
+      const pendingData = mockCacheService.setPendingSession.mock.calls[0]?.[2] as {
+        processed: { identity?: unknown };
+      };
+      expect(pendingData.processed.identity).toEqual(identity);
     });
   });
 
@@ -941,7 +1022,6 @@ describe('SSE Processor - Pending Session Flow', () => {
         thumbUrl: null,
         identityName: 'Test User',
         trustScore: 100,
-        sessionCount: 10,
         lastActivityAt: new Date(),
         createdAt: new Date(),
       };
@@ -1097,7 +1177,6 @@ describe('SSE Processor - Pending Session Flow', () => {
         thumbUrl: null,
         identityName: 'Test User',
         trustScore: 100,
-        sessionCount: 10,
         lastActivityAt: new Date(),
         createdAt: new Date(),
       };

@@ -733,6 +733,11 @@ function RuleCard({
                     Cross-server
                   </span>
                 )}
+                {isV2 && (rule.actions?.actions?.length ?? 0) === 0 && (
+                  <span className="text-muted-foreground bg-muted inline-flex items-center rounded-full px-2 py-0.5 text-xs">
+                    {t('rules.recordsOnly')}
+                  </span>
+                )}
                 {!rule.isActive && (
                   <span className="text-muted-foreground text-xs">
                     ({t('common:states.disabled')})

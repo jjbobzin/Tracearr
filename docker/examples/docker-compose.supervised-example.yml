@@ -19,7 +19,9 @@
 #   PORT=3000              # External port mapping
 #   TZ=UTC                 # Timezone (e.g., America/New_York)
 #   LOG_LEVEL=info         # Log level (debug, info, warn, error)
-#   PG_MAX_MEMORY=2GB      # PostgreSQL memory limit (auto-detected from mem_limit)
+#   PG_MAX_MEMORY=2GB      # PostgreSQL memory (default: mem_limit minus a Node/Redis reserve,
+#                          # e.g. 2048MB for the 3g limit below; set explicitly to override,
+#                          # taken as-is with no reserve subtracted)
 
 services:
   tracearr:
@@ -36,7 +38,7 @@ services:
     environment:
       - TZ=${TZ:-UTC}
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      # - DATABASE_POOL_MAX=50  # Database connection pool size (default: 50)
+      # - DATABASE_POOL_MAX=50  # Database connection pool size (default: derived from PostgreSQL max_connections, ~20 at the 3g limit)
       # Secrets are auto-generated if not provided
       # Uncomment to override:
       # - JWT_SECRET=${JWT_SECRET}

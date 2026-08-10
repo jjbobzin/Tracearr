@@ -21,9 +21,17 @@ vi.mock('@/hooks/queries', () => ({
   useActiveSessions: vi.fn(),
 }));
 
+// Not typechecked against the real module - keep in sync by hand
 vi.mock('@/hooks/queries/useServers', () => ({
-  useServerStatistics: () => ({ data: undefined, isLoading: false, averages: undefined }),
-  useServerBandwidth: () => ({ data: undefined, isLoading: false, averages: undefined }),
+  useServerLiveStats: () => ({
+    statistics: undefined,
+    statisticsAverages: null,
+    bandwidth: undefined,
+    bandwidthAverages: null,
+    clockSkewMs: 0,
+    isLoading: false,
+  }),
+  useMultiServerLiveStats: () => ({ series: [], clockSkewMs: 0, isLoading: false }),
 }));
 
 vi.mock('@/components/charts/ServerResourceCharts', () => ({
@@ -48,6 +56,10 @@ vi.mock('@/components/sessions', () => ({
 
 vi.mock('@/hooks/useServer', () => ({
   useServer: vi.fn(),
+}));
+
+vi.mock('@/hooks/useSocket', () => ({
+  useSocket: () => ({ isConnected: true }),
 }));
 
 vi.mock('@/hooks/useServerColorMap', () => ({

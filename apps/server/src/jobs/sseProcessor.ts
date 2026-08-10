@@ -26,10 +26,13 @@ import { createMediaServerClient } from '../services/mediaServer/index.js';
 import { extractLiveUuid } from '../services/mediaServer/plex/plexUtils.js';
 import { lookupGeoIP } from '../services/plexGeoip.js';
 import { registerService, unregisterService } from '../services/serviceTracker.js';
+import { getWatchedThreshold } from '../services/settings.js';
 import { sseManager } from '../services/sseManager.js';
 import { getIdentityServerUserIds } from '../services/userService.js';
+import { createLogger } from '../utils/logger.js';
 import { enqueueNotification } from './notificationQueue.js';
 import {
+  batchGetLibraryItemIdentity,
   batchGetRecentUserSessions,
   getActiveRulesV2,
   getServerUserIdByExternalId,
@@ -66,6 +69,8 @@ import {
 import { PENDING_STOP_PERSIST_MIN_PROGRESS_MS, type PendingSessionData } from './poller/types.js';
 import { excludeUncountableSessions } from './poller/utils.js';
 import { broadcastViolations } from './poller/violations.js';
+
+const sseLogger = createLogger('SSEProcessor');
 
 let cacheService: CacheService | null = null;
 let pubSubService: PubSubService | null = null;
@@ -124,6 +129,13 @@ const SERVER_DOWN_THRESHOLD_MS = 60 * 1000;
 // Orphan sweep threshold in milliseconds
 // Pending sessions older than this are considered orphaned and will be swept
 const ORPHAN_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
+
+// Playing notifications carry no user, so the repeat-tick fast path could
+// latch onto a stale foreign row that matches sessionKey+ratingKey+deviceId.
+// Each session gets a bounded fast-path window; expiry forces one full pass
+// whose server-user check unlatches any foreign row.
+const FAST_PATH_REVALIDATE_MS = 60 * 1000;
+const fastPathWindowStart = new Map<string, number>();
 
 // Track pending server down notifications (can be cancelled if server comes back up)
 const pendingServerDownNotifications = new Map<string, NodeJS.Timeout>();
@@ -285,6 +297,7 @@ export function stopSSEProcessor(): void {
 
   console.log('[SSEProcessor] Stopping');
   isRunning = false;
+  fastPathWindowStart.clear();
   unregisterService('sse-processor');
 
   sseManager.off('plex:session:playing', wrappedHandlers.playing);
@@ -362,13 +375,6 @@ async function handlePlaying(event: {
       }
     }
 
-    const result = await fetchFullSession(serverId, notification.sessionKey);
-    if (!result) {
-      return;
-    }
-
-    const { session, server } = result;
-
     // Look up by sessionKey alone. Passing the incoming ratingKey would filter
     // out the still-active old row on a real media change (same sessionKey, new
     // ratingKey), leaving detectMediaChange below unreachable.
@@ -376,6 +382,38 @@ async function handlePlaying(event: {
       serverId,
       sessionKey: notification.sessionKey,
     });
+
+    // Plex delivers its progress stream as repeated 'playing' notifications
+    // with an advancing viewOffset. When the active row already matches this
+    // exact playback (same device, same media, already playing), take the
+    // throttled progress path: no /status/sessions fetch, one DB write per
+    // throttle window. The window expires after FAST_PATH_REVALIDATE_MS so
+    // the full path re-checks the server user. Everything else (new play,
+    // resume, media change, live TV) falls through to the full path, and the
+    // 30s reconciliation poll covers mid-stream transcode flips.
+    if (
+      existingRow?.state === 'playing' &&
+      existingRow.mediaType !== 'live' &&
+      existingRow.ratingKey === notification.ratingKey &&
+      existingRow.deviceId === notification.clientIdentifier
+    ) {
+      const windowStart = fastPathWindowStart.get(existingRow.id);
+      if (windowStart === undefined || Date.now() - windowStart < FAST_PATH_REVALIDATE_MS) {
+        if (windowStart === undefined) {
+          fastPathWindowStart.set(existingRow.id, Date.now());
+        }
+        await applySessionProgress(existingRow, notification.viewOffset);
+        return;
+      }
+      fastPathWindowStart.delete(existingRow.id);
+    }
+
+    const result = await fetchFullSession(serverId, notification.sessionKey);
+    if (!result) {
+      return;
+    }
+
+    const { session, server } = result;
 
     // Plex resets sessionKey counters on PMS restart, so within the
     // reconciliation window a stale open row from one user can carry the same
@@ -462,9 +500,32 @@ async function handlePaused(event: {
     }
 
     const result = await fetchFullSession(serverId, notification.sessionKey);
-    if (result) {
-      await updateExistingSession(existingSession, result.session, 'paused');
+    if (!result) {
+      return;
     }
+
+    // Same cross-user guard as handlePlaying: after a PMS restart this
+    // sessionKey can still be held by a stale row from another user. Updating
+    // that row would splice this user's stream into it and refresh its
+    // lastSeenAt on every pause, so it never ages out of the stale sweep.
+    // Leave the foreign row to its own cleanup instead.
+    const incomingServerUserId = await getServerUserIdByExternalId(
+      serverId,
+      result.session.externalUserId
+    );
+    if (incomingServerUserId !== existingSession.serverUserId) {
+      if (incomingServerUserId === null) {
+        // Lookup miss, not a foreign row: reachable mid-stream after a user
+        // merge re-points the account. Reconciliation applies the pause ~30s
+        // later; log so the gap is diagnosable.
+        console.log(
+          `[SSEProcessor] Pause dropped: no server user for external id on server ${serverId}`
+        );
+      }
+      return;
+    }
+
+    await updateExistingSession(existingSession, result.session, 'paused');
   } catch (error) {
     console.error('[SSEProcessor] Error handling paused event:', error);
   }
@@ -531,11 +592,30 @@ async function handleStopped(event: {
       }
     }
 
-    // Query without limit to handle any duplicate sessions that may exist
-    const existingSessions = await findActiveSessionsAll({
+    // Query without limit to handle any duplicate sessions that may exist.
+    // The stopping user's identity is unknowable here (the session is already
+    // gone from Plex), so the ratingKey is the only guard against closing a
+    // foreign row that shares this sessionKey after a PMS restart. Live TV is
+    // exempt: its ratingKey changes per channel and the row never re-syncs,
+    // so live rows match on sessionKey alone.
+    const candidateSessions = await findActiveSessionsAll({
       serverId,
       sessionKey: notification.sessionKey,
     });
+    const existingSessions =
+      notification.ratingKey == null
+        ? candidateSessions
+        : candidateSessions.filter(
+            (s) =>
+              s.ratingKey === notification.ratingKey ||
+              // Live rows can't match on ratingKey (channel changes rotate it),
+              // so they close on device instead; without the device check a
+              // non-live stop sharing this sessionKey after a PMS restart
+              // would close a foreign live stream
+              (s.mediaType === 'live' &&
+                (notification.clientIdentifier == null ||
+                  s.deviceId === notification.clientIdentifier))
+          );
 
     if (existingSessions.length === 0) {
       return;
@@ -551,9 +631,85 @@ async function handleStopped(event: {
 }
 
 /**
+ * Apply a position update to a confirmed session at throttled DB cost: the
+ * Redis cache updates on every call so dashboards stay live, while the DB
+ * write coalesces through shouldFlushDbWrite. Watched transitions flush
+ * immediately. Production reaches this from handlePlaying's repeat-tick fast
+ * path; Plex SSE has no distinct progress state.
+ */
+async function applySessionProgress(
+  existingSession: typeof sessions.$inferSelect,
+  viewOffset: number
+): Promise<void> {
+  const now = new Date();
+  let watched = existingSession.watched;
+  if (!watched && existingSession.totalDurationMs) {
+    const elapsedMs = now.getTime() - existingSession.startedAt.getTime();
+    const pausedMs = existingSession.pausedDurationMs || 0;
+    // Account for ongoing pause if currently paused
+    const ongoingPauseMs = existingSession.lastPausedAt
+      ? now.getTime() - existingSession.lastPausedAt.getTime()
+      : 0;
+    const currentWatchTimeMs = Math.max(0, elapsedMs - pausedMs - ongoingPauseMs);
+    watched = checkWatchCompletion(
+      currentWatchTimeMs,
+      viewOffset,
+      existingSession.totalDurationMs,
+      await getWatchedThreshold(existingSession.mediaType)
+    );
+  }
+
+  const watchedTransition = watched && !existingSession.watched;
+  let wasStoppedConcurrently = false;
+  if (watchedTransition || shouldFlushDbWrite(existingSession.id, now.getTime())) {
+    // Guarded by isNull(stoppedAt): a stop racing this write must not
+    // resurrect the session into the cache.
+    const updateResult = await db
+      .update(sessions)
+      .set({
+        progressMs: viewOffset,
+        lastSeenAt: now, // Update for stale session detection
+        watched,
+      })
+      .where(and(eq(sessions.id, existingSession.id), isNull(sessions.stoppedAt)))
+      .returning({ id: sessions.id });
+
+    if (updateResult.length === 0) {
+      wasStoppedConcurrently = true;
+      console.log(
+        `[SSEProcessor] Session ${existingSession.id} already stopped, skipping progress resurrection`
+      );
+    } else {
+      recordDbWrite(existingSession.id, now.getTime());
+    }
+  }
+
+  if (wasStoppedConcurrently) {
+    return;
+  }
+
+  if (cacheService) {
+    const cached = await cacheService.getSessionById(existingSession.id);
+    if (cached) {
+      cached.progressMs = viewOffset;
+      cached.watched = watched;
+      await cacheService.updateActiveSession(cached);
+
+      // Only broadcast on watched status change (progress events are frequent)
+      if (watchedTransition && pubSubService) {
+        await pubSubService.publish('session:updated', cached);
+      }
+    }
+  }
+}
+
+/**
  * Handle progress event (periodic position updates)
  * Also handles pending session confirmation - if viewOffset exceeds 30s threshold,
  * the session is persisted to DB and rules are evaluated.
+ * Plex SSE never emits a distinct progress state, so in production this logic
+ * runs via handlePlaying's fast path; the subscription stays for the relay
+ * interface and any event source that does emit it.
  */
 async function handleProgress(event: {
   serverId: string;
@@ -587,65 +743,7 @@ async function handleProgress(event: {
       return;
     }
 
-    const now = new Date();
-    let watched = existingSession.watched;
-    if (!watched && existingSession.totalDurationMs) {
-      const elapsedMs = now.getTime() - existingSession.startedAt.getTime();
-      const pausedMs = existingSession.pausedDurationMs || 0;
-      // Account for ongoing pause if currently paused
-      const ongoingPauseMs = existingSession.lastPausedAt
-        ? now.getTime() - existingSession.lastPausedAt.getTime()
-        : 0;
-      const currentWatchTimeMs = Math.max(0, elapsedMs - pausedMs - ongoingPauseMs);
-      watched = checkWatchCompletion(
-        currentWatchTimeMs,
-        notification.viewOffset,
-        existingSession.totalDurationMs
-      );
-    }
-
-    const watchedTransition = watched && !existingSession.watched;
-    let wasStoppedConcurrently = false;
-    if (watchedTransition || shouldFlushDbWrite(existingSession.id, now.getTime())) {
-      // Guarded by isNull(stoppedAt): a stop racing this write must not
-      // resurrect the session into the cache.
-      const updateResult = await db
-        .update(sessions)
-        .set({
-          progressMs: notification.viewOffset,
-          lastSeenAt: now, // Update for stale session detection
-          watched,
-        })
-        .where(and(eq(sessions.id, existingSession.id), isNull(sessions.stoppedAt)))
-        .returning({ id: sessions.id });
-
-      if (updateResult.length === 0) {
-        wasStoppedConcurrently = true;
-        console.log(
-          `[SSEProcessor] Session ${existingSession.id} already stopped, skipping progress resurrection`
-        );
-      } else {
-        recordDbWrite(existingSession.id, now.getTime());
-      }
-    }
-
-    if (wasStoppedConcurrently) {
-      return;
-    }
-
-    if (cacheService) {
-      const cached = await cacheService.getSessionById(existingSession.id);
-      if (cached) {
-        cached.progressMs = notification.viewOffset;
-        cached.watched = watched;
-        await cacheService.updateActiveSession(cached);
-
-        // Only broadcast on watched status change (progress events are frequent)
-        if (watchedTransition && pubSubService) {
-          await pubSubService.publish('session:updated', cached);
-        }
-      }
-    }
+    await applySessionProgress(existingSession, notification.viewOffset);
   } catch (error) {
     console.error('[SSEProcessor] Error handling progress event:', error);
   }
@@ -655,7 +753,7 @@ async function handleProgress(event: {
  * Handle reconciliation request - triggers a light poll to catch missed events
  */
 async function handleReconciliation(): Promise<void> {
-  console.log('[SSEProcessor] Triggering reconciliation poll');
+  sseLogger.debug('Triggering reconciliation poll');
   await triggerReconciliationPoll();
 
   // Run maintenance tasks during reconciliation
@@ -929,10 +1027,16 @@ async function fetchFullSession(
       return null;
     }
 
-    return {
-      session: mapMediaSession(targetSession, server.type),
-      server,
-    };
+    const session = mapMediaSession(targetSession, server.type);
+    // Stamp identity like the poller does or SSE session rows insert with null media columns
+    if (session.ratingKey) {
+      const identityMap = await batchGetLibraryItemIdentity(server.id, [session.ratingKey]);
+      session.identity = identityMap.get(session.ratingKey) ?? null;
+    } else {
+      session.identity = null;
+    }
+
+    return { session, server };
   } catch (error) {
     console.error(`[SSEProcessor] Error fetching session ${sessionKey}:`, error);
     return null;
@@ -979,7 +1083,6 @@ async function createNewSession(
       thumbUrl: serverUsers.thumbUrl,
       identityName: users.name,
       trustScore: serverUsers.trustScore,
-      sessionCount: serverUsers.sessionCount,
       lastActivityAt: serverUsers.lastActivityAt,
       createdAt: serverUsers.createdAt,
     })
@@ -1005,7 +1108,6 @@ async function createNewSession(
     thumbUrl: serverUserFromDb.thumbUrl,
     identityName: serverUserFromDb.identityName,
     trustScore: serverUserFromDb.trustScore,
-    sessionCount: serverUserFromDb.sessionCount,
     lastActivityAt: serverUserFromDb.lastActivityAt,
     createdAt: serverUserFromDb.createdAt,
     identityServerUserIds,
@@ -1132,7 +1234,6 @@ async function handleMediaChange(
       thumbUrl: serverUsers.thumbUrl,
       identityName: users.name,
       trustScore: serverUsers.trustScore,
-      sessionCount: serverUsers.sessionCount,
       lastActivityAt: serverUsers.lastActivityAt,
       createdAt: serverUsers.createdAt,
     })
@@ -1190,6 +1291,7 @@ async function handleMediaChange(
     result;
 
   clearDbWriteTracking(stoppedSession.id);
+  fastPathWindowStart.delete(stoppedSession.id);
 
   // Update cache for stopped session
   await cacheService.removeActiveSession(stoppedSession.id);
@@ -1272,7 +1374,8 @@ async function updateExistingSession(
     watched = checkWatchCompletion(
       currentWatchTimeMs,
       processed.progressMs,
-      processed.totalDurationMs
+      processed.totalDurationMs,
+      await getWatchedThreshold(processed.mediaType)
     );
   }
 
@@ -1332,7 +1435,6 @@ async function updateExistingSession(
             thumbUrl: serverUsers.thumbUrl,
             identityName: users.name,
             trustScore: serverUsers.trustScore,
-            sessionCount: serverUsers.sessionCount,
             lastActivityAt: serverUsers.lastActivityAt,
             createdAt: serverUsers.createdAt,
           })
@@ -1403,7 +1505,6 @@ async function updateExistingSession(
             thumbUrl: serverUsers.thumbUrl,
             identityName: users.name,
             trustScore: serverUsers.trustScore,
-            sessionCount: serverUsers.sessionCount,
             lastActivityAt: serverUsers.lastActivityAt,
             createdAt: serverUsers.createdAt,
           })
@@ -1800,6 +1901,7 @@ async function stopSession(existingSession: typeof sessions.$inferSelect): Promi
   });
 
   clearDbWriteTracking(existingSession.id);
+  fastPathWindowStart.delete(existingSession.id);
 
   if (needsRetry && retryData && cacheService) {
     await cacheService.addSessionWriteRetry(existingSession.id, retryData);

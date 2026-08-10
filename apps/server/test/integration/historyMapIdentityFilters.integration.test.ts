@@ -58,12 +58,12 @@ async function setupMergedPerson() {
   const targetSu = await createTestServerUser({
     userId: target.id,
     serverId: serverA.id,
-    sessionCount: 10,
+    lastActivityAt: new Date('2026-06-01T00:00:00Z'),
   });
   const sourceSu = await createTestServerUser({
     userId: source.id,
     serverId: serverB.id,
-    sessionCount: 30,
+    lastActivityAt: new Date('2026-06-02T00:00:00Z'),
   });
 
   await createTestSession({ serverId: serverA.id, serverUserId: targetSu.id, durationMs: 600_000 });
@@ -93,7 +93,7 @@ describe('GET /sessions/filter-options - identity dedup', () => {
     const mergedEntries = users.filter((u) => u.identityName === 'Merged Person');
     expect(mergedEntries).toHaveLength(1);
     const entry = mergedEntries[0]!;
-    // sourceSu has the higher session count, so it's the representative account
+    // sourceSu is the more recently active account, so it's the representative
     expect(entry.id).toBe(sourceSu.id);
     expect(entry.serverUserIds.sort()).toEqual([targetSu.id, sourceSu.id].sort());
   });

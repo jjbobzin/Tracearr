@@ -6,7 +6,7 @@ global.Buffer = Buffer;
 
 import '../global.css';
 import { useEffect, useState, useRef } from 'react';
-import { Stack, useRouter, useSegments } from 'expo-router';
+import { Stack, ThemeProvider, DarkTheme, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { View, ActivityIndicator } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -22,7 +22,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { useAuthStateStore } from '@/lib/authStateStore';
 import { useConnectionValidator } from '@/hooks/useConnectionValidator';
 import { usePushNotifications } from '@/hooks/usePushNotifications';
-import { ACCENT_COLOR } from '@/lib/theme';
+import { ACCENT_COLOR, colors } from '@/lib/theme';
 import { i18nReady } from '@/lib/i18n';
 import { useTranslation } from '@tracearr/translations/mobile';
 
@@ -75,7 +75,7 @@ function RootLayoutNav() {
       <View
         style={{
           flex: 1,
-          backgroundColor: '#09090B',
+          backgroundColor: colors.background.dark,
           alignItems: 'center',
           justifyContent: 'center',
         }}
@@ -89,7 +89,7 @@ function RootLayoutNav() {
   if (connectionState === 'unauthenticated') {
     return (
       <>
-        <StatusBar style="auto" />
+        <StatusBar style="light" />
         <UnauthenticatedScreen />
       </>
     );
@@ -97,7 +97,7 @@ function RootLayoutNav() {
 
   return (
     <>
-      <StatusBar style="auto" />
+      <StatusBar style="light" />
       <OfflineBanner onRetry={validate} />
       <Toast
         message={t('mobile:reconnected')}
@@ -107,31 +107,25 @@ function RootLayoutNav() {
       <Stack
         screenOptions={{
           headerShown: false,
-          animation: 'fade',
-          contentStyle: { backgroundColor: '#09090B' },
+          contentStyle: { backgroundColor: colors.background.dark },
         }}
       >
         <Stack.Screen name="(auth)" options={{ headerShown: false }} />
-        <Stack.Screen name="(drawer)" options={{ headerShown: false }} />
-        <Stack.Screen
-          name="user"
-          options={{
-            headerShown: false,
-            presentation: 'card',
-          }}
-        />
-        <Stack.Screen
-          name="session"
-          options={{
-            headerShown: false,
-            presentation: 'card',
-          }}
-        />
+        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen
           name="alerts"
           options={{
             headerShown: false,
             presentation: 'card',
+          }}
+        />
+        <Stack.Screen
+          name="server-select"
+          options={{
+            headerShown: false,
+            presentation: 'formSheet',
+            sheetAllowedDetents: [0.5, 0.9],
+            sheetGrabberVisible: true,
           }}
         />
         <Stack.Screen
@@ -159,7 +153,7 @@ export default function RootLayout() {
       <View
         style={{
           flex: 1,
-          backgroundColor: '#09090B',
+          backgroundColor: colors.background.dark,
           alignItems: 'center',
           justifyContent: 'center',
         }}
@@ -172,12 +166,20 @@ export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
-        <View style={{ flex: 1, backgroundColor: '#09090B' }}>
+        <View style={{ flex: 1, backgroundColor: colors.background.dark }}>
           <ErrorBoundary>
             <QueryProvider>
               <SocketProvider>
                 <MediaServerProvider>
-                  <RootLayoutNav />
+                  {/* Must be expo-router's ThemeProvider — it vendors react-navigation
+                      theming, so the @react-navigation/native one sets a context its
+                      header code never reads. theme.dark drives the nav bar's
+                      userInterfaceStyle; without it, iOS 26 paints one white
+                      liquid-glass frame every time a tab refocus re-creates the
+                      toolbar buttons (rns#4163). */}
+                  <ThemeProvider value={DarkTheme}>
+                    <RootLayoutNav />
+                  </ThemeProvider>
                 </MediaServerProvider>
               </SocketProvider>
             </QueryProvider>

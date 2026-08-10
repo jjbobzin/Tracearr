@@ -273,35 +273,21 @@ export async function fetchGitHubReleases(
 }
 
 /**
- * Find the best update target for a prerelease user
- *
- * Returns the newest stable release if available, otherwise the newest prerelease.
- * This ensures prerelease users are notified about the latest stable version
- * (e.g., user on 1.4.1-beta.17 sees 1.4.3, not just 1.4.1).
+ * Find the best update target for a prerelease user: the newest release
+ * overall. When a stable supersedes the user's beta line it IS the newest
+ * (1.4.1-beta.17 is offered 1.4.3), but a newer beta line past the last
+ * stable must win too - preferring stable here once hid 2.0.0-beta.1 from
+ * every 1.5.0-beta user because 1.5.0 outranked their tag.
  */
 export function findBestUpdateForPrerelease(
   currentVersion: string,
   releases: GitHubRelease[]
 ): GitHubRelease | null {
-  // Filter out drafts and sort by version (newest first)
   const validReleases = releases
     .filter((r) => !r.draft)
     .sort((a, b) => compareVersions(b.tag_name, a.tag_name));
 
-  // Find the newest stable release
-  const newestStable = validReleases.find((r) => !r.prerelease);
-
-  // If there's a stable release newer than current, return it
-  if (newestStable && compareVersions(newestStable.tag_name, currentVersion) > 0) {
-    return newestStable;
-  }
-
-  // Otherwise, find any newer release (including prereleases)
-  const newerRelease = validReleases.find((r) => {
-    return compareVersions(r.tag_name, currentVersion) > 0;
-  });
-
-  return newerRelease ?? null;
+  return validReleases.find((r) => compareVersions(r.tag_name, currentVersion) > 0) ?? null;
 }
 
 /**

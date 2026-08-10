@@ -220,12 +220,14 @@ describe('DELETE /violations/bulk - person filter', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ success: true, dismissed: 2 });
 
-    const remaining = await db.select().from(violations);
-    const remainingIds = remaining.map((v) => v.id);
-    expect(remainingIds).not.toContain(violationA1.id);
-    expect(remainingIds).not.toContain(violationA2.id);
+    // Dismiss is a soft delete: rows survive with dismissedAt stamped so
+    // dedup keeps blocking re-creation.
+    const rows = await db.select().from(violations);
+    const dismissedById = new Map(rows.map((v) => [v.id, v.dismissedAt]));
+    expect(dismissedById.get(violationA1.id)).toBeInstanceOf(Date);
+    expect(dismissedById.get(violationA2.id)).toBeInstanceOf(Date);
     // Person B's violation must survive person A's select-all dismiss.
-    expect(remainingIds).toContain(violationB.id);
+    expect(dismissedById.get(violationB.id)).toBeNull();
   });
 
   it('recomputes the merged person aggregate trust once after dismissing reversible violations on both of their accounts', async () => {
@@ -239,20 +241,18 @@ describe('DELETE /violations/bulk - person filter', () => {
       userId: target.id,
       serverId: serverA.id,
       trustScore: 90,
-      sessionCount: 10,
     });
     const sourceSu = await createTestServerUser({
       userId: source.id,
       serverId: serverB.id,
       trustScore: 90,
-      sessionCount: 30,
     });
     await mergeUsers(source.id, target.id, admin.id);
 
     // Seed a correct baseline rollup the way a prior trust-affecting write would
     // have left it, matching the pattern used elsewhere for this recompute:
-    // (90*10 + 90*30) / 40 = 90.
-    await userService.recalculateAggregateTrustScore(target.id);
+    // both accounts at 90, so the worst-account rollup is 90.
+    await userService.recomputeIdentityAggregates(target.id);
     const [before] = await db.select().from(users).where(eq(users.id, target.id));
     expect(before?.aggregateTrustScore).toBe(90);
 
@@ -278,7 +278,7 @@ describe('DELETE /violations/bulk - person filter', () => {
       sessionId: sessionB.id,
     });
 
-    const recomputeSpy = vi.spyOn(userService, 'recalculateAggregateTrustScore');
+    const recomputeSpy = vi.spyOn(userService, 'recomputeIdentityAggregates');
 
     const app = await buildApp({
       userId: admin.id,
@@ -432,11 +432,11 @@ describe('bulk endpoints - people (userIds) multiselect filter', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ success: true, dismissed: 2 });
 
-    const remaining = await db.select().from(violations);
-    const remainingIds = remaining.map((v) => v.id);
-    expect(remainingIds).not.toContain(violationA.id);
-    expect(remainingIds).not.toContain(violationB.id);
-    expect(remainingIds).toContain(violationC.id);
+    const rows = await db.select().from(violations);
+    const dismissedById = new Map(rows.map((v) => [v.id, v.dismissedAt]));
+    expect(dismissedById.get(violationA.id)).toBeInstanceOf(Date);
+    expect(dismissedById.get(violationB.id)).toBeInstanceOf(Date);
+    expect(dismissedById.get(violationC.id)).toBeNull();
   });
 
   it('GET /violations with userIds returns exactly the union of the selected people, singular userId still works', async () => {
@@ -517,5 +517,73 @@ describe('bulk endpoints - people (userIds) multiselect filter', () => {
     expect(remainingIds).toEqual(
       expect.arrayContaining([violationA.id, violationB.id, violationC.id])
     );
+  });
+});
+
+describe('recomputeIdentityAggregates semantics', () => {
+  it('a solo account mirrors its own score, and its violations set the identity total', async () => {
+    const server = await createTestServer({ type: 'plex' });
+    const person = await createTestUser({ role: 'member' });
+    const su = await createTestServerUser({
+      userId: person.id,
+      serverId: server.id,
+      trustScore: 85,
+    });
+    const rule = await createTestRule({ type: 'concurrent_streams', params: { max_streams: 2 } });
+    const session = await createTestSession({ serverId: server.id, serverUserId: su.id });
+    await createTestViolation({ ruleId: rule.id, serverUserId: su.id, sessionId: session.id });
+
+    await userService.recomputeIdentityAggregates(person.id);
+
+    const [row] = await db.select().from(users).where(eq(users.id, person.id));
+    expect(row?.aggregateTrustScore).toBe(85);
+    expect(row?.totalViolations).toBe(1);
+  });
+
+  it('a removed account stops dragging the trust rollup but its violations still count', async () => {
+    const serverA = await createTestServer({ type: 'plex' });
+    const serverB = await createTestServer({ type: 'jellyfin' });
+    const person = await createTestUser({ role: 'member' });
+    await createTestServerUser({
+      userId: person.id,
+      serverId: serverA.id,
+      trustScore: 95,
+    });
+    const removedSu = await createTestServerUser({
+      userId: person.id,
+      serverId: serverB.id,
+      trustScore: 20,
+      removedAt: new Date('2026-01-01T00:00:00Z'),
+    });
+    const rule = await createTestRule({ type: 'concurrent_streams', params: { max_streams: 2 } });
+    const session = await createTestSession({ serverId: serverB.id, serverUserId: removedSu.id });
+    await createTestViolation({
+      ruleId: rule.id,
+      serverUserId: removedSu.id,
+      sessionId: session.id,
+    });
+
+    await userService.recomputeIdentityAggregates(person.id);
+
+    const [row] = await db.select().from(users).where(eq(users.id, person.id));
+    expect(row?.aggregateTrustScore).toBe(95);
+    expect(row?.totalViolations).toBe(1);
+  });
+
+  it('an identity whose accounts are all removed keeps its worst historical score instead of resetting to 100', async () => {
+    const server = await createTestServer({ type: 'plex' });
+    const person = await createTestUser({ role: 'member' });
+    await createTestServerUser({
+      userId: person.id,
+      serverId: server.id,
+      trustScore: 35,
+      removedAt: new Date('2026-01-01T00:00:00Z'),
+    });
+
+    await userService.recomputeIdentityAggregates(person.id);
+
+    const [row] = await db.select().from(users).where(eq(users.id, person.id));
+    expect(row?.aggregateTrustScore).toBe(35);
+    expect(row?.totalViolations).toBe(0);
   });
 });

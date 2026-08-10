@@ -76,7 +76,15 @@ export const libraryGrowthRoute: FastifyPluginAsync = async (app) => {
         return reply.badRequest('Invalid query parameters');
       }
 
-      const { serverId, serverIds, libraryId, period, timezone } = query.data;
+      const {
+        serverId,
+        serverIds,
+        libraryId,
+        period,
+        startDate: rawStartDate,
+        endDate: rawEndDate,
+        timezone,
+      } = query.data;
       const authUser = request.user;
       const tz = timezone ?? 'UTC';
 
@@ -86,9 +94,18 @@ export const libraryGrowthRoute: FastifyPluginAsync = async (app) => {
       // Optional library filter
       const libraryFilter = libraryId ? sql`AND lsd.library_id = ${libraryId}` : sql``;
 
+      // Both present -> overrides the period token (custom/day windows).
+      const hasCustomRange = Boolean(rawStartDate && rawEndDate);
+
       // Build cache key - include sorted server IDs so order doesn't cause misses
       const serverCacheKey = resolvedIds !== undefined ? [...resolvedIds].sort().join(',') : 'all';
-      const cacheKey = buildLibraryCacheKey(REDIS_KEYS.LIBRARY_GROWTH, serverCacheKey, period, tz);
+      const periodCacheKey = hasCustomRange ? `custom:${rawStartDate}:${rawEndDate}` : period;
+      const cacheKey = buildLibraryCacheKey(
+        REDIS_KEYS.LIBRARY_GROWTH,
+        serverCacheKey,
+        periodCacheKey,
+        tz
+      );
       const fullCacheKey = libraryId ? `${cacheKey}:${libraryId}` : cacheKey;
 
       const cached = await app.redis.get(fullCacheKey);
@@ -101,23 +118,28 @@ export const libraryGrowthRoute: FastifyPluginAsync = async (app) => {
       }
 
       // Calculate date range
-      const startDate = getStartDate(period);
-      const endDate = new Date();
-
-      // For 'all' period, find the earliest date from library_stats_daily aggregate
       let effectiveStartDate: Date;
-      if (startDate) {
-        effectiveStartDate = startDate;
+      let endDate: Date;
+      if (rawStartDate && rawEndDate) {
+        effectiveStartDate = new Date(rawStartDate);
+        endDate = new Date(rawEndDate);
       } else {
-        const earliestResult = await db.execute(sql`
-          SELECT MIN(day)::date AS earliest
-          FROM library_stats_daily lsd
-          WHERE 1=1
-            ${serverFilter}
-            ${libraryFilter}
-        `);
-        const earliest = (earliestResult.rows[0] as { earliest: string | null })?.earliest;
-        effectiveStartDate = earliest ? new Date(earliest) : new Date('2020-01-01');
+        endDate = new Date();
+        const startDate = getStartDate(period);
+        // For 'all' period, find the earliest date from library_stats_daily aggregate
+        if (startDate) {
+          effectiveStartDate = startDate;
+        } else {
+          const earliestResult = await db.execute(sql`
+            SELECT MIN(day)::date AS earliest
+            FROM library_stats_daily lsd
+            WHERE 1=1
+              ${serverFilter}
+              ${libraryFilter}
+          `);
+          const earliest = (earliestResult.rows[0] as { earliest: string | null })?.earliest;
+          effectiveStartDate = earliest ? new Date(earliest) : new Date('2020-01-01');
+        }
       }
 
       // Query from library_stats_daily continuous aggregate.
@@ -272,7 +294,7 @@ export const libraryGrowthRoute: FastifyPluginAsync = async (app) => {
       }
 
       const response: LibraryGrowthResponse = {
-        period,
+        period: hasCustomRange ? 'custom' : period,
         movies,
         episodes,
         music,

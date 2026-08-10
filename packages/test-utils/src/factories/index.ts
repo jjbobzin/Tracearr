@@ -11,6 +11,7 @@ import { resetServerUserCounter } from './serverUser.js';
 import { resetSessionCounter } from './session.js';
 import { resetRuleCounter } from './rule.js';
 import { resetViolationCounter } from './violation.js';
+import { resetLibraryItemCounter } from './libraryItem.js';
 
 export {
   buildUser,
@@ -98,6 +99,15 @@ export {
   type ViolationSeverity,
 } from './violation.js';
 
+export {
+  buildLibraryItem,
+  createTestLibraryItem,
+  createTestLibraryItemVersion,
+  resetLibraryItemCounter,
+  type LibraryItemData,
+  type LibraryItemVersionData,
+} from './libraryItem.js';
+
 /**
  * Reset all factory counters
  *
@@ -110,4 +120,5 @@ export function resetAllFactoryCounters(): void {
   resetSessionCounter();
   resetRuleCounter();
   resetViolationCounter();
+  resetLibraryItemCounter();
 }

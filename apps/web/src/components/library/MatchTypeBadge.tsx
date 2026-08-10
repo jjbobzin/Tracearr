@@ -11,6 +11,7 @@ const MATCH_LABELS: Record<MatchType, string> = {
   tmdb: 'TMDB',
   tvdb: 'TVDB',
   fuzzy: 'Fuzzy',
+  version: 'Versions',
 };
 
 /**

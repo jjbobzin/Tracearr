@@ -24,6 +24,23 @@ if (typeof Element.prototype.scrollIntoView === 'undefined') {
   };
 }
 
+// jsdom has no Pointer Events implementation; radix Select's pointer-down
+// handling calls these directly, so any test that opens a Select throws
+// without them.
+if (typeof Element.prototype.hasPointerCapture === 'undefined') {
+  Element.prototype.hasPointerCapture = () => false;
+}
+if (typeof Element.prototype.setPointerCapture === 'undefined') {
+  Element.prototype.setPointerCapture = () => {
+    // no-op
+  };
+}
+if (typeof Element.prototype.releasePointerCapture === 'undefined') {
+  Element.prototype.releasePointerCapture = () => {
+    // no-op
+  };
+}
+
 afterEach(() => {
   cleanup();
 });

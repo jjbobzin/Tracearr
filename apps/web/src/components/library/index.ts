@@ -1,14 +1,13 @@
 export { ErrorState, InlineErrorState } from './ErrorState';
 export { EmptyState } from './EmptyState';
 export { LibraryEmptyState } from './LibraryEmptyState';
-export { CodecBreakdown } from './CodecBreakdown';
-export { QualityProgress } from './QualityProgress';
 export { QualityTrend } from './QualityTrend';
 export { MatchTypeBadge } from './MatchTypeBadge';
 export { ValueCategoryBadge } from './ValueCategoryBadge';
 export { DuplicatesTable } from './DuplicatesTable';
 export { StaleContentTabs } from './StaleContentTabs';
 export { RoiTable } from './RoiTable';
+export { DeadWeightTable, DeadWeightTableSkeleton } from './DeadWeightTable';
 export { EngagementTierBadge } from './EngagementTierBadge';
 export { BingeHighlightsTable } from './BingeHighlightsTable';
 export { TopMoviesTable } from './TopMoviesTable';

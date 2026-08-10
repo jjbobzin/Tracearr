@@ -58,8 +58,7 @@ export async function hasHyperLogLog(): Promise<boolean> {
         ) as hll_column_exists
     `);
     const row = result.rows[0] as
-      | { extension_installed: boolean; hll_column_exists: boolean }
-      | undefined;
+      { extension_installed: boolean; hll_column_exists: boolean } | undefined;
     hyperLogLogAvailable = (row?.extension_installed && row?.hll_column_exists) ?? false;
     return hyperLogLogAvailable;
   } catch {

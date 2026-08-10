@@ -76,7 +76,9 @@ function createStatements() {
         count: sql<number>`count(*)::int`,
       })
       .from(violations)
-      .where(gte(violations.createdAt, sql.placeholder('since')))
+      .where(
+        and(gte(violations.createdAt, sql.placeholder('since')), isNull(violations.dismissedAt))
+      )
       .prepare('violations_count_since'),
 
     /**
@@ -110,7 +112,7 @@ function createStatements() {
         count: sql<number>`count(*)::int`,
       })
       .from(violations)
-      .where(isNull(violations.acknowledgedAt))
+      .where(and(isNull(violations.acknowledgedAt), isNull(violations.dismissedAt)))
       .prepare('unacknowledged_violations_count'),
 
     // ========================================================================
@@ -331,7 +333,7 @@ function createStatements() {
     getUnackedViolations: db
       .select()
       .from(violations)
-      .where(isNull(violations.acknowledgedAt))
+      .where(and(isNull(violations.acknowledgedAt), isNull(violations.dismissedAt)))
       .orderBy(desc(violations.createdAt))
       .limit(sql.placeholder('limit'))
       .prepare('get_unacked_violations'),

@@ -363,7 +363,11 @@ describe('killQueue', () => {
           makeJob(makeData({ ruleId, cooldownMinutes: 10, triggeringServerUserId }))
         );
 
-        expect(setCooldown).toHaveBeenCalledWith(ruleId, `${ruleId}:${triggeringServerUserId}`, 10);
+        expect(setCooldown).toHaveBeenCalledWith(
+          ruleId,
+          `${ruleId}:${triggeringServerUserId}:kill_stream`,
+          10
+        );
       });
 
       it('does not arm the cooldown when the kill was aborted (skipped outcome)', async () => {

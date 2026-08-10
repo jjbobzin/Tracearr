@@ -119,8 +119,11 @@ timezone = 'UTC'
 timescaledb.license = timescale
 # Disable TimescaleDB telemetry
 timescaledb.telemetry_level = off
-# Allow unlimited tuple decompression for migrations on compressed hypertables
-timescaledb.max_tuples_decompressed_per_dml_transaction = 0
+# Cap tuple decompression per DML transaction (TimescaleDB's default, set
+# explicitly because earlier releases wrote 0 = unlimited here, which let one
+# UPDATE decompress unbounded history into memory and OOM the container).
+# Migrations and imports that need more grant it per-session/per-transaction.
+timescaledb.max_tuples_decompressed_per_dml_transaction = 100000
 # Increase lock table size for TimescaleDB hypertables with many chunks
 # Default (64) is far too low - hypertables with 1000+ chunks need locks on each chunk + indexes
 # Memory cost: 4096 * max_connections * ~256 bytes = ~100MB at 100 connections (trivial)
@@ -197,7 +200,7 @@ if [ ! -f /data/postgres/PG_VERSION ]; then
             warn "Initializing fresh database..."
             rm -rf /data/postgres/*
             chown -R postgres:postgres /data/postgres
-            gosu postgres /usr/lib/postgresql/15/bin/initdb -D /data/postgres
+            gosu postgres /usr/lib/postgresql/15/bin/initdb -D /data/postgres -E UTF8 --locale=C.UTF-8
             init_postgres_db
         fi
     else
@@ -210,7 +213,7 @@ if [ ! -f /data/postgres/PG_VERSION ]; then
             warn "Previous sessions will be invalidated (users will need to log in again)"
         fi
         chown -R postgres:postgres /data/postgres
-        gosu postgres /usr/lib/postgresql/15/bin/initdb -D /data/postgres
+        gosu postgres /usr/lib/postgresql/15/bin/initdb -D /data/postgres -E UTF8 --locale=C.UTF-8
         init_postgres_db
     fi
 else
@@ -275,6 +278,7 @@ fi
 if command -v timescaledb-tune &> /dev/null; then
     TUNE_MEMORY=""
     MEMORY_SOURCE=""
+    CGROUP_MB=""
 
     # Priority 1: User-specified memory limit via environment variable
     if [ -n "${PG_MAX_MEMORY:-}" ]; then
@@ -286,8 +290,7 @@ if command -v timescaledb-tune &> /dev/null; then
         if [ "$CGROUP_LIMIT" != "max" ] && [ -n "$CGROUP_LIMIT" ]; then
             # Convert bytes to MB
             CGROUP_MB=$((CGROUP_LIMIT / 1024 / 1024))
-            TUNE_MEMORY="${CGROUP_MB}MB"
-            MEMORY_SOURCE="cgroup v2"
+            CGROUP_VER="v2"
         fi
     # Priority 3: Detect container cgroup v1 memory limit (older systems)
     elif [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
@@ -295,9 +298,26 @@ if command -v timescaledb-tune &> /dev/null; then
         # Check if it's not the "unlimited" value (very large number ~9 exabytes)
         if [ -n "$CGROUP_LIMIT" ] && [ "$CGROUP_LIMIT" -gt 0 ] && [ "$CGROUP_LIMIT" -lt 9223372036854771712 ]; then
             CGROUP_MB=$((CGROUP_LIMIT / 1024 / 1024))
-            TUNE_MEMORY="${CGROUP_MB}MB"
-            MEMORY_SOURCE="cgroup v1"
+            CGROUP_VER="v1"
         fi
+    fi
+
+    # Postgres shares this cgroup with Node and Redis, and Node's sync-time
+    # spike lands exactly when postgres works hardest - tuning for the full
+    # limit left no reserve when the OOM killer fired under sync load.
+    # Reserve a quarter of the limit (at least 1GB) for Node and Redis and
+    # tune postgres for the rest: 3/4 on containers >=4G, half at 2G.
+    # PG_MAX_MEMORY overrides this split entirely.
+    if [ -n "$CGROUP_MB" ]; then
+        PG_RESERVE_MB=1024
+        [ $((CGROUP_MB / 4)) -gt "$PG_RESERVE_MB" ] && PG_RESERVE_MB=$((CGROUP_MB / 4))
+        PG_TUNE_MB=$((CGROUP_MB - PG_RESERVE_MB))
+        # 0 or negative makes timescaledb-tune exit non-zero and silently skip
+        # tuning, leaving a stale larger config in place - floor it instead.
+        [ "$PG_TUNE_MB" -lt 256 ] && PG_TUNE_MB=256
+        TUNE_MEMORY="${PG_TUNE_MB}MB"
+        MEMORY_SOURCE="cgroup ${CGROUP_VER} limit ${CGROUP_MB}MB minus ${PG_RESERVE_MB}MB reserved for Node/Redis"
+        log "PostgreSQL is tuned for the container limit minus a Node/Redis reserve. Set PG_MAX_MEMORY to override."
     fi
 
     if [ -n "$TUNE_MEMORY" ]; then
@@ -310,10 +330,36 @@ if command -v timescaledb-tune &> /dev/null; then
         # No container limit detected - use host memory (default behavior)
         # This may over-allocate if container has mem_limit set but cgroup detection failed
         warn "No container memory limit detected - tuning for host memory"
-        warn "If using mem_limit in compose, set PG_MAX_MEMORY to match (e.g., PG_MAX_MEMORY=2GB)"
+        warn "If using mem_limit in compose, set PG_MAX_MEMORY to about three-quarters of it (e.g. PG_MAX_MEMORY=3GB for a 4g limit)"
         timescaledb-tune --pg-config=/usr/lib/postgresql/15/bin/pg_config \
             --conf-path=/data/postgres/postgresql.conf \
             --yes --quiet 2>/dev/null || warn "timescaledb-tune failed (non-fatal)"
+    fi
+fi
+
+# =============================================================================
+# Floor max_connections when the postgres memory budget affords it
+# =============================================================================
+# The Node/Redis reserve shrinks the budget timescaledb-tune sees, and its
+# tuned max_connections can dip below the stock 100. At a 2GB+ postgres
+# budget 100 backends are affordable, so restore the floor; smaller
+# containers keep tune's value.
+PG_BUDGET_MB=""
+if [ -n "${PG_TUNE_MB:-}" ]; then
+    PG_BUDGET_MB="$PG_TUNE_MB"
+elif [ -n "${PG_MAX_MEMORY:-}" ]; then
+    PG_MEM_NUM=$(printf '%s' "$PG_MAX_MEMORY" | grep -oE '[0-9]+' | head -1 || echo "")
+    case "$PG_MAX_MEMORY" in
+        *[Gg]*) [ -n "$PG_MEM_NUM" ] && PG_BUDGET_MB=$((PG_MEM_NUM * 1024)) ;;
+        *) PG_BUDGET_MB="$PG_MEM_NUM" ;;
+    esac
+fi
+
+if [ -n "$PG_BUDGET_MB" ] && [ "$PG_BUDGET_MB" -ge 2048 ] 2>/dev/null && [ -f /data/postgres/postgresql.conf ]; then
+    TUNED_MAX_CONN=$(grep -E "^max_connections\s*=" /data/postgres/postgresql.conf | tail -1 | grep -oE '[0-9]+' | head -1 || echo "")
+    if [ -n "$TUNED_MAX_CONN" ] && [ "$TUNED_MAX_CONN" -lt 100 ] 2>/dev/null; then
+        log "Raising max_connections from $TUNED_MAX_CONN to 100 (postgres budget ${PG_BUDGET_MB}MB affords it)"
+        sed -i "s/^max_connections\s*=.*/max_connections = 100/" /data/postgres/postgresql.conf
     fi
 fi
 
@@ -323,24 +369,26 @@ fi
 # After timescaledb-tune runs, read the configured max_connections and set
 # DATABASE_POOL_MAX accordingly. This prevents pool exhaustion on high-memory
 # systems while avoiding connection conflicts on low-memory systems.
+PG_MAX_CONN=""
+
+# Try to read max_connections from postgresql.conf
+if [ -f /data/postgres/postgresql.conf ]; then
+    PG_MAX_CONN=$(grep -E "^max_connections\s*=" /data/postgres/postgresql.conf 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "")
+fi
+
+# Reserve connections for superuser, maintenance, and replication
+# - 3 for superuser reserved connections
+# - 2 for maintenance/backup operations
+# Both branches below treat "safe" as leaving this many connections free.
+RESERVED_CONN=5
+
 if [ -z "${DATABASE_POOL_MAX:-}" ]; then
-    PG_MAX_CONN=""
-
-    # Try to read max_connections from postgresql.conf
-    if [ -f /data/postgres/postgresql.conf ]; then
-        PG_MAX_CONN=$(grep -E "^max_connections\s*=" /data/postgres/postgresql.conf 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "")
-    fi
-
     # Fallback: use a safe default if we couldn't read the config
     if [ -z "$PG_MAX_CONN" ] || [ "$PG_MAX_CONN" -eq 0 ] 2>/dev/null; then
         PG_MAX_CONN=100
         warn "Could not read max_connections from postgresql.conf, assuming $PG_MAX_CONN"
     fi
 
-    # Reserve connections for superuser, maintenance, and replication
-    # - 3 for superuser reserved connections
-    # - 2 for maintenance/backup operations
-    RESERVED_CONN=5
     POOL_MAX=$((PG_MAX_CONN - RESERVED_CONN))
 
     # Enforce minimum and maximum bounds
@@ -355,29 +403,50 @@ if [ -z "${DATABASE_POOL_MAX:-}" ]; then
     export DATABASE_POOL_MAX="$POOL_MAX"
     log "Database pool configured: max=$POOL_MAX (PostgreSQL max_connections=$PG_MAX_CONN)"
 else
+    if [ -n "$PG_MAX_CONN" ] && [ "$DATABASE_POOL_MAX" -gt "$((PG_MAX_CONN - RESERVED_CONN))" ] 2>/dev/null; then
+        warn "DATABASE_POOL_MAX=$DATABASE_POOL_MAX exceeds PostgreSQL max_connections=$PG_MAX_CONN minus $RESERVED_CONN reserved for superuser/maintenance - expect \"sorry, too many clients already\" errors under load"
+    fi
+
     log "Using user-specified DATABASE_POOL_MAX=$DATABASE_POOL_MAX"
 fi
 
+# The supervised image bundles its own postgres, so the extension owner is the
+# app user and updates always match the bundled binaries: safe to auto-update.
+# Image bumps would otherwise leave the extension version behind silently.
+export TIMESCALEDB_AUTO_UPDATE="${TIMESCALEDB_AUTO_UPDATE:-true}"
+
 # =============================================================================
-# Ensure TimescaleDB decompression limit is set (for existing databases)
+# Ensure the TimescaleDB decompression cap is at its default (existing installs)
 # =============================================================================
-# This setting allows migrations to modify compressed hypertable data.
-# Without it, bulk UPDATEs on compressed sessions will fail with
-# "tuple decompression limit exceeded" errors. Must be 0 (unlimited).
+# Earlier releases forced this to 0 (unlimited) on every boot, which removed
+# TimescaleDB's per-transaction memory guard from all runtime DML and let the
+# session identity backfill OOM postgres. Rewrite those installs back to the
+# default; migrations and imports grant themselves unlimited per-session
+# (migrations) or per-transaction (imports).
 if [ -f /data/postgres/postgresql.conf ]; then
     if grep -q "^timescaledb\.max_tuples_decompressed_per_dml_transaction" /data/postgres/postgresql.conf; then
-        # Setting exists (uncommented) - ensure it's set to 0
-        current_value=$(grep "^timescaledb\.max_tuples_decompressed_per_dml_transaction" /data/postgres/postgresql.conf | grep -oE '[0-9]+' | head -1)
-        if [ -n "$current_value" ] && [ "$current_value" != "0" ]; then
-            log "Updating timescaledb.max_tuples_decompressed_per_dml_transaction to 0..."
-            sed -i "s/^timescaledb\.max_tuples_decompressed_per_dml_transaction.*/timescaledb.max_tuples_decompressed_per_dml_transaction = 0/" /data/postgres/postgresql.conf
+        # Postgres applies the LAST occurrence in the file, so read that one -
+        # a stale "= 0" below a newer "= 100000" is the case that needs repair.
+        current_value=$(grep "^timescaledb\.max_tuples_decompressed_per_dml_transaction" /data/postgres/postgresql.conf | grep -oE '[0-9]+' | tail -1)
+        # Only rewrite the dangerous value. 0 means unlimited (the setting that
+        # OOM-crashed postgres) and empty means malformed; an operator who
+        # deliberately raised the cap to e.g. 1000000 keeps it.
+        if [ "$current_value" = "0" ] || [ -z "$current_value" ]; then
+            log "Updating timescaledb.max_tuples_decompressed_per_dml_transaction from ${current_value:-unset} to 100000..."
+            # set -e is on and this runs as PID 1: a bind-mounted or :ro conf
+            # makes sed fail, which would kill the container before postgres
+            # ever starts. Warn and carry on instead.
+            if ! sed -i "s/^timescaledb\.max_tuples_decompressed_per_dml_transaction.*/timescaledb.max_tuples_decompressed_per_dml_transaction = 100000/" /data/postgres/postgresql.conf; then
+                warn "Could not rewrite postgresql.conf (read-only?) - set timescaledb.max_tuples_decompressed_per_dml_transaction = 100000 manually"
+            fi
         fi
-    elif ! grep -q "^timescaledb\.max_tuples_decompressed_per_dml_transaction" /data/postgres/postgresql.conf; then
-        # Setting doesn't exist or is commented out - add active setting
-        log "Adding TimescaleDB decompression setting for migrations..."
-        echo "" >> /data/postgres/postgresql.conf
-        echo "# Allow unlimited tuple decompression for migrations on compressed hypertables" >> /data/postgres/postgresql.conf
-        echo "timescaledb.max_tuples_decompressed_per_dml_transaction = 0" >> /data/postgres/postgresql.conf
+    else
+        log "Adding TimescaleDB decompression cap setting..."
+        {
+            echo ""
+            echo "# Cap tuple decompression per DML transaction (TimescaleDB default)"
+            echo "timescaledb.max_tuples_decompressed_per_dml_transaction = 100000"
+        } >> /data/postgres/postgresql.conf || warn "Could not append to postgresql.conf (read-only?)"
     fi
 fi
 
@@ -390,18 +459,23 @@ fi
 # Memory cost: 4096 * max_connections * ~256 bytes = ~100MB at 100 connections (trivial)
 if [ -f /data/postgres/postgresql.conf ]; then
     if grep -q "^max_locks_per_transaction" /data/postgres/postgresql.conf; then
-        # Setting exists (uncommented) - update if below 4096
-        current_value=$(grep "^max_locks_per_transaction" /data/postgres/postgresql.conf | grep -oE '[0-9]+' | head -1)
+        # Setting exists (uncommented) - update if below 4096. Postgres applies
+        # the LAST occurrence in the file, so read that one.
+        current_value=$(grep "^max_locks_per_transaction" /data/postgres/postgresql.conf | grep -oE '[0-9]+' | tail -1)
         if [ -n "$current_value" ] && [ "$current_value" -lt 4096 ]; then
             log "Updating max_locks_per_transaction from $current_value to 4096..."
-            sed -i "s/^max_locks_per_transaction.*/max_locks_per_transaction = 4096/" /data/postgres/postgresql.conf
+            if ! sed -i "s/^max_locks_per_transaction.*/max_locks_per_transaction = 4096/" /data/postgres/postgresql.conf; then
+                warn "Could not rewrite postgresql.conf (read-only?) - set max_locks_per_transaction = 4096 manually"
+            fi
         fi
     elif ! grep -q "^max_locks_per_transaction" /data/postgres/postgresql.conf; then
         # Setting doesn't exist or is commented out - add active setting
         log "Adding max_locks_per_transaction setting for TimescaleDB..."
-        echo "" >> /data/postgres/postgresql.conf
-        echo "# Increase lock table size for TimescaleDB hypertables with many chunks" >> /data/postgres/postgresql.conf
-        echo "max_locks_per_transaction = 4096" >> /data/postgres/postgresql.conf
+        {
+            echo ""
+            echo "# Increase lock table size for TimescaleDB hypertables with many chunks"
+            echo "max_locks_per_transaction = 4096"
+        } >> /data/postgres/postgresql.conf || warn "Could not append to postgresql.conf (read-only?)"
     fi
 fi
 

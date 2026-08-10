@@ -11,6 +11,9 @@ out
 # Turbo
 .turbo
 
+# ESLint
+.eslintcache
+
 # Environment
 .env
 .env.local

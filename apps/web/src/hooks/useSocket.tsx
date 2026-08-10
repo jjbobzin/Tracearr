@@ -24,6 +24,7 @@ import type {
   TautulliImportProgress,
   JellystatImportProgress,
   MaintenanceJobProgress,
+  RunningTask,
   ServerConnectionStatus,
 } from '@tracearr/shared';
 import { WS_EVENTS } from '@tracearr/shared';
@@ -56,6 +57,10 @@ const SocketContext = createContext<SocketContextValue | null>(null);
 // throttle so a busy tick doesn't trigger a refetch per session.
 const SESSION_UPDATED_THROTTLE_MS = 2000;
 const SESSION_STOPPED_HISTORY_THROTTLE_MS = 5000;
+// Job progress events arrive per batch during syncs/imports; a long import
+// would otherwise drive /tasks/running refetches for hours, so this stays
+// near the old fixed poll cadence.
+const TASKS_REFRESH_THROTTLE_MS = 5000;
 
 export function SocketProvider({ children }: { children: ReactNode }) {
   const { t } = useTranslation(['notifications', 'common']);
@@ -78,6 +83,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const routingMapRef = useRef<Map<NotificationEventType, NotificationChannelRouting>>(new Map());
   const sessionUpdatedThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionStoppedHistoryThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tasksRefreshThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasConnectedRef = useRef(false);
 
   // Update the ref when routing data changes
   useEffect(() => {
@@ -150,8 +157,24 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       reconnectionDelay: 1000,
     });
 
+    const scheduleTasksRefresh = () => {
+      if (tasksRefreshThrottleRef.current) return;
+      tasksRefreshThrottleRef.current = setTimeout(() => {
+        tasksRefreshThrottleRef.current = null;
+        void queryClient.invalidateQueries({ queryKey: ['tasks', 'running'] });
+      }, TASKS_REFRESH_THROTTLE_MS);
+    };
+
     newSocket.on('connect', () => {
       setIsConnected(true);
+      // Catch up on anything missed while the socket was down; skipped on the
+      // very first connect since those queries are freshly fetched anyway.
+      if (hasConnectedRef.current) {
+        void queryClient.invalidateQueries({ queryKey: ['sessions', 'active'] });
+        void queryClient.invalidateQueries({ queryKey: ['tasks', 'running'] });
+        void queryClient.invalidateQueries({ queryKey: ['stats', 'dashboard'] });
+      }
+      hasConnectedRef.current = true;
     });
 
     newSocket.on('disconnect', () => {
@@ -295,16 +318,25 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       });
     });
 
+    // Unified running-tasks push; the server does not emit this yet, but the
+    // shared contract defines it, so honor it if it ever arrives.
+    newSocket.on(WS_EVENTS.TASKS_UPDATED, (tasks: RunningTask[]) => {
+      queryClient.setQueryData(['tasks', 'running'], { tasks });
+    });
+
     // Library sync progress - invalidate library caches when sync completes
     newSocket.on(WS_EVENTS.LIBRARY_SYNC_PROGRESS, (progress: LibrarySyncProgress) => {
+      scheduleTasksRefresh();
       if (progress.status === 'complete' || progress.status === 'error') {
         // Invalidate all library queries to refresh storage and stale content
         void queryClient.invalidateQueries({ queryKey: ['library'] });
+        void queryClient.invalidateQueries({ queryKey: ['media'] });
       }
     });
 
     // Tautulli import progress - invalidate session data when import completes
     newSocket.on(WS_EVENTS.IMPORT_PROGRESS, (progress: TautulliImportProgress) => {
+      scheduleTasksRefresh();
       if (progress.status === 'complete') {
         // Invalidate session history and stats after importing watch history
         void queryClient.invalidateQueries({ queryKey: ['sessions'] });
@@ -315,6 +347,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     // Jellystat import progress - invalidate session data when import completes
     newSocket.on(WS_EVENTS.IMPORT_JELLYSTAT_PROGRESS, (progress: JellystatImportProgress) => {
+      scheduleTasksRefresh();
       if (progress.status === 'complete') {
         // Invalidate session history and stats after importing watch history
         void queryClient.invalidateQueries({ queryKey: ['sessions'] });
@@ -325,12 +358,14 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     // Maintenance job progress - invalidate relevant caches when jobs complete
     newSocket.on(WS_EVENTS.MAINTENANCE_PROGRESS, (progress: MaintenanceJobProgress) => {
+      scheduleTasksRefresh();
       if (progress.status === 'complete') {
         // Different jobs affect different data
         switch (progress.type) {
           case 'rebuild_timescale_views':
             // Rebuilding views affects all chart/stats data
             void queryClient.invalidateQueries({ queryKey: ['library'] });
+            void queryClient.invalidateQueries({ queryKey: ['media'] });
             void queryClient.invalidateQueries({ queryKey: ['stats'] });
             void queryClient.invalidateQueries({ queryKey: ['sessions'] });
             break;
@@ -339,6 +374,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
             // These affect session/playback data
             void queryClient.invalidateQueries({ queryKey: ['sessions'] });
             void queryClient.invalidateQueries({ queryKey: ['library'] });
+            void queryClient.invalidateQueries({ queryKey: ['media'] });
             break;
           case 'normalize_countries':
             // Affects geographic data in sessions
@@ -373,6 +409,10 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       if (sessionStoppedHistoryThrottleRef.current) {
         clearTimeout(sessionStoppedHistoryThrottleRef.current);
         sessionStoppedHistoryThrottleRef.current = null;
+      }
+      if (tasksRefreshThrottleRef.current) {
+        clearTimeout(tasksRefreshThrottleRef.current);
+        tasksRefreshThrottleRef.current = null;
       }
     };
   }, [isAuthenticated, isInMaintenance, queryClient, isWebToastEnabled]);

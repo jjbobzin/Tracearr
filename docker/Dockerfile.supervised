@@ -57,14 +57,20 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PostgreSQL 15 + TimescaleDB
+# timescaledb-2-postgresql-15 is pinned to the 2.28.x line, not left to float:
+# TimescaleDB 2.28.x is the last line PG15 supports (2.29+ requires PG16+), and an
+# unpinned install could silently jump to a release this image's PG15 can't run.
+# Bumping this pin past 2.28.x means a PG major upgrade (dump/restore) first.
 RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
     && curl -fsSL https://packagecloud.io/timescale/timescaledb/gpgkey | gpg --dearmor -o /usr/share/keyrings/timescaledb-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/timescaledb-keyring.gpg] https://packagecloud.io/timescale/timescaledb/debian/ bookworm main" > /etc/apt/sources.list.d/timescaledb.list \
     && apt-get update \
+    && TIMESCALEDB_VERSION="$(apt-cache madison timescaledb-2-postgresql-15 | awk '{print $3}' | grep -m1 '^2\.28\.')" \
+    && if [ -z "$TIMESCALEDB_VERSION" ]; then echo "No 2.28.x timescaledb-2-postgresql-15 package found" >&2; exit 1; fi \
     && apt-get install -y --no-install-recommends \
         postgresql-15 \
-        timescaledb-2-postgresql-15 \
+        "timescaledb-2-postgresql-15=${TIMESCALEDB_VERSION}" \
         timescaledb-tools \
         timescaledb-toolkit-postgresql-15 \
     && rm -rf /var/lib/apt/lists/*

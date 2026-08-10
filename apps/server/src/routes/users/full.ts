@@ -16,7 +16,7 @@
  */
 
 import type { FastifyPluginAsync } from 'fastify';
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, isNull, sql } from 'drizzle-orm';
 import { userIdParamSchema, identityScopeQuerySchema, type UserLocation } from '@tracearr/shared';
 import { db } from '../../db/client.js';
 import {
@@ -80,7 +80,7 @@ export const fullRoutes: FastifyPluginAsync = async (app) => {
           thumbUrl: serverUsers.thumbUrl,
           isServerAdmin: serverUsers.isServerAdmin,
           trustScore: serverUsers.trustScore,
-          sessionCount: serverUsers.sessionCount,
+          sessionCount: sql<number>`(select count(*)::int from ${sessions} where ${sessions.serverUserId} = ${serverUsers.id})`,
           joinedAt: serverUsers.joinedAt,
           lastActivityAt: serverUsers.lastActivityAt,
           removedAt: serverUsers.removedAt,
@@ -129,7 +129,7 @@ export const fullRoutes: FastifyPluginAsync = async (app) => {
           username: serverUsers.username,
           thumbUrl: serverUsers.thumbUrl,
           trustScore: serverUsers.trustScore,
-          sessionCount: serverUsers.sessionCount,
+          sessionCount: sql<number>`(select count(*)::int from ${sessions} where ${sessions.serverUserId} = ${serverUsers.id})`,
           removedAt: serverUsers.removedAt,
         })
         .from(serverUsers)
@@ -337,7 +337,12 @@ export const fullRoutes: FastifyPluginAsync = async (app) => {
         .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
         .innerJoin(servers, eq(serverUsers.serverId, servers.id))
         .leftJoin(sessions, eq(violations.sessionId, sessions.id))
-        .where(sql`${violations.serverUserId} = ANY(${scopedIdArray})`)
+        .where(
+          and(
+            sql`${violations.serverUserId} = ANY(${scopedIdArray})`,
+            isNull(violations.dismissedAt)
+          )
+        )
         .orderBy(desc(violations.createdAt))
         .limit(violationsLimit);
 
@@ -345,7 +350,12 @@ export const fullRoutes: FastifyPluginAsync = async (app) => {
       const violationsCountResult = await tx
         .select({ count: sql<number>`count(*)::int` })
         .from(violations)
-        .where(sql`${violations.serverUserId} = ANY(${scopedIdArray})`);
+        .where(
+          and(
+            sql`${violations.serverUserId} = ANY(${scopedIdArray})`,
+            isNull(violations.dismissedAt)
+          )
+        );
 
       const violationsTotal = violationsCountResult[0]?.count ?? 0;
 

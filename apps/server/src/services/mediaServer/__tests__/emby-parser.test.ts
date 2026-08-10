@@ -267,3 +267,60 @@ describe('Emby Parser - Edge Cases', () => {
     expect(session!.music?.albumThumbPath).toBe('/Items/album-456/Images/Primary');
   });
 });
+
+describe('Emby Parser - transcode progress parity', () => {
+  it('parses throttle, transcode position, and per-direction hardware accel', () => {
+    const session = parseSession({
+      Id: 'session-1',
+      NowPlayingItem: {
+        Id: '1',
+        Name: 'Test',
+        Type: 'Movie',
+        MediaStreams: [{ Type: 'Video', RealFrameRate: 24 }],
+      },
+      PlayState: { IsPaused: false },
+      TranscodingInfo: {
+        IsVideoDirect: false,
+        CompletionPercentage: 61.2,
+        Framerate: 48,
+        CurrentThrottle: 40,
+        TranscodingPositionTicks: 9000000000,
+        VideoDecoderIsHardware: true,
+        VideoDecoderHwAccel: 'qsv',
+        VideoEncoderIsHardware: true,
+        VideoEncoderHwAccel: 'qsv',
+      },
+    });
+
+    const info = session!.quality.transcodeInfo;
+    expect(info?.progress).toBe(61.2);
+    expect(info?.speed).toBe(2);
+    expect(info?.throttled).toBe(true);
+    expect(info?.maxOffsetAvailable).toBe(900);
+    expect(info?.hwRequested).toBe(true);
+    expect(info?.hwDecoding).toBe('qsv');
+    expect(info?.hwEncoding).toBe('qsv');
+  });
+
+  it('leaves throttle and hw fields unset for unthrottled software transcode', () => {
+    const session = parseSession({
+      Id: 'session-1',
+      NowPlayingItem: { Id: '1', Name: 'Test', Type: 'Movie' },
+      PlayState: { IsPaused: false },
+      TranscodingInfo: {
+        IsVideoDirect: false,
+        CompletionPercentage: 5,
+        CurrentThrottle: 0,
+        VideoDecoderIsHardware: false,
+        VideoDecoderHwAccel: 'vaapi',
+        VideoEncoderIsHardware: false,
+      },
+    });
+
+    const info = session!.quality.transcodeInfo;
+    expect(info?.throttled).toBeUndefined();
+    expect(info?.hwDecoding).toBeUndefined();
+    expect(info?.hwRequested).toBeUndefined();
+    expect(info?.progress).toBe(5);
+  });
+});

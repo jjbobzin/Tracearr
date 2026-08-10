@@ -42,6 +42,7 @@ interface ConditionRowProps {
   onRemove: () => void;
   showRemove?: boolean;
   filterOptions?: RulesFilterOptions;
+  allowedFields?: ReadonlySet<string>;
 }
 
 export function ConditionRow({
@@ -50,11 +51,17 @@ export function ConditionRow({
   onRemove,
   showRemove = true,
   filterOptions,
+  allowedFields,
 }: ConditionRowProps) {
-  const fieldDef = FIELD_DEFINITIONS[condition.field];
+  const fieldDef = FIELD_DEFINITIONS[condition.field] as
+    (typeof FIELD_DEFINITIONS)[ConditionField] | undefined;
   const fieldsByCategory = getFieldsByCategory();
   const { data: settings } = useSettings();
   const unitSystem = settings?.unitSystem ?? 'metric';
+
+  // A stored rule can carry a field this build no longer defines (library_id
+  // was removed); rendering nothing beats taking the whole builder down
+  if (!fieldDef) return null;
 
   // Handle field change - reset operator and value
   const handleFieldChange = (newField: ConditionField) => {
@@ -146,7 +153,12 @@ export function ConditionRow({
         </SelectTrigger>
         <SelectContent className="min-w-[240px]">
           {(Object.keys(fieldsByCategory) as FieldCategory[]).map((category) => {
-            const fields = fieldsByCategory[category];
+            // The row's own field always stays listed so the trigger keeps
+            // its label even when the rest of the rule disallows it.
+            const fields = fieldsByCategory[category].filter(
+              (def) =>
+                !allowedFields || allowedFields.has(def.field) || def.field === condition.field
+            );
             if (fields.length === 0) return null;
             return (
               <SelectGroup key={category}>

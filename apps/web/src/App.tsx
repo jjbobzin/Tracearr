@@ -11,7 +11,11 @@ import { Setup } from '@/pages/Setup';
 import { Dashboard } from '@/pages/Dashboard';
 import { Map } from '@/pages/Map';
 import { StatsActivity, StatsUsers, StatsDevices, StatsBandwidth } from '@/pages/stats';
-import { LibraryOverview, LibraryQuality, LibraryStorage, LibraryWatch } from '@/pages/library';
+import { LibraryQuality, LibraryStorage, LibraryWatch } from '@/pages/library';
+import { MediaOverview } from '@/pages/media/Overview';
+import { MediaGrid } from '@/pages/media/Grid';
+import { MediaGenres } from '@/pages/media/Genres';
+import { MediaDetail } from '@/pages/media/Detail';
 import { Users } from '@/pages/Users';
 import { UserDetail } from '@/pages/UserDetail';
 import { Rules } from '@/pages/Rules';
@@ -24,7 +28,7 @@ import { NotFound } from '@/pages/NotFound';
 import { Maintenance } from '@/pages/Maintenance';
 import { useMaintenanceMode } from '@/hooks/useMaintenanceMode';
 
-// Lazy load ApiDocs to avoid loading swagger-ui-react (which uses Node's Buffer) on app startup
+// Lazy load ApiDocs so Scalar's reference bundle stays out of the app startup path
 const ApiDocs = lazy(() => import('@/pages/ApiDocs').then((m) => ({ default: m.ApiDocs })));
 
 export function App() {
@@ -59,18 +63,26 @@ export function App() {
           {/* Stats routes */}
           <Route path="stats" element={<Navigate to="/stats/activity" replace />} />
           <Route path="stats/activity" element={<StatsActivity />} />
-          <Route path="stats/library" element={<Navigate to="/library" replace />} />
+          <Route path="stats/library" element={<Navigate to="/media" replace />} />
           <Route path="stats/users" element={<StatsUsers />} />
 
           {/* Performance routes */}
           <Route path="stats/devices" element={<StatsDevices />} />
           <Route path="stats/bandwidth" element={<StatsBandwidth />} />
 
-          {/* Library routes */}
-          <Route path="library" element={<LibraryOverview />} />
+          {/* Library routes - overview merged into Media, other pages untouched */}
+          <Route path="library" element={<Navigate to="/media" replace />} />
           <Route path="library/quality" element={<LibraryQuality />} />
           <Route path="library/storage" element={<LibraryStorage />} />
           <Route path="library/watch" element={<LibraryWatch />} />
+
+          {/* Media routes */}
+          <Route path="media" element={<MediaOverview />} />
+          <Route path="media/browse" element={<MediaGrid />} />
+          <Route path="media/movies" element={<Navigate to="/media/browse" replace />} />
+          <Route path="media/shows" element={<Navigate to="/media/browse?type=shows" replace />} />
+          <Route path="media/genres" element={<MediaGenres />} />
+          <Route path="media/:id" element={<MediaDetail />} />
 
           {/* Other routes */}
           <Route path="history/:sessionId?" element={<History />} />

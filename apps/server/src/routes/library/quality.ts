@@ -22,7 +22,11 @@ import {
   type LibraryQualityQueryInput,
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
-import { validateServerAccess } from '../../utils/serverFiltering.js';
+import {
+  validateServerAccess,
+  resolveServerIds,
+  buildMultiServerFragment,
+} from '../../utils/serverFiltering.js';
 import { buildLibraryCacheKey } from './utils.js';
 
 /** Single data point in quality timeline */
@@ -104,10 +108,14 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
         }
       }
 
+      const resolvedIds = resolveServerIds(authUser, serverId, undefined, { strict: false });
+      const serverCacheSegment =
+        resolvedIds !== undefined ? resolvedIds.slice().sort().join(',') : 'all';
+
       // Build cache key with all varying params including mediaType
       const cacheKey = buildLibraryCacheKey(
         REDIS_KEYS.LIBRARY_QUALITY,
-        serverId,
+        serverCacheSegment,
         `${period}:${mediaType}`,
         tz
       );
@@ -127,14 +135,7 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
       const endDate = new Date();
 
       // Build server filter for library_stats_daily
-      const serverFilter = serverId
-        ? sql`AND lsd.server_id = ${serverId}::uuid`
-        : authUser.serverIds?.length
-          ? sql`AND lsd.server_id IN (${sql.join(
-              authUser.serverIds.map((id: string) => sql`${id}::uuid`),
-              sql`, `
-            )})`
-          : sql``;
+      const serverFilter = buildMultiServerFragment(resolvedIds, 'lsd.server_id');
 
       // Media type filter - filter by library type (movie-only vs TV vs all video)
       // Libraries are typically homogeneous in Plex, so we filter based on content counts
@@ -187,6 +188,7 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
           -- Pre-filter libraries by media type before aggregating
           SELECT
             lsd.day,
+            lsd.total_items,
             lsd.count_4k,
             lsd.count_1080p,
             lsd.count_720p,
@@ -201,6 +203,7 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
           -- Aggregate quality counts across all matching libraries per day
           SELECT
             fl.day::date AS day,
+            COALESCE(SUM(fl.total_items), 0)::int AS total_items,
             COALESCE(SUM(fl.count_4k), 0)::int AS count_4k,
             COALESCE(SUM(fl.count_1080p), 0)::int AS count_1080p,
             COALESCE(SUM(fl.count_720p), 0)::int AS count_720p,
@@ -213,6 +216,10 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
           -- Use subquery to carry forward last known value for gaps
           SELECT
             ds.day,
+            COALESCE(dst.total_items, (
+              SELECT total_items FROM daily_stats dst2
+              WHERE dst2.day < ds.day ORDER BY dst2.day DESC LIMIT 1
+            ), 0)::int AS total_items,
             COALESCE(dst.count_4k, (
               SELECT count_4k FROM daily_stats dst2
               WHERE dst2.day < ds.day ORDER BY dst2.day DESC LIMIT 1
@@ -234,6 +241,7 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
         )
         SELECT
           fd.day::text,
+          fd.total_items,
           fd.count_4k,
           fd.count_1080p,
           fd.count_720p,
@@ -244,6 +252,7 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
 
       const rows = result.rows as Array<{
         day: string;
+        total_items: number;
         count_4k: number;
         count_1080p: number;
         count_720p: number;
@@ -253,11 +262,13 @@ export const libraryQualityRoute: FastifyPluginAsync = async (app) => {
       // Calculate percentages in application code
       // totalItems = sum of all quality tiers (we filter out music libraries in the query)
       const data: QualityDataPoint[] = rows.map((row) => {
-        const videoTotal = row.count_4k + row.count_1080p + row.count_720p + row.count_sd;
-        const total = videoTotal || 1; // Avoid division by zero
+        // Buckets are overlapping (a 4K+1080p title counts in both), so the
+        // denominator is the real title count, not the bucket sum, and
+        // percentages describe "share of titles having this tier".
+        const total = row.total_items || 1; // Avoid division by zero
         return {
           day: row.day,
-          totalItems: videoTotal,
+          totalItems: row.total_items,
           // Absolute counts
           count4k: row.count_4k,
           count1080p: row.count_1080p,

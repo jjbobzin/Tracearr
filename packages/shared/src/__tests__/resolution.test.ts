@@ -4,6 +4,10 @@ import {
   normalizeResolutionLabel,
   normalizeResolution,
   resolutionTierRank,
+  resolutionBucket,
+  resolutionBucketSpellings,
+  resolutionAboveSdSpellings,
+  resolutionSpellingRanks,
   RESOLUTION_TIERS,
 } from '../resolution.js';
 
@@ -121,5 +125,55 @@ describe('resolutionTierRank', () => {
   it('returns null for unknown labels', () => {
     expect(resolutionTierRank('576')).toBeNull();
     expect(resolutionTierRank(undefined)).toBeNull();
+  });
+});
+
+describe('resolutionBucket', () => {
+  it('folds tiers above 1080p into the 4k bucket', () => {
+    expect(resolutionBucket('4k')).toBe('4k');
+    expect(resolutionBucket('1440p')).toBe('4k');
+    expect(resolutionBucket('8k')).toBe('4k');
+    expect(resolutionBucket('2160')).toBe('4k');
+  });
+
+  it('maps exact tiers to their own buckets', () => {
+    expect(resolutionBucket('1080p')).toBe('1080p');
+    expect(resolutionBucket('720p')).toBe('720p');
+    expect(resolutionBucket('480p')).toBe('sd');
+    expect(resolutionBucket('sd')).toBe('sd');
+  });
+
+  it('counts unknown non-null labels as sd and keeps null as null', () => {
+    expect(resolutionBucket('576')).toBe('sd');
+    expect(resolutionBucket('weird')).toBe('sd');
+    expect(resolutionBucket(null)).toBeNull();
+    expect(resolutionBucket(undefined)).toBeNull();
+  });
+});
+
+describe('resolution bucket spellings', () => {
+  it('partitions spellings without overlap', () => {
+    const s4k = resolutionBucketSpellings('4k');
+    const s1080 = resolutionBucketSpellings('1080p');
+    const s720 = resolutionBucketSpellings('720p');
+
+    expect(s4k).toContain('1440p');
+    expect(s4k).toContain('8k');
+    expect(s1080).toContain('1080');
+    expect(s720).toContain('hd');
+    expect(new Set([...s4k, ...s1080, ...s720]).size).toBe(s4k.length + s1080.length + s720.length);
+    expect(new Set(resolutionAboveSdSpellings())).toEqual(new Set([...s4k, ...s1080, ...s720]));
+  });
+
+  it('agrees with resolutionBucket for every known spelling', () => {
+    for (const { spelling, rank } of resolutionSpellingRanks()) {
+      expect(rank).toBe(resolutionTierRank(spelling) ?? 0);
+      const bucket = resolutionBucket(spelling);
+      if (bucket === 'sd') {
+        expect(resolutionAboveSdSpellings()).not.toContain(spelling);
+      } else {
+        expect(resolutionBucketSpellings(bucket!)).toContain(spelling);
+      }
+    }
   });
 });

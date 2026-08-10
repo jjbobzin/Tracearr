@@ -22,7 +22,9 @@ import type {
   MediaLibrary,
   MediaWatchHistoryItem,
   MediaLibraryItem,
+  MediaItemVersion,
 } from '../types.js';
+import { computeVersionsFingerprint, pickBestVersion, sumVersionSizes } from './versionUtils.js';
 import {
   ticksToMs,
   parseMediaType,
@@ -35,8 +37,9 @@ import {
   extractLiveTvMetadata,
   extractMusicMetadata,
   extractStreamDetails,
+  mapDynamicRange,
 } from './jellyfinEmbyUtils.js';
-import { classifyByDimensions } from '@tracearr/shared';
+import { classifyByDimensions, normalizeDynamicRange } from '@tracearr/shared';
 
 // ============================================================================
 // Stream Decisions Function Type
@@ -99,6 +102,7 @@ export interface JellyfinEmbyItemResult {
   Artists?: string[];
   AlbumId?: string;
   AlbumPrimaryImageTag?: string;
+  RunTimeTicks?: number;
 }
 
 // ============================================================================
@@ -186,6 +190,7 @@ export function parseSessionCore(
   const result: MediaSession = {
     sessionKey: parseString(session.Id),
     mediaId: itemId,
+    serverVersionKey: parseOptionalString(playState?.MediaSourceId),
     user: {
       id: userId,
       username: parseString(session.UserName),
@@ -433,6 +438,7 @@ export function parseItem(item: Record<string, unknown>): JellyfinEmbyItemResult
     Artists: artists?.length ? artists : undefined,
     AlbumId: parseOptionalString(item.AlbumId),
     AlbumPrimaryImageTag: parseOptionalString(item.AlbumPrimaryImageTag),
+    RunTimeTicks: parseOptionalNumber(item.RunTimeTicks),
   };
 }
 
@@ -505,11 +511,18 @@ function parseExternalId(raw: unknown): number | undefined {
 /**
  * Parse ProviderIds object to extract external IDs
  * Handles both capitalized (Imdb) and lowercase (imdb) keys
+ *
+ * @param mediaType - When 'track'/'album'/'artist', also extracts the matching
+ *   MusicBrainz field (MusicBrainzTrack/Album/Artist, AlbumArtist for artist)
  */
-export function parseProviderIds(providerIds: unknown): {
+export function parseProviderIds(
+  providerIds: unknown,
+  mediaType?: string
+): {
   imdbId?: string;
   tmdbId?: number;
   tvdbId?: number;
+  musicBrainzId?: string;
 } {
   if (!providerIds || typeof providerIds !== 'object') {
     return {};
@@ -522,7 +535,7 @@ export function parseProviderIds(providerIds: unknown): {
   const tmdbRaw = ids.Tmdb ?? ids.tmdb ?? ids.TMDB;
   const tvdbRaw = ids.Tvdb ?? ids.tvdb ?? ids.TVDB;
 
-  const result: { imdbId?: string; tmdbId?: number; tvdbId?: number } = {};
+  const result: { imdbId?: string; tmdbId?: number; tvdbId?: number; musicBrainzId?: string } = {};
 
   if (typeof imdbRaw === 'string' && imdbRaw.length > 0) {
     // Extract valid IMDB ID (tt followed by digits) - handles malformed data like "tt37547598/?ref_=..."
@@ -534,6 +547,21 @@ export function parseProviderIds(providerIds: unknown): {
 
   result.tmdbId = parseExternalId(tmdbRaw);
   result.tvdbId = parseExternalId(tvdbRaw);
+
+  const mbidRaw =
+    mediaType === 'track'
+      ? (ids.MusicBrainzTrack ?? ids.musicBrainzTrack)
+      : mediaType === 'album'
+        ? (ids.MusicBrainzAlbum ?? ids.musicBrainzAlbum)
+        : mediaType === 'artist'
+          ? (ids.MusicBrainzArtist ??
+            ids.musicBrainzArtist ??
+            ids.MusicBrainzAlbumArtist ??
+            ids.musicBrainzAlbumArtist)
+          : undefined;
+  if (typeof mbidRaw === 'string' && mbidRaw.length > 0) {
+    result.musicBrainzId = mbidRaw;
+  }
 
   return result;
 }
@@ -581,48 +609,25 @@ export function getResolutionString(width?: number, height?: number): string | u
 }
 
 /**
- * Extract quality information from MediaSources and MediaStreams
+ * First video / first audio stream quality within ONE MediaSource's streams.
+ * VideoRangeType (and its color-attribute fallbacks) is already part of the
+ * stream object Fields=MediaSources returns - no extra Fields entry needed.
  */
-export function extractQuality(
-  mediaSources: unknown,
-  mediaStreams?: unknown
-): {
+function streamQuality(streams: unknown[]): {
   videoResolution?: string;
   videoCodec?: string;
+  videoDynamicRange?: string;
   audioCodec?: string;
   audioChannels?: number;
-  fileSize?: number;
-  container?: string;
 } {
   const result: {
     videoResolution?: string;
     videoCodec?: string;
+    videoDynamicRange?: string;
     audioCodec?: string;
     audioChannels?: number;
-    fileSize?: number;
-    container?: string;
   } = {};
 
-  // Get streams from MediaSources (preferred) or direct MediaStreams
-  let streams: unknown[] = [];
-  let source: Record<string, unknown> | undefined;
-
-  if (Array.isArray(mediaSources) && mediaSources.length > 0) {
-    source = mediaSources[0] as Record<string, unknown>;
-    streams = Array.isArray(source?.MediaStreams) ? (source.MediaStreams as unknown[]) : [];
-
-    // Extract container and file size from source
-    if (typeof source?.Container === 'string') {
-      result.container = source.Container.toLowerCase();
-    }
-    if (typeof source?.Size === 'number') {
-      result.fileSize = source.Size;
-    }
-  } else if (Array.isArray(mediaStreams)) {
-    streams = mediaStreams;
-  }
-
-  // Find video and audio streams
   for (const stream of streams) {
     if (!stream || typeof stream !== 'object') continue;
     const s = stream as Record<string, unknown>;
@@ -634,6 +639,7 @@ export function extractQuality(
       if (typeof s.Codec === 'string') {
         result.videoCodec = s.Codec.toUpperCase();
       }
+      result.videoDynamicRange = normalizeDynamicRange(mapDynamicRange(s)) ?? undefined;
     }
 
     if (s.Type === 'Audio' && !result.audioCodec) {
@@ -647,6 +653,77 @@ export function extractQuality(
   }
 
   return result;
+}
+
+/**
+ * One MediaItemVersion per MediaSource, each with its own streams' quality.
+ * When the payload has no MediaSources but does carry item-level MediaStreams
+ * (some Emby list shapes), a single version keyed by the item id stands in;
+ * JF names its primary MediaSource with the item id anyway, so the key stays
+ * stable once a full payload arrives.
+ */
+export function extractVersions(
+  mediaSources: unknown,
+  mediaStreams: unknown,
+  itemId: string
+): MediaItemVersion[] {
+  if (Array.isArray(mediaSources) && mediaSources.length > 0) {
+    const versions: MediaItemVersion[] = [];
+    for (const source of mediaSources) {
+      if (!source || typeof source !== 'object') continue;
+      const s = source as Record<string, unknown>;
+      const sourceId = typeof s.Id === 'string' && s.Id ? s.Id : itemId;
+      if (!sourceId) continue;
+      const streams = Array.isArray(s.MediaStreams) ? (s.MediaStreams as unknown[]) : [];
+      versions.push({
+        serverVersionKey: sourceId,
+        container: typeof s.Container === 'string' ? s.Container.toLowerCase() : undefined,
+        fileSize: typeof s.Size === 'number' ? s.Size : undefined,
+        // MediaSource.Bitrate is bps; versions store kbps like sessions do
+        bitrate: typeof s.Bitrate === 'number' ? Math.round(s.Bitrate / 1000) : undefined,
+        partCount: 1,
+        filePath: typeof s.Path === 'string' && s.Path ? s.Path : undefined,
+        ...streamQuality(streams),
+      });
+    }
+    return versions;
+  }
+
+  if (Array.isArray(mediaStreams) && mediaStreams.length > 0 && itemId) {
+    return [{ serverVersionKey: itemId, partCount: 1, ...streamQuality(mediaStreams) }];
+  }
+
+  return [];
+}
+
+/**
+ * Extract quality information from MediaSources and MediaStreams.
+ * Flat rollup over extractVersions: file size sums, the rest comes from the
+ * best version.
+ */
+export function extractQuality(
+  mediaSources: unknown,
+  mediaStreams?: unknown
+): {
+  videoResolution?: string;
+  videoCodec?: string;
+  videoDynamicRange?: string;
+  audioCodec?: string;
+  audioChannels?: number;
+  fileSize?: number;
+  container?: string;
+} {
+  const versions = extractVersions(mediaSources, mediaStreams, 'quality:probe');
+  const best = pickBestVersion(versions);
+  return {
+    videoResolution: best?.videoResolution,
+    videoCodec: best?.videoCodec,
+    videoDynamicRange: best?.videoDynamicRange,
+    audioCodec: best?.audioCodec,
+    audioChannels: best?.audioChannels,
+    fileSize: sumVersionSizes(versions),
+    container: best?.container,
+  };
 }
 
 /**
@@ -686,8 +763,13 @@ export function parseLibraryDate(value: unknown): Date | undefined {
  * Parse a single library item from Jellyfin/Emby API response
  */
 export function parseLibraryItem(item: Record<string, unknown>): MediaLibraryItem {
-  const providerIds = parseProviderIds(item.ProviderIds);
-  const quality = extractQuality(item.MediaSources, item.MediaStreams);
+  const mappedType = mapJellyfinType(item.Type);
+  const providerIds = parseProviderIds(item.ProviderIds, mappedType);
+  const versions = extractVersions(item.MediaSources, item.MediaStreams, parseString(item.Id));
+  const bestVersion = pickBestVersion(versions);
+  const genres = Array.isArray(item.Genres)
+    ? item.Genres.filter((g): g is string => typeof g === 'string' && g.length > 0)
+    : undefined;
 
   // Parse year first so we can use it as addedAt fallback
   const year = parseOptionalNumber(item.ProductionYear);
@@ -704,23 +786,34 @@ export function parseLibraryItem(item: Record<string, unknown>): MediaLibraryIte
   const FALLBACK_DATE = new Date(Date.UTC(MIN_VALID_YEAR, 0, 1));
   const addedAt = dateCreated ?? yearFallback ?? FALLBACK_DATE;
 
+  const itemId = parseString(item.Id);
+  const imageTags = getNestedObject(item, 'ImageTags');
+  const primaryTag = imageTags?.Primary ? parseString(imageTags.Primary) : undefined;
+  const thumbPath = `/Items/${itemId}/Images/Primary${primaryTag ? `?tag=${primaryTag}` : ''}`;
+
   const result: MediaLibraryItem = {
-    ratingKey: parseString(item.Id),
+    ratingKey: itemId,
     title: parseString(item.Name),
-    mediaType: mapJellyfinType(item.Type),
+    mediaType: mappedType,
     year,
     addedAt,
-    // Quality fields
-    videoResolution: quality.videoResolution,
-    videoCodec: quality.videoCodec,
-    audioCodec: quality.audioCodec,
-    audioChannels: quality.audioChannels,
-    fileSize: quality.fileSize,
-    container: quality.container,
+    thumbPath,
+    // Quality rollups over the version list
+    videoResolution: bestVersion?.videoResolution,
+    videoCodec: bestVersion?.videoCodec,
+    videoDynamicRange: bestVersion?.videoDynamicRange,
+    audioCodec: bestVersion?.audioCodec,
+    audioChannels: bestVersion?.audioChannels,
+    fileSize: sumVersionSizes(versions),
+    container: bestVersion?.container,
+    versions,
+    versionsFingerprint: computeVersionsFingerprint(versions),
     // External IDs
     imdbId: providerIds.imdbId,
     tmdbId: providerIds.tmdbId,
     tvdbId: providerIds.tvdbId,
+    musicBrainzId: providerIds.musicBrainzId,
+    genres: genres && genres.length > 0 ? genres : undefined,
     // File path (debug only)
     filePath: parseOptionalString(item.Path),
   };
@@ -731,6 +824,9 @@ export function parseLibraryItem(item: Record<string, unknown>): MediaLibraryIte
     result.grandparentRatingKey = parseOptionalString(item.SeriesId);
     result.parentIndex = parseOptionalNumber(item.ParentIndexNumber); // season number
     result.itemIndex = parseOptionalNumber(item.IndexNumber); // episode number
+  } else if (result.mediaType === 'season') {
+    result.parentRatingKey = parseOptionalString(item.SeriesId);
+    result.parentIndex = parseOptionalNumber(item.IndexNumber); // season number, 0 = Specials
   } else if (result.mediaType === 'track') {
     // AlbumArtist is preferred, fall back to first artist in Artists array
     const artists = item.Artists;
@@ -747,16 +843,41 @@ export function parseLibraryItem(item: Record<string, unknown>): MediaLibraryIte
       );
     }
     result.parentRatingKey = parseOptionalString(item.AlbumId);
+  } else if (result.mediaType === 'album') {
+    const artists = item.AlbumArtists ?? item.Artists;
+    const albumArtist = parseOptionalString(item.AlbumArtist);
+    const firstArtistId =
+      Array.isArray(item.AlbumArtists) && item.AlbumArtists.length > 0
+        ? parseOptionalString((item.AlbumArtists[0] as Record<string, unknown>)?.Id)
+        : undefined;
+    const firstArtistName =
+      Array.isArray(artists) && artists.length > 0
+        ? parseOptionalString(
+            typeof artists[0] === 'string'
+              ? artists[0]
+              : (artists[0] as Record<string, unknown>)?.Name
+          )
+        : undefined;
+    result.parentTitle = albumArtist ?? firstArtistName;
+    result.parentRatingKey = firstArtistId;
   }
 
   return result;
 }
 
 /**
- * Supported Jellyfin/Emby item types for library sync.
- * Season excluded for Plex consistency (season info embedded in episodes).
+ * Supported Jellyfin/Emby item types for library sync. Season is only ever
+ * requested via getLibraryLeaves(Since) - see baseMediaServerClient.ts - so
+ * listing it here doesn't pull seasons into the top-level items query too.
  */
-const ALLOWED_LIBRARY_ITEM_TYPES = new Set(['movie', 'series', 'episode', 'musicartist', 'audio']);
+const ALLOWED_LIBRARY_ITEM_TYPES = new Set([
+  'movie',
+  'series',
+  'episode',
+  'season',
+  'musicartist',
+  'audio',
+]);
 
 /**
  * Parse library items from Jellyfin/Emby /Items API response
@@ -767,7 +888,12 @@ export function parseLibraryItemsResponse(data: unknown[]): MediaLibraryItem[] {
     .filter((item) => {
       const record = item as Record<string, unknown>;
       const type = (typeof record.Type === 'string' ? record.Type : '').toLowerCase();
-      return ALLOWED_LIBRARY_ITEM_TYPES.has(type);
+      if (!ALLOWED_LIBRARY_ITEM_TYPES.has(type)) return false;
+      // Extras (trailers, behind-the-scenes, etc.) can share Type with their parent
+      // content, so the allowlist above isn't enough - reuse the same ExtraType check
+      // the session parser uses. Extras already synced before this filter existed clear
+      // on the next sync via the existing removed_at reconciliation (see librarySync.ts).
+      return !shouldFilterItem(record);
     })
     .map((item) => parseLibraryItem(item as Record<string, unknown>));
 }

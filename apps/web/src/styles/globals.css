@@ -46,6 +46,9 @@
   --color-popover-foreground: hsl(var(--popover-foreground));
   --color-card: hsl(var(--card));
   --color-card-foreground: hsl(var(--card-foreground));
+  --color-card-raised: hsl(var(--card-raised));
+  --color-success: hsl(var(--success));
+  --color-warning: hsl(var(--warning));
 
   /* Colors - Sidebar */
   --color-sidebar: hsl(var(--sidebar));
@@ -139,6 +142,15 @@
   --ring: var(--accent-hue) 85% 38%;          /* Accent color for focus */
   --radius: 0.5rem;
 
+  /* Semantic status colors */
+  --success: 150 60% 38%;
+  --warning: 43 90% 45%;
+
+  /* Media-scoped raised surface (KPI cards, panels, poster fallbacks) -
+     light --card is already pure white, so this is a hair off-white rather
+     than literally lighter. */
+  --card-raised: 240 5% 98%;
+
   /* Chart Colors - Light Mode */
   --chart-1: var(--accent-hue) 85% 38%;       /* Accent */
   --chart-2: var(--accent-hue) 70% 50%;       /* Accent variant */
@@ -183,6 +195,14 @@
   --border: 240 4% 16%;                       /* Dark neutral border */
   --input: 240 4% 16%;
   --ring: var(--accent-hue) 80% 50%;          /* Accent color */
+
+  /* Semantic status colors */
+  --success: 150 60% 45%;
+  --warning: 43 80% 55%;
+
+  /* Media-scoped raised surface (KPI cards, panels, poster fallbacks) -
+     lighter than --card, which is flat against --background in dark mode. */
+  --card-raised: 240 8% 7%;
 
   /* Chart Colors - Dark Mode */
   --chart-1: var(--accent-hue) 80% 50%;       /* Accent color */
@@ -264,6 +284,9 @@ body {
   --color-foreground: hsl(var(--foreground));
   --color-card: hsl(var(--card));
   --color-card-foreground: hsl(var(--card-foreground));
+  --color-card-raised: hsl(var(--card-raised));
+  --color-success: hsl(var(--success));
+  --color-warning: hsl(var(--warning));
   --color-popover: hsl(var(--popover));
   --color-popover-foreground: hsl(var(--popover-foreground));
   --color-primary: hsl(var(--primary));

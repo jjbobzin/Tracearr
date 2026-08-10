@@ -12,12 +12,13 @@
  * Single-server path: counts are per library_items row, no external-ID dedup —
  * matches main branch behavior exactly.
  *
- * Multi-server path: titles are collapsed by COALESCE(imdb->tmdb->tvdb->normalized-title)
- * so the same movie on two servers counts as ONE title in the summary KPIs and in the
- * Most Watched list. Watch events (plays, duration) are SUMMED across servers.
+ * Multi-server path: titles are collapsed by media identity (media_id, falling back
+ * to the item id) so the same movie on two servers counts as ONE title in the summary
+ * KPIs and in the Most Watched list. Watch events (plays, duration) are SUMMED across
+ * servers.
  *
  * Uses LEFT JOIN to ensure items without sessions return 0 watch count.
- * 2-minute (120000ms) session threshold for valid "intent to watch".
+ * A play is one resume chain (COALESCE(reference_id, id)) gated at 2 minutes (120000ms).
  */
 
 import type { FastifyPluginAsync } from 'fastify';
@@ -30,6 +31,7 @@ import {
 } from '@tracearr/shared';
 import { db } from '../../db/client.js';
 import { resolveServerIds, buildMultiServerFragment } from '../../utils/serverFiltering.js';
+import { resolutionRankSql } from '../../utils/resolutionBuckets.js';
 import { buildLibraryCacheKey } from './utils.js';
 
 /** Individual library item with watch statistics (deduped across servers when multiple in scope) */
@@ -203,7 +205,11 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
       }
 
       const libraryFilter = libraryId ? sql`AND li.library_id = ${libraryId}` : sql``;
-      const mediaTypeFilter = mediaType ? sql`AND li.media_type = ${mediaType}` : sql``;
+      // mediaType is always one of movie/episode/show (see libraryWatchQuerySchema); season
+      // is never selectable and, unfiltered, would show up as a permanent 0-watch item.
+      const mediaTypeFilter = mediaType
+        ? sql`AND li.media_type = ${mediaType}`
+        : sql`AND li.media_type != 'season'`;
 
       const minWatchFilter =
         minWatchCount !== undefined ? sql`AND watch_count >= ${minWatchCount}` : sql``;
@@ -244,7 +250,7 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
               li.file_size,
               li.video_resolution,
               li.created_at AS added_at,
-              COUNT(sess.id) FILTER (WHERE sess.duration_ms >= 120000) AS watch_count,
+              COUNT(DISTINCT COALESCE(sess.reference_id, sess.id)) FILTER (WHERE COALESCE(sess.duration_ms, 0) >= 120000) AS watch_count,
               COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) AS total_watch_ms,
               MAX(sess.stopped_at) AS last_watched_at,
               BOOL_OR(
@@ -258,6 +264,7 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
             LEFT JOIN sessions sess ON sess.rating_key = li.rating_key
               AND sess.server_id = li.server_id
             WHERE 1=1
+              AND li.removed_at IS NULL
               ${serverFragment}
               ${libraryFilter}
               ${mediaTypeFilter}
@@ -352,7 +359,7 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
               SELECT
                 li.id,
                 li.server_id,
-                COUNT(sess.id) FILTER (WHERE sess.duration_ms >= 120000) AS watch_count,
+                COUNT(DISTINCT COALESCE(sess.reference_id, sess.id)) FILTER (WHERE COALESCE(sess.duration_ms, 0) >= 120000) AS watch_count,
                 COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) AS total_watch_ms,
                 BOOL_OR(
                   sess.duration_ms IS NOT NULL
@@ -362,7 +369,7 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
                 ) AS has_completion
               FROM library_items li
               LEFT JOIN sessions sess ON sess.rating_key = li.rating_key AND sess.server_id = li.server_id
-              WHERE 1=1 ${serverFragment} ${libraryFilter} ${mediaTypeFilter}
+              WHERE 1=1 AND li.removed_at IS NULL ${serverFragment} ${libraryFilter} ${mediaTypeFilter}
               GROUP BY li.id, li.server_id
             ),
             filtered AS (
@@ -394,9 +401,8 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
           };
         }
       } else {
-        // Multi-server path: collapse same title across servers by match_key.
+        // Multi-server path: collapse the same media across servers by match_key.
         // Plays and duration are SUMMED; inventory/completion are DISTINCT.
-        // Compute the external-ID match key inline (mirrors buildExternalIdMatchKey).
         const combinedResult = await db.execute(sql`
           WITH item_watch_stats AS (
             -- One row per library_item; attaches session aggregates
@@ -411,14 +417,8 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
               li.file_size,
               li.video_resolution,
               li.created_at AS added_at,
-              -- External-ID match key for cross-server dedup
-              COALESCE(
-                CASE WHEN li.imdb_id IS NOT NULL AND li.imdb_id <> '' THEN 'imdb:' || li.imdb_id END,
-                CASE WHEN li.tmdb_id IS NOT NULL THEN 'tmdb:' || li.tmdb_id::text END,
-                CASE WHEN li.tvdb_id IS NOT NULL THEN 'tvdb:' || li.tvdb_id::text END,
-                NULLIF('title:' || LOWER(REGEXP_REPLACE(COALESCE(li.title, ''), '[^a-zA-Z0-9]', '', 'g')), 'title:')
-              ) AS match_key,
-              COUNT(sess.id) FILTER (WHERE sess.duration_ms >= 120000) AS watch_count,
+              COALESCE(li.media_id::text, li.id::text) AS match_key,
+              COUNT(DISTINCT COALESCE(sess.reference_id, sess.id)) FILTER (WHERE COALESCE(sess.duration_ms, 0) >= 120000) AS watch_count,
               COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) AS total_watch_ms,
               MAX(sess.stopped_at) AS last_watched_at,
               -- Completion signal: any session covering 85%+ of total_duration_ms
@@ -433,12 +433,12 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
             LEFT JOIN sessions sess ON sess.rating_key = li.rating_key
               AND sess.server_id = li.server_id
             WHERE 1=1
+              AND li.removed_at IS NULL
               ${serverFragment}
               ${libraryFilter}
               ${mediaTypeFilter}
             GROUP BY li.id, li.server_id, s.name, li.library_id, li.title,
-                     li.media_type, li.year, li.file_size, li.video_resolution, li.created_at,
-                     li.imdb_id, li.tmdb_id, li.tvdb_id
+                     li.media_type, li.year, li.file_size, li.video_resolution, li.created_at
           ),
           deduped_stats AS (
             -- Collapse same title across servers into one row using match_key.
@@ -455,7 +455,8 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
               MIN(media_type) AS media_type,
               MIN(year) AS year,
               MAX(file_size) AS file_size,
-              MIN(video_resolution) AS video_resolution,
+              (ARRAY_AGG(video_resolution ORDER BY ${resolutionRankSql('video_resolution')} DESC))[1]
+                AS video_resolution,
               MIN(added_at::text) AS added_at,
               -- Sum events across all copies of this title
               SUM(watch_count) AS watch_count,
@@ -556,13 +557,8 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
               SELECT
                 li.id,
                 li.server_id,
-                COALESCE(
-                  CASE WHEN li.imdb_id IS NOT NULL AND li.imdb_id <> '' THEN 'imdb:' || li.imdb_id END,
-                  CASE WHEN li.tmdb_id IS NOT NULL THEN 'tmdb:' || li.tmdb_id::text END,
-                  CASE WHEN li.tvdb_id IS NOT NULL THEN 'tvdb:' || li.tvdb_id::text END,
-                  NULLIF('title:' || LOWER(REGEXP_REPLACE(COALESCE(li.title, ''), '[^a-zA-Z0-9]', '', 'g')), 'title:')
-                ) AS match_key,
-                COUNT(sess.id) FILTER (WHERE sess.duration_ms >= 120000) AS watch_count,
+                COALESCE(li.media_id::text, li.id::text) AS match_key,
+                COUNT(DISTINCT COALESCE(sess.reference_id, sess.id)) FILTER (WHERE COALESCE(sess.duration_ms, 0) >= 120000) AS watch_count,
                 COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) AS total_watch_ms,
                 BOOL_OR(
                   sess.duration_ms IS NOT NULL
@@ -572,8 +568,8 @@ export const libraryWatchRoute: FastifyPluginAsync = async (app) => {
                 ) AS has_completion
               FROM library_items li
               LEFT JOIN sessions sess ON sess.rating_key = li.rating_key AND sess.server_id = li.server_id
-              WHERE 1=1 ${serverFragment} ${libraryFilter} ${mediaTypeFilter}
-              GROUP BY li.id, li.server_id, li.imdb_id, li.tmdb_id, li.tvdb_id, li.title
+              WHERE 1=1 AND li.removed_at IS NULL ${serverFragment} ${libraryFilter} ${mediaTypeFilter}
+              GROUP BY li.id, li.server_id
             ),
             deduped AS (
               SELECT match_key, SUM(watch_count) AS watch_count, SUM(total_watch_ms) AS total_watch_ms,

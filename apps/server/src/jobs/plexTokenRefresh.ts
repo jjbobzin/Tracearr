@@ -21,6 +21,7 @@ import { and, eq, lte, isNotNull } from 'drizzle-orm';
 import { isMaintenance } from '../serverState.js';
 import { db } from '../db/client.js';
 import { authAccounts, plexAccounts, servers } from '../db/schema.js';
+import { invalidateServersCache } from './poller/database.js';
 import { PlexClient } from '../services/mediaServer/index.js';
 
 const QUEUE_NAME = 'plex-token-refresh';
@@ -232,6 +233,9 @@ export async function processPlexTokenRefresh(): Promise<PlexTokenRefreshResult>
           .update(servers)
           .set({ token: refreshedToken.accessToken, updatedAt: new Date() })
           .where(eq(servers.plexAccountId, plexAccount.id));
+        // A stale cached token means failed polls until the TTL expires,
+        // which is enough consecutive failures to fire a server_down push
+        invalidateServersCache();
       }
 
       refreshed++;

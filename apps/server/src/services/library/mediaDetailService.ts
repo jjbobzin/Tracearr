@@ -1,0 +1,795 @@
+/**
+ * Media detail query layer, shared by the public API v2 /media routes and
+ * the internal /library/media routes.
+ *
+ * Every query threads `serverIds: string[] | undefined` through
+ * buildMultiServerFragment: undefined (v2's call shape) produces the exact
+ * same unscoped SQL v2 always ran, so this extraction changes nothing about
+ * v2 behavior. The internal routes pass a caller's resolved scope instead.
+ */
+
+import { and, eq, isNull, sql, type SQL } from 'drizzle-orm';
+import type { WatchedState } from '@tracearr/shared';
+import { db } from '../../db/client.js';
+import { media, servers } from '../../db/schema.js';
+import { buildMultiServerFragment } from '../../utils/serverFiltering.js';
+import { uuidArraySql } from '../../utils/sqlArrays.js';
+import { parseMediaRef } from './mediaRef.js';
+import { resolveMediaAliases } from './mediaResolutionService.js';
+import { resolveWatchedStates } from './mediaWatchedService.js';
+import {
+  idList,
+  runHistoryPage,
+  STATS_WINDOWS,
+  windowDayFilter,
+  type StatsWindowKey,
+} from '../../routes/publicV2/shared.js';
+
+export type MediaDetailRow = typeof media.$inferSelect;
+
+// Season number is only recoverable from the season match key season:<showUuid>:s<n>
+const SEASON_KEY_RE = /^season:[0-9a-f-]+:s(\d+)$/i;
+export function seasonNumberFromKey(matchKey: string): number | null {
+  const m = SEASON_KEY_RE.exec(matchKey);
+  return m ? Number(m[1]) : null;
+}
+
+/** Resolve a media uuid or type-qualified provider ref to its canonical media row. */
+export async function resolveCanonicalMediaByRef(ref: string): Promise<MediaDetailRow | null> {
+  const parsed = parseMediaRef(ref);
+  if (!parsed) return null;
+  if (parsed.kind === 'uuid') {
+    const [row] = await db.select().from(media).where(eq(media.id, parsed.id));
+    if (!row) return null;
+    if (!row.mergedIntoId) return row;
+    const [winner] = await db.select().from(media).where(eq(media.id, row.mergedIntoId));
+    return winner ?? row;
+  }
+  const col =
+    parsed.provider === 'imdb'
+      ? media.imdbId
+      : parsed.provider === 'tmdb'
+        ? media.tmdbId
+        : media.tvdbId;
+  let value: string | number = parsed.id;
+  if (parsed.provider !== 'imdb') {
+    const n = Number(parsed.id);
+    if (!Number.isInteger(n)) return null;
+    value = n;
+  }
+  const [row] = await db
+    .select()
+    .from(media)
+    .where(and(eq(media.mediaType, parsed.mediaType), eq(col, value), isNull(media.mergedIntoId)));
+  return row ?? null;
+}
+
+export interface MediaScope {
+  kind: 'media' | 'show' | 'season';
+  aliases: string[];
+  seasonNumber: number | null;
+  showAliases: string[];
+}
+
+/** Resolves the alias/hierarchy scope a canonical media row's sessions live under. */
+export async function buildMediaScope(canonical: MediaDetailRow): Promise<MediaScope | null> {
+  if (canonical.mediaType === 'season') {
+    const n = seasonNumberFromKey(canonical.matchKey);
+    if (n === null || !canonical.showMediaId) return null;
+    const showAliases = await resolveMediaAliases(canonical.showMediaId);
+    return {
+      kind: 'season',
+      aliases: [],
+      seasonNumber: n,
+      showAliases: showAliases.length > 0 ? showAliases : [canonical.showMediaId],
+    };
+  }
+  const aliases = await resolveMediaAliases(canonical.id);
+  const ids = aliases.length > 0 ? aliases : [canonical.id];
+  return {
+    kind: canonical.mediaType === 'show' ? 'show' : 'media',
+    aliases: ids,
+    seasonNumber: null,
+    showAliases: [],
+  };
+}
+
+export function scopeSessionConditions(scope: MediaScope): SQL[] {
+  if (scope.kind === 'season') {
+    return [
+      sql`s.show_media_id IN (${idList(scope.showAliases)})`,
+      sql`s.season_number = ${scope.seasonNumber}`,
+    ];
+  }
+  if (scope.kind === 'show') {
+    return [sql`s.show_media_id IN (${idList(scope.aliases)})`];
+  }
+  return [sql`s.media_id IN (${idList(scope.aliases)})`];
+}
+
+/** Bare boolean condition (no leading AND) for use in a conditions[] array. */
+function buildServerAuthCondition(serverIds: string[] | undefined, columnRef: string): SQL | null {
+  if (serverIds === undefined) return null;
+  const col = sql.raw(columnRef);
+  if (serverIds.length === 0) return sql`false`;
+  if (serverIds.length === 1) return sql`${col} = ${serverIds[0]}`;
+  const ids = serverIds.map((id) => sql`${id}`);
+  return sql`${col} IN (${sql.join(ids, sql`, `)})`;
+}
+
+export interface AvailabilityRow {
+  server_id: string;
+  server_type: string;
+  library_id: string;
+  /** Null when the owning server hasn't synced its library names yet (see librarySync.ts). */
+  library_name: string | null;
+  rating_key: string;
+  added_at: Date;
+  removed_at: Date | null;
+  video_resolution: string | null;
+  file_size: string | number | null;
+  /** Show rows only: summed episode file bytes in the same server+library. */
+  episode_file_size: string | number | null;
+  /** Show rows only: distinct episode resolutions, most frequent first. */
+  episode_resolutions: string[] | null;
+  /** Show rows only: active episode count in the same server+library. */
+  episode_count: number | null;
+  /** Physical files of this copy, largest first; empty for containers. */
+  versions: Array<{
+    resolution: string | null;
+    videoCodec: string | null;
+    audioCodec: string | null;
+    dynamicRange: string | null;
+    container: string | null;
+    fileSize: number | null;
+  }>;
+}
+
+export interface MediaAvailabilityResult {
+  availability: AvailabilityRow[];
+  seasonCount: number | null;
+  episodeCount: number | null;
+}
+
+/** Per-server availability rows plus (for shows) active season/episode counts. */
+export async function getAvailability(
+  mediaId: string,
+  mediaType: string,
+  serverIds: string[] | undefined
+): Promise<MediaAvailabilityResult> {
+  const serverFragmentLi = buildMultiServerFragment(serverIds, 'li.server_id');
+  const availRes = await db.execute(sql`
+    SELECT
+      li.server_id,
+      sv.type AS server_type,
+      li.library_id,
+      lib.name AS library_name,
+      li.rating_key,
+      li.created_at AS added_at,
+      li.removed_at,
+      li.video_resolution,
+      li.file_size,
+      NULL AS episode_file_size,
+      NULL AS episode_resolutions,
+      NULL AS episode_count,
+      COALESCE((
+        SELECT json_agg(json_build_object(
+          'resolution', v.video_resolution,
+          'videoCodec', v.video_codec,
+          'audioCodec', v.audio_codec,
+          'dynamicRange', v.video_dynamic_range,
+          'container', v.container,
+          'fileSize', v.file_size
+        ) ORDER BY v.file_size DESC NULLS LAST)
+        FROM library_item_versions v
+        WHERE v.library_item_id = li.id AND v.removed_at IS NULL
+      ), '[]'::json) AS versions
+    FROM library_items li
+    JOIN servers sv ON sv.id = li.server_id
+    LEFT JOIN libraries lib ON lib.server_id = li.server_id AND lib.library_id = li.library_id
+    WHERE li.media_id = ${mediaId} ${serverFragmentLi}
+    ORDER BY li.created_at ASC, li.rating_key ASC
+  `);
+  const availability = availRes.rows as unknown as AvailabilityRow[];
+
+  // A show's own library_items row carries no size or resolution - roll both
+  // up from its episodes' files, per server+library, in one query for all rows.
+  if (mediaType === 'show' && availability.length > 0) {
+    const serverFragmentEp = buildMultiServerFragment(serverIds, 'li.server_id');
+    const rollupRes = await db.execute(sql`
+      WITH ep AS (
+        SELECT li.server_id, li.library_id, li.media_id, li.file_size, li.video_resolution
+        FROM library_items li
+        JOIN media m ON m.id = li.media_id
+        WHERE m.show_media_id = ${mediaId}
+          AND m.media_type = 'episode'
+          AND li.removed_at IS NULL
+          ${serverFragmentEp}
+      ),
+      res AS (
+        SELECT server_id, library_id, video_resolution, COUNT(*) AS freq
+        FROM ep
+        WHERE video_resolution IS NOT NULL
+        GROUP BY server_id, library_id, video_resolution
+      )
+      SELECT
+        e.server_id,
+        e.library_id,
+        SUM(e.file_size) AS episode_file_size,
+        COUNT(DISTINCT e.media_id)::int AS episode_count,
+        (SELECT ARRAY_AGG(r.video_resolution ORDER BY r.freq DESC, r.video_resolution)
+           FROM res r
+          WHERE r.server_id = e.server_id AND r.library_id = e.library_id) AS episode_resolutions
+      FROM ep e
+      GROUP BY e.server_id, e.library_id
+    `);
+    const rollupByKey = new Map(
+      (
+        rollupRes.rows as unknown as {
+          server_id: string;
+          library_id: string;
+          episode_file_size: string | number | null;
+          episode_count: number;
+          episode_resolutions: string[] | null;
+        }[]
+      ).map((r) => [`${r.server_id}:${r.library_id}`, r])
+    );
+    for (const row of availability) {
+      const rollup = rollupByKey.get(`${row.server_id}:${row.library_id}`);
+      if (rollup) {
+        row.episode_file_size = rollup.episode_file_size;
+        row.episode_resolutions = rollup.episode_resolutions;
+        row.episode_count = rollup.episode_count;
+      }
+    }
+  }
+
+  let seasonCount: number | null = null;
+  let episodeCount: number | null = null;
+  if (mediaType === 'show') {
+    const serverFragmentLi2 = buildMultiServerFragment(serverIds, 'li.server_id');
+    const counts = await db.execute(sql`
+      SELECT
+        COUNT(*) FILTER (WHERE m.media_type = 'season') AS season_count,
+        COUNT(*) FILTER (WHERE m.media_type = 'episode') AS episode_count
+      FROM media m
+      WHERE m.show_media_id = ${mediaId}
+        AND m.media_type IN ('season', 'episode')
+        AND EXISTS (
+          SELECT 1 FROM library_items li
+          WHERE li.media_id = m.id AND li.removed_at IS NULL ${serverFragmentLi2}
+        )
+    `);
+    const row = counts.rows[0] as { season_count: string; episode_count: string };
+    seasonCount = Number(row.season_count);
+    episodeCount = Number(row.episode_count);
+  }
+
+  return { availability, seasonCount, episodeCount };
+}
+
+interface EpisodeChildRow {
+  id: string;
+  title: string;
+  imdb_id: string | null;
+  tmdb_id: number | null;
+  tvdb_id: number | null;
+  show_media_id: string | null;
+  genres: string[] | null;
+  episode_number: number | null;
+}
+
+export interface MediaChildRow {
+  id: string;
+  media_type: 'season' | 'episode';
+  title: string;
+  season_number: number | null;
+  episode_count: number | null;
+  episode_number: number | null;
+  imdb_id: string | null;
+  tmdb_id: number | null;
+  tvdb_id: number | null;
+  show_media_id: string | null;
+  genres: string[] | null;
+}
+
+interface ShowSeasonRow {
+  id: string;
+  season_number: number | null;
+  title: string;
+  year: number | null;
+  episode_count: number;
+}
+
+/** Seasons of a show with their active episode counts, deduped across merges. */
+async function getShowSeasons(
+  showId: string,
+  serverIds: string[] | undefined
+): Promise<ShowSeasonRow[]> {
+  const serverFragmentLi = buildMultiServerFragment(serverIds, 'li.server_id');
+
+  const seasonRows = await db
+    .select({ id: media.id, matchKey: media.matchKey, title: media.title, year: media.year })
+    .from(media)
+    .where(and(eq(media.mediaType, 'season'), eq(media.showMediaId, showId)));
+
+  const countsRes = await db.execute(sql`
+    SELECT li.parent_index AS season_number, COUNT(DISTINCT li.media_id) AS episode_count
+    FROM library_items li
+    JOIN media em ON em.id = li.media_id
+    WHERE li.media_type = 'episode'
+      AND em.show_media_id = ${showId}
+      AND li.removed_at IS NULL
+      AND li.parent_index IS NOT NULL
+      ${serverFragmentLi}
+    GROUP BY li.parent_index
+  `);
+  const countBySeason = new Map<number, number>();
+  for (const r of countsRes.rows as unknown as {
+    season_number: number;
+    episode_count: string;
+  }[]) {
+    countBySeason.set(Number(r.season_number), Number(r.episode_count));
+  }
+
+  // Show merges leave duplicate season numbers; keep one per number, canonical key preferred
+  const canonicalKeyPrefix = `season:${showId}:`;
+  const rowBySeason = new Map<number, (typeof seasonRows)[number]>();
+  const unnumbered: typeof seasonRows = [];
+  for (const s of seasonRows) {
+    const n = seasonNumberFromKey(s.matchKey);
+    if (n === null) {
+      unnumbered.push(s);
+      continue;
+    }
+    const prev = rowBySeason.get(n);
+    if (
+      !prev ||
+      (s.matchKey.startsWith(canonicalKeyPrefix) && !prev.matchKey.startsWith(canonicalKeyPrefix))
+    ) {
+      rowBySeason.set(n, s);
+    }
+  }
+
+  return [...rowBySeason.values(), ...unnumbered]
+    .map((s) => {
+      const n = seasonNumberFromKey(s.matchKey);
+      return {
+        id: s.id,
+        season_number: n,
+        title: s.title,
+        year: s.year,
+        episode_count: n !== null ? (countBySeason.get(n) ?? 0) : 0,
+      };
+    })
+    .sort((a, b) => (a.season_number ?? Infinity) - (b.season_number ?? Infinity));
+}
+
+/** Episodes of a single season, ordered by their item index (episode number). */
+async function getEpisodesForSeason(
+  showMediaId: string,
+  seasonNumber: number,
+  serverIds: string[] | undefined
+): Promise<EpisodeChildRow[]> {
+  const serverFragmentLi = buildMultiServerFragment(serverIds, 'li.server_id');
+  const epRes = await db.execute(sql`
+    SELECT
+      em.id,
+      em.title,
+      em.imdb_id,
+      em.tmdb_id,
+      em.tvdb_id,
+      em.show_media_id,
+      em.genres,
+      MAX(li.item_index) AS episode_number
+    FROM library_items li
+    JOIN media em ON em.id = li.media_id
+    WHERE li.media_type = 'episode'
+      AND li.parent_index = ${seasonNumber}
+      AND em.show_media_id = ${showMediaId}
+      AND li.removed_at IS NULL
+      ${serverFragmentLi}
+    GROUP BY em.id, em.title, em.imdb_id, em.tmdb_id, em.tvdb_id, em.show_media_id, em.genres
+    ORDER BY MAX(li.item_index) ASC NULLS LAST
+  `);
+  return epRes.rows as unknown as EpisodeChildRow[];
+}
+
+/**
+ * Seasons of a show, or episodes of a season. Returns null for media types
+ * with no children (movie/episode) - the caller 404s on null. A season ref
+ * with no recoverable season number returns [] (matches v2: 200, not 404).
+ */
+export async function getChildren(
+  canonical: MediaDetailRow,
+  serverIds: string[] | undefined
+): Promise<MediaChildRow[] | null> {
+  if (canonical.mediaType === 'show') {
+    const seasons = await getShowSeasons(canonical.id, serverIds);
+    return seasons.map((s) => ({
+      id: s.id,
+      media_type: 'season' as const,
+      title: s.title,
+      season_number: s.season_number,
+      episode_count: s.episode_count,
+      episode_number: null,
+      imdb_id: null,
+      tmdb_id: null,
+      tvdb_id: null,
+      show_media_id: canonical.id,
+      genres: null,
+    }));
+  }
+
+  if (canonical.mediaType === 'season') {
+    const n = seasonNumberFromKey(canonical.matchKey);
+    if (n === null || !canonical.showMediaId) return [];
+
+    const episodes = await getEpisodesForSeason(canonical.showMediaId, n, serverIds);
+    return episodes.map((e) => ({
+      id: e.id,
+      media_type: 'episode' as const,
+      title: e.title,
+      season_number: null,
+      episode_count: null,
+      episode_number: e.episode_number,
+      imdb_id: e.imdb_id,
+      tmdb_id: e.tmdb_id,
+      tvdb_id: e.tvdb_id,
+      show_media_id: e.show_media_id,
+      genres: e.genres,
+    }));
+  }
+
+  return null;
+}
+
+export interface SeasonHeatEpisodeRow {
+  episode_number: number | null;
+  watched_state: WatchedState;
+}
+
+export interface SeasonHeatSeasonRow {
+  season_number: number | null;
+  title: string;
+  year: number | null;
+  episodes: SeasonHeatEpisodeRow[];
+}
+
+/**
+ * Per-episode watched state grouped by season, for the show detail page's
+ * watch-heat strip. Whole-audience only (lensUserId: null, no lens param on
+ * this endpoint) - the detail page has no per-viewer lens on its own stats
+ * (owner decision, Task-18 GAP-B), so this aggregates plays across every
+ * identity rather than a single viewer's history.
+ *
+ * Episode ids are passed through resolveWatchedStates' movieIds path rather
+ * than a separate episode probe: that path resolves watched/partial purely
+ * from a media id's own plays (BOOL_OR(watched)/SUM(plays) keyed on
+ * media_id, no media_type predicate), which is exactly an episode's
+ * direct-media state - the same shape the movieIds path already computes.
+ */
+export async function getSeasonHeat(
+  canonical: MediaDetailRow,
+  serverIds: string[] | undefined
+): Promise<SeasonHeatSeasonRow[] | null> {
+  if (canonical.mediaType !== 'show') return null;
+
+  const seasons = await getShowSeasons(canonical.id, serverIds);
+  const seasonEpisodes = await Promise.all(
+    seasons.map((s) =>
+      s.season_number !== null
+        ? getEpisodesForSeason(canonical.id, s.season_number, serverIds)
+        : Promise.resolve<EpisodeChildRow[]>([])
+    )
+  );
+
+  const allEpisodeIds = seasonEpisodes.flat().map((e) => e.id);
+  const watchedStates =
+    allEpisodeIds.length > 0
+      ? await resolveWatchedStates({
+          movieIds: allEpisodeIds,
+          showIds: [],
+          serverIds,
+          lensUserId: null,
+          episodeCounts: new Map(),
+        })
+      : new Map<string, WatchedState>();
+
+  return seasons.map((s, i) => ({
+    season_number: s.season_number,
+    title: s.title,
+    year: s.year,
+    episodes: seasonEpisodes[i]!.map((e) => ({
+      episode_number: e.episode_number,
+      watched_state: watchedStates.get(e.id) ?? 'unwatched',
+    })),
+  }));
+}
+
+interface StatsAggRow {
+  server_id: string | null;
+  plays: string | number;
+  watch_time_ms: string | number;
+  unique_users: number;
+}
+
+export interface MediaStatsWindowResult {
+  combined: { plays: number; watch_time_ms: number; unique_users: number };
+  per_server: {
+    server_id: string;
+    server_name: string | null;
+    plays: number;
+    watch_time_ms: number;
+    unique_users: number;
+  }[];
+}
+
+/**
+ * Plays/watch time/unique-viewer rollup across all three stats windows.
+ * Movies and episodes read the media_id rollup; shows roll up episodes via
+ * show_media_id; seasons compute live from raw sessions (neither aggregate
+ * records season membership).
+ */
+export async function getMediaStats(
+  scope: MediaScope,
+  serverIds: string[] | undefined
+): Promise<Record<StatsWindowKey, MediaStatsWindowResult>> {
+  const serverRows = await db.select({ id: servers.id, name: servers.name }).from(servers);
+  const serverNames = new Map(serverRows.map((s) => [s.id, s.name]));
+
+  const scopeFilter =
+    scope.kind === 'season'
+      ? sql`s.show_media_id IN (${idList(scope.showAliases)}) AND s.season_number = ${scope.seasonNumber}`
+      : scope.kind === 'show'
+        ? sql`p.show_media_id IN (${idList(scope.aliases)})`
+        : sql`p.media_id IN (${idList(scope.aliases)})`;
+
+  const windows: Record<StatsWindowKey, MediaStatsWindowResult> = {} as Record<
+    StatsWindowKey,
+    MediaStatsWindowResult
+  >;
+  for (const win of STATS_WINDOWS) {
+    const serverFragment = buildMultiServerFragment(
+      serverIds,
+      scope.kind === 'season' ? 's.server_id' : 'p.server_id'
+    );
+    const result =
+      scope.kind === 'season'
+        ? await db.execute(sql`
+            SELECT
+              s.server_id,
+              COUNT(DISTINCT COALESCE(s.reference_id, s.id)) FILTER (WHERE COALESCE(s.duration_ms, 0) >= 120000) AS plays,
+              SUM(CASE WHEN COALESCE(s.duration_ms, 0) >= 120000 THEN s.duration_ms ELSE 0 END) AS watch_time_ms,
+              COUNT(DISTINCT su.user_id) FILTER (WHERE COALESCE(s.duration_ms, 0) >= 120000)::int AS unique_users
+            FROM sessions s
+            JOIN server_users su ON su.id = s.server_user_id
+            WHERE ${scopeFilter}${windowDayFilter(sql`s.started_at`, win.days)} ${serverFragment}
+            GROUP BY GROUPING SETS ((s.server_id), ())
+          `)
+        : await db.execute(sql`
+            SELECT
+              p.server_id,
+              SUM(p.plays) AS plays,
+              SUM(p.watched_ms) AS watch_time_ms,
+              COUNT(DISTINCT su.user_id) FILTER (WHERE p.watched_ms > 0)::int AS unique_users
+            FROM user_media_plays_daily p
+            JOIN server_users su ON su.id = p.server_user_id
+            WHERE ${scopeFilter}${windowDayFilter(sql`p.day`, win.days)} ${serverFragment}
+            GROUP BY GROUPING SETS ((p.server_id), ())
+          `);
+
+    const rows = result.rows as unknown as StatsAggRow[];
+    const combinedRow = rows.find((r) => r.server_id === null);
+    const perServer = rows
+      .filter((r) => r.server_id !== null)
+      .map((r) => ({
+        server_id: r.server_id as string,
+        server_name: serverNames.get(r.server_id as string) ?? null,
+        plays: Number(r.plays ?? 0),
+        watch_time_ms: Number(r.watch_time_ms ?? 0),
+        unique_users: Number(r.unique_users ?? 0),
+      }));
+
+    windows[win.key] = {
+      combined: {
+        plays: Number(combinedRow?.plays ?? 0),
+        watch_time_ms: Number(combinedRow?.watch_time_ms ?? 0),
+        unique_users: Number(combinedRow?.unique_users ?? 0),
+      },
+      per_server: perServer,
+    };
+  }
+
+  return windows;
+}
+
+interface WatcherAggRow {
+  server_user_id: string;
+  user_id: string;
+  server_id: string;
+  username: string | null;
+  identity_name: string | null;
+  thumb: string | null;
+  plays: string | number;
+  watch_time_ms: string | number;
+  completion_pct: number | null;
+  last_watched_day: string | null;
+  distinct_episodes_watched: number;
+}
+
+export interface MediaWatcherRow {
+  user: {
+    server_user_id: string;
+    user_id: string;
+    server_id: string;
+    username: string | null;
+    identity_name: string | null;
+    thumb: string | null;
+  };
+  plays: number;
+  watch_time_ms: number;
+  completion_pct: number | null;
+  last_watched_day: string | null;
+  distinct_episodes_watched: number | null;
+}
+
+export interface GetMediaWatchersArgs {
+  scope: MediaScope;
+  windowKey: StatsWindowKey;
+  serverId?: string;
+  serverIds: string[] | undefined;
+}
+
+/** Per server-user rollup for a media item's scope, one entry per account. */
+export async function getMediaWatchers(args: GetMediaWatchersArgs): Promise<MediaWatcherRow[]> {
+  const { scope, windowKey, serverId, serverIds } = args;
+  const days = STATS_WINDOWS.find((w) => w.key === windowKey)!.days;
+  const isEpisodic = scope.kind === 'show' || scope.kind === 'season';
+
+  let rows: WatcherAggRow[];
+  if (scope.kind === 'season') {
+    const serverFilter = serverId ? sql` AND s.server_id = ${serverId}` : sql``;
+    const authFragment = buildMultiServerFragment(serverIds, 's.server_id');
+    const result = await db.execute(sql`
+      SELECT
+        s.server_user_id,
+        su.user_id,
+        su.server_id,
+        su.username,
+        u.name AS identity_name,
+        COALESCE(u.thumbnail, su.thumb_url) AS thumb,
+        COUNT(DISTINCT COALESCE(s.reference_id, s.id)) FILTER (WHERE COALESCE(s.duration_ms, 0) >= 120000) AS plays,
+        SUM(CASE WHEN COALESCE(s.duration_ms, 0) >= 120000 THEN s.duration_ms ELSE 0 END) AS watch_time_ms,
+        CASE WHEN MAX(s.progress_ms) IS NULL OR COALESCE(MAX(s.total_duration_ms), 0) = 0 THEN NULL
+             ELSE LEAST(100, round(100.0 * MAX(s.progress_ms) / MAX(s.total_duration_ms), 1))
+        END::float8 AS completion_pct,
+        MAX((s.started_at AT TIME ZONE 'utc')::date)::text AS last_watched_day,
+        COUNT(DISTINCT s.media_id) FILTER (WHERE COALESCE(s.duration_ms, 0) >= 120000)::int AS distinct_episodes_watched
+      FROM sessions s
+      JOIN server_users su ON su.id = s.server_user_id
+      LEFT JOIN users u ON u.id = su.user_id
+      WHERE s.show_media_id IN (${idList(scope.showAliases)})
+        AND s.season_number = ${scope.seasonNumber}${windowDayFilter(sql`s.started_at`, days)} ${serverFilter} ${authFragment}
+      GROUP BY s.server_user_id, su.user_id, su.server_id, su.username, u.name, COALESCE(u.thumbnail, su.thumb_url)
+      HAVING COUNT(DISTINCT COALESCE(s.reference_id, s.id)) FILTER (WHERE COALESCE(s.duration_ms, 0) >= 120000) > 0
+      ORDER BY watch_time_ms DESC, s.server_user_id
+    `);
+    rows = result.rows as unknown as WatcherAggRow[];
+  } else {
+    const scopeFilter =
+      scope.kind === 'show'
+        ? sql`p.show_media_id IN (${idList(scope.aliases)})`
+        : sql`p.media_id IN (${idList(scope.aliases)})`;
+    const serverFilter = serverId ? sql` AND p.server_id = ${serverId}` : sql``;
+    const authFragment = buildMultiServerFragment(serverIds, 'p.server_id');
+    const result = await db.execute(sql`
+      SELECT
+        p.server_user_id,
+        su.user_id,
+        su.server_id,
+        su.username,
+        u.name AS identity_name,
+        COALESCE(u.thumbnail, su.thumb_url) AS thumb,
+        SUM(p.plays) AS plays,
+        SUM(p.watched_ms) AS watch_time_ms,
+        CASE WHEN MAX(p.max_progress_ms) IS NULL OR COALESCE(MAX(p.content_duration_ms), 0) = 0 THEN NULL
+             ELSE LEAST(100, round(100.0 * MAX(p.max_progress_ms) / MAX(p.content_duration_ms), 1))
+        END::float8 AS completion_pct,
+        MAX((p.day AT TIME ZONE 'utc')::date)::text AS last_watched_day,
+        COUNT(DISTINCT p.media_id) FILTER (WHERE p.plays > 0)::int AS distinct_episodes_watched
+      FROM user_media_plays_daily p
+      JOIN server_users su ON su.id = p.server_user_id
+      LEFT JOIN users u ON u.id = su.user_id
+      WHERE ${scopeFilter}${windowDayFilter(sql`p.day`, days)} ${serverFilter} ${authFragment}
+      GROUP BY p.server_user_id, su.user_id, su.server_id, su.username, u.name, COALESCE(u.thumbnail, su.thumb_url)
+      HAVING SUM(p.plays) > 0
+      ORDER BY watch_time_ms DESC, p.server_user_id
+    `);
+    rows = result.rows as unknown as WatcherAggRow[];
+  }
+
+  return rows.map((r) => ({
+    user: {
+      server_user_id: r.server_user_id,
+      user_id: r.user_id,
+      server_id: r.server_id,
+      username: r.username,
+      identity_name: r.identity_name,
+      thumb: r.thumb,
+    },
+    plays: Number(r.plays ?? 0),
+    watch_time_ms: Number(r.watch_time_ms ?? 0),
+    completion_pct: r.completion_pct,
+    last_watched_day: r.last_watched_day,
+    distinct_episodes_watched: isEpisodic ? Number(r.distinct_episodes_watched ?? 0) : null,
+  }));
+}
+
+export interface GetMediaHistoryPageArgs {
+  scope: MediaScope;
+  pageSize: number;
+  cursorValue: { startedAt: Date; id: string } | null;
+  serverIds: string[] | undefined;
+}
+
+/** Chain-grain watch history for a media item's scope, same paging as /history. */
+export async function getMediaHistoryPage(
+  args: GetMediaHistoryPageArgs
+): Promise<Awaited<ReturnType<typeof runHistoryPage>>> {
+  const { scope, pageSize, cursorValue, serverIds } = args;
+  const conditions = scopeSessionConditions(scope);
+  const authCondition = buildServerAuthCondition(serverIds, 's.server_id');
+  if (authCondition) conditions.push(authCondition);
+  return runHistoryPage(conditions, pageSize, cursorValue, undefined);
+}
+
+export interface MediaPlatformBreakdownRow {
+  platform: string | null;
+  player: string | null;
+  plays: number;
+  watch_time_ms: number;
+}
+
+/**
+ * Sessions grouped by platform/player for a canonical media id and its
+ * merged losers (single hop). aliasIds may carry either media ids (movies,
+ * episodes) or show ids (shows) - a session's media_id and show_media_id
+ * are never both populated with the same value, so matching either column
+ * is safe without a separate scope-kind flag. Season-scoped breakdowns fall
+ * back to their parent show's aliases (not filtered to the single season).
+ */
+export async function getMediaPlatformBreakdown(
+  mediaId: string,
+  aliasIds: string[],
+  serverIds: string[] | undefined
+): Promise<MediaPlatformBreakdownRow[]> {
+  const ids = aliasIds.length > 0 ? aliasIds : [mediaId];
+  const serverFragment = buildMultiServerFragment(serverIds, 's.server_id');
+  const result = await db.execute(sql`
+    SELECT
+      s.platform,
+      s.player_name AS player,
+      COUNT(DISTINCT COALESCE(s.reference_id, s.id)) FILTER (WHERE COALESCE(s.duration_ms, 0) >= 120000) AS plays,
+      SUM(CASE WHEN COALESCE(s.duration_ms, 0) >= 120000 THEN s.duration_ms ELSE 0 END) AS watch_time_ms
+    FROM sessions s
+    WHERE (s.media_id = ANY(${uuidArraySql(ids)}) OR s.show_media_id = ANY(${uuidArraySql(ids)}))
+      ${serverFragment}
+    GROUP BY s.platform, s.player_name
+    HAVING COUNT(DISTINCT COALESCE(s.reference_id, s.id)) FILTER (WHERE COALESCE(s.duration_ms, 0) >= 120000) > 0
+    ORDER BY plays DESC, s.platform NULLS LAST, s.player_name NULLS LAST
+  `);
+  return (
+    result.rows as unknown as {
+      platform: string | null;
+      player: string | null;
+      plays: string;
+      watch_time_ms: string;
+    }[]
+  ).map((r) => ({
+    platform: r.platform,
+    player: r.player,
+    plays: Number(r.plays),
+    watch_time_ms: Number(r.watch_time_ms),
+  }));
+}

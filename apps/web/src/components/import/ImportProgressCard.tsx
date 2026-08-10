@@ -3,7 +3,8 @@ import { Progress } from '../ui/progress';
 import { cn } from '@/lib/utils';
 import type { HeavyOpsWaitingFor } from '@tracearr/shared';
 
-export type ImportStatus = 'idle' | 'waiting' | 'fetching' | 'processing' | 'complete' | 'error';
+export type ImportStatus =
+  'idle' | 'waiting' | 'detecting' | 'fetching' | 'enriching' | 'processing' | 'complete' | 'error';
 
 export interface ImportProgressData {
   status: ImportStatus;
@@ -33,7 +34,11 @@ export function ImportProgressCard({
   showPageProgress = false,
 }: ImportProgressCardProps) {
   const isWaiting = progress.status === 'waiting';
-  const isActive = progress.status === 'fetching' || progress.status === 'processing';
+  const isActive =
+    progress.status === 'detecting' ||
+    progress.status === 'fetching' ||
+    progress.status === 'enriching' ||
+    progress.status === 'processing';
   const isComplete = progress.status === 'complete';
   const isError = progress.status === 'error';
 

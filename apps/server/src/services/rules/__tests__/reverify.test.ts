@@ -105,7 +105,6 @@ function makeSessionRow(overrides: Record<string, unknown> = {}) {
       thumbUrl: null,
       isServerAdmin: false,
       trustScore: 100,
-      sessionCount: 1,
       joinedAt: null,
       lastActivityAt: new Date(),
       removedAt: null,
@@ -368,10 +367,12 @@ describe('reverifyKillCondition', () => {
 
     // The initial fetch already spans the identity, not just the triggering
     // account, so recentSessions matches what live evaluation matched on.
-    expect(mockBatchGetRecentUserSessions).toHaveBeenCalledWith([
-      sessionRow.serverUserId,
-      siblingServerUserId,
-    ]);
+    // The window derives from the rule itself (24h floor here), never from
+    // the module default the leader keeps warm.
+    expect(mockBatchGetRecentUserSessions).toHaveBeenCalledWith(
+      [sessionRow.serverUserId, siblingServerUserId],
+      24
+    );
 
     const [context] = mockEvaluateRulesAsync.mock.calls[0]!;
     expect((context.recentSessions as Array<{ id: string }>).map((s) => s.id).sort()).toEqual([
@@ -414,7 +415,7 @@ describe('reverifyKillCondition', () => {
     // The lookup itself is unconditional - only widening past a single
     // server_user id is skipped, since there's nothing to widen.
     expect(mockBatchGetIdentityServerUserIds).toHaveBeenCalledWith([sessionRow.serverUser.userId]);
-    expect(mockBatchGetRecentUserSessions).toHaveBeenCalledWith([sessionRow.serverUserId]);
+    expect(mockBatchGetRecentUserSessions).toHaveBeenCalledWith([sessionRow.serverUserId], 24);
   });
 
   it('kills a merged-identity user under a rule without enforceAcrossServers when both accounts together clear the condition', async () => {

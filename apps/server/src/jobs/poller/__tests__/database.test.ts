@@ -20,7 +20,8 @@ vi.mock('../../../db/schema.js', async (importOriginal) => {
   return { ...actual };
 });
 
-import { getActiveRulesV2, invalidateRulesCache } from '../database.js';
+import { getActiveRulesV2, invalidateRulesCache, maxWindowHoursFromRules } from '../database.js';
+import type { RuleV2 } from '@tracearr/shared';
 
 function ruleRow(id: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -109,5 +110,42 @@ describe('getActiveRulesV2 cache', () => {
     const second = await getActiveRulesV2();
 
     expect(second).toEqual(first);
+  });
+});
+
+describe('maxWindowHoursFromRules', () => {
+  const windowedRule = (windowHours?: number) =>
+    ({
+      conditions: {
+        groups: [
+          {
+            conditions: [
+              {
+                field: 'unique_ips_in_window',
+                operator: 'gte',
+                value: 3,
+                ...(windowHours !== undefined ? { params: { window_hours: windowHours } } : {}),
+              },
+            ],
+          },
+        ],
+      },
+    }) as RuleV2;
+
+  it('defaults to 24 when no rule sets a window', () => {
+    expect(maxWindowHoursFromRules([])).toBe(24);
+    expect(maxWindowHoursFromRules([windowedRule()])).toBe(24);
+  });
+
+  it('returns the largest window across rules', () => {
+    expect(maxWindowHoursFromRules([windowedRule(48), windowedRule(72), windowedRule(6)])).toBe(72);
+  });
+
+  it('never drops below 24 for short windows', () => {
+    expect(maxWindowHoursFromRules([windowedRule(2)])).toBe(24);
+  });
+
+  it('caps at 168 hours', () => {
+    expect(maxWindowHoursFromRules([windowedRule(500)])).toBe(168);
   });
 });

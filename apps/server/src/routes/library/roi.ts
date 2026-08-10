@@ -10,7 +10,7 @@
  * - Deletion suggestions for low-value, unwatched content
  *
  * Uses LEFT JOIN with sessions table to correlate watch time with storage.
- * 2-minute (120000ms) session threshold for valid "intent to watch".
+ * A play is one resume chain (COALESCE(reference_id, id)) gated at 2 minutes (120000ms).
  */
 
 import type { FastifyPluginAsync } from 'fastify';
@@ -217,94 +217,83 @@ export const libraryRoiRoute: FastifyPluginAsync = async (app) => {
       // Combined ROI query: items, summary, and count in one round-trip
       // Uses window functions for summary aggregation alongside item results
       const combinedResult = await db.execute(sql`
-        WITH child_stats AS (
-          -- Aggregate child data for shows (episodes) and artists (tracks)
-          SELECT
-            grandparent_rating_key,
-            server_id,
-            SUM(file_size) AS total_size
-          FROM library_items
-          WHERE media_type IN ('episode', 'track') AND grandparent_rating_key IS NOT NULL
-          GROUP BY grandparent_rating_key, server_id
-        ),
-        child_watch_stats AS (
-          -- Get watch stats for shows/artists via their children
-          SELECT
-            child.grandparent_rating_key,
-            child.server_id,
-            COUNT(sess.id) FILTER (WHERE sess.duration_ms >= 120000) AS watch_count,
-            COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) AS total_watch_ms,
-            MAX(sess.stopped_at) AS last_watched_at
-          FROM library_items child
-          LEFT JOIN sessions sess ON sess.rating_key = child.rating_key
-            AND sess.server_id = child.server_id
-            AND sess.started_at >= NOW() - INTERVAL '1 day' * ${periodDays}
-          WHERE child.media_type IN ('episode', 'track') AND child.grandparent_rating_key IS NOT NULL
-          GROUP BY child.grandparent_rating_key, child.server_id
-        ),
-        item_roi AS (
-          SELECT
-            li.id,
-            li.server_id,
-            s.name AS server_name,
-            li.title,
-            li.media_type,
-            li.year,
-            -- For shows/artists: use aggregated child size, otherwise use item's file_size
-            CASE
-              WHEN li.media_type IN ('show', 'artist') THEN COALESCE(cs.total_size, li.file_size)
-              ELSE li.file_size
-            END AS file_size_bytes,
-            CASE
-              WHEN li.media_type IN ('show', 'artist') THEN COALESCE(cs.total_size, li.file_size) / 1073741824.0
-              ELSE li.file_size / 1073741824.0
-            END AS file_size_gb,
-            li.created_at AS added_at,
-            -- For shows/artists: use child watch stats
-            CASE
-              WHEN li.media_type IN ('show', 'artist') THEN COALESCE(cws.watch_count, 0)
-              ELSE COUNT(sess.id) FILTER (WHERE sess.duration_ms >= 120000)
-            END AS watch_count,
-            CASE
-              WHEN li.media_type IN ('show', 'artist') THEN COALESCE(cws.total_watch_ms, 0)
-              ELSE COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0)
-            END AS total_watch_ms,
-            CASE
-              WHEN li.media_type IN ('show', 'artist') THEN COALESCE(cws.total_watch_ms, 0) / 3600000.0
-              ELSE COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) / 3600000.0
-            END AS total_watch_hours,
-            CASE
-              WHEN li.media_type IN ('show', 'artist') THEN cws.last_watched_at
-              ELSE MAX(sess.stopped_at)
-            END AS last_watched_at,
-            CASE
-              WHEN li.media_type IN ('show', 'artist') THEN EXTRACT(DAY FROM NOW() - cws.last_watched_at)::int
-              ELSE EXTRACT(DAY FROM NOW() - MAX(sess.stopped_at))::int
-            END AS days_since_last_watch
+        WITH top_items AS (
+          -- Every top-level entry with its identity key. A title merged
+          -- across libraries or servers has several entries sharing one
+          -- ident; unmatched items fall back to their own id.
+          SELECT li.id, li.server_id, li.library_id, li.rating_key, li.title,
+                 li.media_type, li.year, li.created_at,
+                 COALESCE(li.media_id::text, li.id::text) AS ident
           FROM library_items li
-          JOIN servers s ON li.server_id = s.id
-          LEFT JOIN child_stats cs ON li.media_type IN ('show', 'artist')
-            AND cs.grandparent_rating_key = li.rating_key
-            AND cs.server_id = li.server_id
-          LEFT JOIN child_watch_stats cws ON li.media_type IN ('show', 'artist')
-            AND cws.grandparent_rating_key = li.rating_key
-            AND cws.server_id = li.server_id
-          LEFT JOIN sessions sess ON li.media_type NOT IN ('show', 'artist')
-            AND sess.rating_key = li.rating_key
-            AND sess.server_id = li.server_id
-            AND sess.started_at >= NOW() - INTERVAL '1 day' * ${periodDays}
           WHERE li.media_type NOT IN ('episode', 'track', 'season', 'album')  -- Exclude children/containers, only show content
-            AND (
-              CASE
-                WHEN li.media_type IN ('show', 'artist') THEN COALESCE(cs.total_size, li.file_size)
-                ELSE li.file_size
-              END
-            ) > ${minFileSize}
+            AND li.removed_at IS NULL
             ${serverFilter}
             ${libraryFilter}
             ${mediaTypeFilter}
-          GROUP BY li.id, li.server_id, s.name, li.title, li.media_type, li.year, li.file_size, li.created_at,
-                   cs.total_size, cws.watch_count, cws.total_watch_ms, cws.last_watched_at
+        ),
+        ident_sizes AS (
+          -- Physical bytes per identity, mirror-deduped by (ident, byte size)
+          -- so a merged entry listing the same file twice counts it once and
+          -- the GB denominator stops halving the title's ROI
+          SELECT ident, SUM(sz) AS file_size
+          FROM (
+            SELECT DISTINCT b.ident, v.file_size AS sz
+            FROM top_items b
+            LEFT JOIN library_items child ON b.media_type IN ('show', 'artist')
+              AND child.grandparent_rating_key = b.rating_key
+              AND child.server_id = b.server_id
+              AND child.removed_at IS NULL
+            JOIN library_item_versions v
+              ON v.library_item_id = COALESCE(child.id, b.id)
+              AND v.removed_at IS NULL AND v.file_size IS NOT NULL
+          ) d
+          GROUP BY ident
+        ),
+        ident_watch AS (
+          -- Watch stats per identity within the period: a play on ANY entry
+          -- (or any entry's children) counts for the title
+          SELECT b.ident,
+                 COUNT(DISTINCT COALESCE(sess.reference_id, sess.id))
+                   FILTER (WHERE COALESCE(sess.duration_ms, 0) >= 120000) AS watch_count,
+                 COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) AS total_watch_ms,
+                 MAX(sess.stopped_at) AS last_watched_at
+          FROM top_items b
+          LEFT JOIN library_items child ON b.media_type IN ('show', 'artist')
+            AND child.grandparent_rating_key = b.rating_key
+            AND child.server_id = b.server_id
+            AND child.removed_at IS NULL
+          LEFT JOIN sessions sess ON sess.server_id = b.server_id
+            AND sess.rating_key = COALESCE(child.rating_key, b.rating_key)
+            AND sess.started_at >= NOW() - INTERVAL '1 day' * ${periodDays}
+          GROUP BY b.ident
+        ),
+        ident_reps AS (
+          -- One representative entry per identity for display fields
+          SELECT DISTINCT ON (ident) ident, id, server_id, title, media_type, year, created_at
+          FROM top_items
+          ORDER BY ident, created_at ASC NULLS LAST, id
+        ),
+        item_roi AS (
+          SELECT
+            r.id,
+            r.server_id,
+            s.name AS server_name,
+            r.title,
+            r.media_type,
+            r.year,
+            isz.file_size AS file_size_bytes,
+            isz.file_size / 1073741824.0 AS file_size_gb,
+            r.created_at AS added_at,
+            COALESCE(iw.watch_count, 0) AS watch_count,
+            COALESCE(iw.total_watch_ms, 0) AS total_watch_ms,
+            COALESCE(iw.total_watch_ms, 0) / 3600000.0 AS total_watch_hours,
+            iw.last_watched_at,
+            EXTRACT(DAY FROM NOW() - iw.last_watched_at)::int AS days_since_last_watch
+          FROM ident_reps r
+          JOIN servers s ON r.server_id = s.id
+          LEFT JOIN ident_sizes isz ON isz.ident = r.ident
+          LEFT JOIN ident_watch iw ON iw.ident = r.ident
+          WHERE COALESCE(isz.file_size, 0) > ${minFileSize}
         ),
         roi_scored AS (
           SELECT
@@ -463,15 +452,46 @@ export const libraryRoiRoute: FastifyPluginAsync = async (app) => {
       } else {
         // No items on current page - need summary separately for empty page case
         const summaryResult = await db.execute(sql`
-          WITH item_roi AS (
-            SELECT li.id, li.file_size / 1073741824.0 AS file_size_gb,
-              COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) / 3600000.0 AS total_watch_hours,
-              EXTRACT(DAY FROM NOW() - MAX(sess.stopped_at))::int AS days_since_last_watch, li.media_type
+          WITH top_items AS (
+            SELECT li.id, li.server_id, li.rating_key, li.media_type,
+              COALESCE(li.media_id::text, li.id::text) AS ident
             FROM library_items li
-            LEFT JOIN sessions sess ON sess.rating_key = li.rating_key AND sess.server_id = li.server_id
+            WHERE li.media_type NOT IN ('episode', 'track', 'season', 'album')
+              AND li.removed_at IS NULL ${serverFilter} ${libraryFilter} ${mediaTypeFilter}
+          ),
+          ident_sizes AS (
+            SELECT ident, SUM(sz) AS file_size FROM (
+              SELECT DISTINCT b.ident, v.file_size AS sz
+              FROM top_items b
+              LEFT JOIN library_items child ON b.media_type IN ('show', 'artist')
+                AND child.grandparent_rating_key = b.rating_key AND child.server_id = b.server_id AND child.removed_at IS NULL
+              JOIN library_item_versions v ON v.library_item_id = COALESCE(child.id, b.id)
+                AND v.removed_at IS NULL AND v.file_size IS NOT NULL
+            ) d GROUP BY ident
+          ),
+          ident_watch AS (
+            SELECT b.ident,
+              COALESCE(SUM(sess.duration_ms) FILTER (WHERE sess.duration_ms >= 120000), 0) AS total_watch_ms,
+              MAX(sess.stopped_at) AS last_watched_at
+            FROM top_items b
+            LEFT JOIN library_items child ON b.media_type IN ('show', 'artist')
+              AND child.grandparent_rating_key = b.rating_key AND child.server_id = b.server_id AND child.removed_at IS NULL
+            LEFT JOIN sessions sess ON sess.server_id = b.server_id
+              AND sess.rating_key = COALESCE(child.rating_key, b.rating_key)
               AND sess.started_at >= NOW() - INTERVAL '1 day' * ${periodDays}
-            WHERE li.file_size > ${minFileSize} ${serverFilter} ${libraryFilter} ${mediaTypeFilter}
-            GROUP BY li.id
+            GROUP BY b.ident
+          ),
+          ident_types AS (
+            SELECT DISTINCT ON (ident) ident, media_type FROM top_items ORDER BY ident, id
+          ),
+          item_roi AS (
+            SELECT i.ident AS id, isz.file_size / 1073741824.0 AS file_size_gb,
+              COALESCE(iw.total_watch_ms, 0) / 3600000.0 AS total_watch_hours,
+              EXTRACT(DAY FROM NOW() - iw.last_watched_at)::int AS days_since_last_watch, i.media_type
+            FROM ident_types i
+            LEFT JOIN ident_sizes isz ON isz.ident = i.ident
+            LEFT JOIN ident_watch iw ON iw.ident = i.ident
+            WHERE COALESCE(isz.file_size, 0) > ${minFileSize}
           ),
           roi_scored AS (
             SELECT *, CASE

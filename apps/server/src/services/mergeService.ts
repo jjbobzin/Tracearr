@@ -32,7 +32,11 @@ import {
 } from '../db/schema.js';
 import { invalidateRulesCache } from '../jobs/poller/database.js';
 import { getAuth } from '../lib/auth.js';
-import { ServerUserNotFoundError, UserNotFoundError } from './userService.js';
+import {
+  recomputeIdentityAggregates,
+  ServerUserNotFoundError,
+  UserNotFoundError,
+} from './userService.js';
 
 export interface MergeIdentitySnapshot {
   id: string;
@@ -148,38 +152,6 @@ async function loadIdentitySnapshot(tx: Tx, userId: string): Promise<MergeIdenti
     linkedPlexAccountCount: plexCount?.count ?? 0,
     authAccountCount: authAccountCountRow?.count ?? 0,
   };
-}
-
-// Recomputes trust and totalViolations together in the same transaction. The trust
-// weighting matches recalculateAggregateTrustScore in userService.ts; it is inlined
-// here so both aggregates are derived and written in one pass alongside the violation count.
-async function recomputeIdentityAggregates(tx: Tx, userId: string): Promise<void> {
-  const [trust] = await tx
-    .select({
-      weightedSum: sql<number>`coalesce(sum(${serverUsers.trustScore}::numeric * ${serverUsers.sessionCount}), 0)`,
-      totalSessions: sql<number>`coalesce(sum(${serverUsers.sessionCount}), 0)`,
-    })
-    .from(serverUsers)
-    .where(eq(serverUsers.userId, userId));
-
-  const totalSessions = Number(trust?.totalSessions ?? 0);
-  const aggregateScore =
-    totalSessions > 0 ? Math.round(Number(trust?.weightedSum ?? 0) / totalSessions) : 100;
-
-  const [violationCount] = await tx
-    .select({ count: sql<number>`count(*)::int` })
-    .from(violations)
-    .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
-    .where(eq(serverUsers.userId, userId));
-
-  await tx
-    .update(users)
-    .set({
-      aggregateTrustScore: aggregateScore,
-      totalViolations: violationCount?.count ?? 0,
-      updatedAt: new Date(),
-    })
-    .where(eq(users.id, userId));
 }
 
 export interface MergedIdentityRowIds {
@@ -365,15 +337,6 @@ async function combineServerUsers(
 
   await tx.delete(serverUsers).where(eq(serverUsers.id, sourceServerUserId));
 
-  const [sessionCount] = await tx
-    .select({ count: sql<number>`count(*)::int` })
-    .from(sessions)
-    .where(eq(sessions.serverUserId, targetServerUserId));
-  await tx
-    .update(serverUsers)
-    .set({ sessionCount: sessionCount?.count ?? 0, updatedAt: new Date() })
-    .where(eq(serverUsers.id, targetServerUserId));
-
   return droppedRuleNames;
 }
 
@@ -445,7 +408,7 @@ export async function mergeUsers(
     }
 
     const movedIdentityRowIds = await repointIdentityRows(tx, sourceUserId, targetUserId);
-    await recomputeIdentityAggregates(tx, targetUserId);
+    await recomputeIdentityAggregates(targetUserId, tx);
 
     // If this source was itself the target of an earlier merge, that earlier
     // audit's targetUserId still points at it. user_merge_audits.targetUserId
@@ -634,8 +597,8 @@ export async function splitServerUser(
       }
     }
 
-    await recomputeIdentityAggregates(tx, oldUserId);
-    await recomputeIdentityAggregates(tx, newUser!.id);
+    await recomputeIdentityAggregates(oldUserId, tx);
+    await recomputeIdentityAggregates(newUser!.id, tx);
 
     return { newUserId: newUser!.id, serverUserId, oldUserId };
   });

@@ -1,7 +1,14 @@
 {
   "name": "@tracearr/shared",
   "version": "0.1.0",
-  "private": true,
+  "description": "Shared types and Zod schemas for Tracearr apps",
+  "license": "AGPL-3.0-only",
+  "author": "Connor Gallopo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/connorgallopo/Tracearr.git",
+    "directory": "packages/shared"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,13 +20,18 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/__tests__"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "pnpm build",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/",
+    "lint": "eslint src/ --cache --cache-location .eslintcache --cache-strategy content",
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
     "test:watch": "vitest",

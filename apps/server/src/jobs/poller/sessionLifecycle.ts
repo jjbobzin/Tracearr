@@ -15,7 +15,7 @@ import {
   type Session,
   type StreamDetailFields,
 } from '@tracearr/shared';
-import { and, desc, eq, gte, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import { serverUsers, sessions, violations } from '../../db/schema.js';
 import type { GeoLocation } from '../../services/geoip.js';
@@ -27,6 +27,8 @@ import {
 import { executeActions, type ActionResult } from '../../services/rules/executors/index.js';
 import type { EvaluationContext, EvaluationResult } from '../../services/rules/types.js';
 import { storeActionResults } from '../../services/rules/v2Integration.js';
+import { getWatchedThreshold } from '../../services/settings.js';
+import { recomputeIdentityAggregatesForServerUser } from '../../services/userService.js';
 import { clearDbWriteTracking } from './dbWriteThrottle.js';
 import { pickStreamDetailFields } from './sessionMapper.js';
 import {
@@ -34,6 +36,7 @@ import {
   checkWatchCompletion,
   shouldRecordSession,
 } from './stateTracker.js';
+import type { SessionIdentity as MediaItemIdentity } from './database.js';
 import type {
   CompositeSessionIdentity,
   MediaChangeInput,
@@ -123,6 +126,7 @@ export interface BuildActiveSessionInput {
     ratingKey: string;
     totalDurationMs: number;
     progressMs: number;
+    serverVersionKey?: string | null;
     ipAddress: string;
     playerName: string;
     deviceId: string;
@@ -143,6 +147,8 @@ export interface BuildActiveSessionInput {
     albumName: string | null;
     trackNumber: number | null;
     discNumber: number | null;
+    /** Canonical media identity resolved from library_items, stamped at session insert. */
+    identity?: MediaItemIdentity | null;
   };
 
   /** Server user info */
@@ -197,6 +203,14 @@ export function buildActiveSession(input: BuildActiveSessionInput): ActiveSessio
     year: processed.year || null,
     thumbPath: processed.thumbPath || null,
     ratingKey: processed.ratingKey || null,
+    serverVersionKey: processed.serverVersionKey ?? null,
+    parentRatingKey: processed.identity?.parentRatingKey ?? null,
+    grandparentRatingKey: processed.identity?.grandparentRatingKey ?? null,
+    mediaId: processed.identity?.mediaId ?? null,
+    showMediaId: processed.identity?.showMediaId ?? null,
+    imdbId: processed.identity?.imdbId ?? null,
+    tmdbId: processed.identity?.tmdbId ?? null,
+    tvdbId: processed.identity?.tvdbId ?? null,
 
     // External session ID (for Plex API calls)
     externalSessionId: session.externalSessionId ?? null,
@@ -301,6 +315,14 @@ export function buildPendingActiveSession(pendingData: PendingSessionData): Acti
     year: processed.year || null,
     thumbPath: processed.thumbPath || null,
     ratingKey: processed.ratingKey || null,
+    serverVersionKey: processed.serverVersionKey ?? null,
+    parentRatingKey: processed.identity?.parentRatingKey ?? null,
+    grandparentRatingKey: processed.identity?.grandparentRatingKey ?? null,
+    mediaId: processed.identity?.mediaId ?? null,
+    showMediaId: processed.identity?.showMediaId ?? null,
+    imdbId: processed.identity?.imdbId ?? null,
+    tmdbId: processed.identity?.tmdbId ?? null,
+    tvdbId: processed.identity?.tvdbId ?? null,
 
     // External session ID (for Plex API calls)
     externalSessionId: processed.plexSessionId ?? null,
@@ -390,7 +412,7 @@ export function buildPendingActiveSession(pendingData: PendingSessionData): Acti
 export async function findActiveSession(
   identity: SessionIdentity
 ): Promise<typeof sessions.$inferSelect | null> {
-  const { serverId, sessionKey, ratingKey } = identity;
+  const { serverId, sessionKey, ratingKey, serverUserId } = identity;
   // Time bound reduces TimescaleDB chunk scanning (only recent chunks can have active sessions)
   const chunkBound = new Date(Date.now() - ACTIVE_SESSION_CHUNK_BOUND_MS);
 
@@ -407,10 +429,18 @@ export async function findActiveSession(
     conditions.push(eq(sessions.ratingKey, ratingKey));
   }
 
+  if (serverUserId != null) {
+    conditions.push(eq(sessions.serverUserId, serverUserId));
+  }
+
+  // Newest first: after a PMS restart a stale open row can share this
+  // sessionKey with a fresh one, and an unordered limit(1) could latch the
+  // stale row forever
   const rows = await db
     .select()
     .from(sessions)
     .where(and(...conditions))
+    .orderBy(desc(sessions.startedAt))
     .limit(1);
 
   return rows[0] || null;
@@ -762,6 +792,14 @@ export async function createSessionWithRulesAtomic(
               // null here would make each tick's dedup miss the row it wrote last
               // tick and insert a duplicate until the stale sweep.
               ratingKey: processed.ratingKey ?? '',
+              serverVersionKey: processed.serverVersionKey ?? null,
+              parentRatingKey: processed.identity?.parentRatingKey ?? null,
+              grandparentRatingKey: processed.identity?.grandparentRatingKey ?? null,
+              mediaId: processed.identity?.mediaId ?? null,
+              showMediaId: processed.identity?.showMediaId ?? null,
+              imdbId: processed.identity?.imdbId ?? null,
+              tmdbId: processed.identity?.tmdbId ?? null,
+              tvdbId: processed.identity?.tvdbId ?? null,
               state: processed.state,
               mediaType: processed.mediaType,
               mediaTitle: processed.mediaTitle,
@@ -841,6 +879,14 @@ export async function createSessionWithRulesAtomic(
             year: processed.year || null,
             thumbPath: processed.thumbPath || null,
             ratingKey: processed.ratingKey || null,
+            serverVersionKey: processed.serverVersionKey ?? null,
+            parentRatingKey: processed.identity?.parentRatingKey ?? null,
+            grandparentRatingKey: processed.identity?.grandparentRatingKey ?? null,
+            mediaId: processed.identity?.mediaId ?? null,
+            showMediaId: processed.identity?.showMediaId ?? null,
+            imdbId: processed.identity?.imdbId ?? null,
+            tmdbId: processed.identity?.tmdbId ?? null,
+            tvdbId: processed.identity?.tvdbId ?? null,
             externalSessionId: null,
             startedAt: inserted.startedAt,
             stoppedAt: null,
@@ -905,7 +951,6 @@ export async function createSessionWithRulesAtomic(
             thumbUrl: serverUser.thumbUrl,
             isServerAdmin: false,
             trustScore: serverUser.trustScore,
-            sessionCount: serverUser.sessionCount,
             joinedAt: null,
             lastActivityAt: serverUser.lastActivityAt,
             createdAt: serverUser.createdAt,
@@ -988,6 +1033,8 @@ export async function createSessionWithRulesAtomic(
               const violation = insertedViolations[0];
 
               if (violation) {
+                await recomputeIdentityAggregatesForServerUser(serverUser.id, tx);
+
                 // Create rule info for ViolationInsertResult (V2 rules don't have type)
                 const ruleInfo = {
                   id: rule.id,
@@ -1046,6 +1093,10 @@ export async function createSessionWithRulesAtomic(
         // Store results for UI
         await storeActionResults(violationId, result.ruleId, actionResults);
       }
+
+      console.log(
+        `[SessionLifecycle] Session started: ${processed.mediaType} "${processed.grandparentTitle ? `${processed.grandparentTitle} - ` : ''}${processed.mediaTitle}" by ${serverUser.username} on ${server.name} (${processed.playerName ?? 'unknown player'}, key ${processed.sessionKey})`
+      );
 
       // Transaction succeeded, return result
       return {
@@ -1202,7 +1253,12 @@ export async function stopSessionAtomic(input: SessionStopInput): Promise<Sessio
   const watched = preserveWatched
     ? session.watched
     : session.watched ||
-      checkWatchCompletion(durationMs, session.progressMs, session.totalDurationMs);
+      checkWatchCompletion(
+        durationMs,
+        session.progressMs,
+        session.totalDurationMs,
+        await getWatchedThreshold(session.mediaType)
+      );
 
   const shortSession = !shouldRecordSession(durationMs);
 
@@ -1229,6 +1285,12 @@ export async function stopSessionAtomic(input: SessionStopInput): Promise<Sessio
 
       // Return whether the update was applied (for caller to skip cache/broadcast if already stopped)
       const wasUpdated = result.length > 0;
+
+      if (wasUpdated) {
+        console.log(
+          `[SessionLifecycle] Session stopped: "${session.mediaTitle}" after ${Math.round(durationMs / 1000)}s (watched=${watched}${forceStopped ? ', forced' : ''})`
+        );
+      }
 
       return { durationMs, watched, shortSession, wasUpdated };
     } catch (error) {
@@ -1513,6 +1575,14 @@ export async function reEvaluateRulesOnTranscodeChange(
     year: processed.year || null,
     thumbPath: processed.thumbPath || null,
     ratingKey: existingSession.ratingKey,
+    serverVersionKey: existingSession.serverVersionKey,
+    parentRatingKey: existingSession.parentRatingKey,
+    grandparentRatingKey: existingSession.grandparentRatingKey,
+    mediaId: existingSession.mediaId,
+    showMediaId: existingSession.showMediaId,
+    imdbId: existingSession.imdbId,
+    tmdbId: existingSession.tmdbId,
+    tvdbId: existingSession.tvdbId,
     startedAt: existingSession.startedAt,
     stoppedAt: null,
     durationMs: null,
@@ -1573,7 +1643,6 @@ export async function reEvaluateRulesOnTranscodeChange(
     thumbUrl: serverUser.thumbUrl,
     isServerAdmin: false,
     trustScore: serverUser.trustScore,
-    sessionCount: serverUser.sessionCount,
     joinedAt: null,
     lastActivityAt: serverUser.lastActivityAt,
     createdAt: serverUser.createdAt,
@@ -1621,7 +1690,10 @@ export async function reEvaluateRulesOnTranscodeChange(
         sql`SELECT pg_advisory_xact_lock(hashtext(${existingSession.id} || '::' || ${rule.id}))`
       );
 
-      // Dedup check (now race-free under advisory lock)
+      // Dedup check (now race-free under advisory lock). A dismissed row
+      // blocks re-creation regardless of whether it was acknowledged first:
+      // dismiss means "false positive", and re-detecting the same
+      // session+rule would re-run its actions.
       const existing = await tx
         .select({ id: violations.id })
         .from(violations)
@@ -1629,7 +1701,7 @@ export async function reEvaluateRulesOnTranscodeChange(
           and(
             eq(violations.ruleId, rule.id),
             eq(violations.sessionId, existingSession.id),
-            isNull(violations.acknowledgedAt)
+            or(isNull(violations.acknowledgedAt), isNotNull(violations.dismissedAt))
           )
         )
         .limit(1);
@@ -1671,6 +1743,7 @@ export async function reEvaluateRulesOnTranscodeChange(
       const violation = insertedViolations[0];
       if (!violation) return null;
 
+      await recomputeIdentityAggregatesForServerUser(serverUser.id, tx);
       return violation;
     });
 
@@ -1745,6 +1818,14 @@ export async function reEvaluateRulesOnPauseState(
     year: processed.year || null,
     thumbPath: processed.thumbPath || null,
     ratingKey: existingSession.ratingKey,
+    serverVersionKey: existingSession.serverVersionKey,
+    parentRatingKey: existingSession.parentRatingKey,
+    grandparentRatingKey: existingSession.grandparentRatingKey,
+    mediaId: existingSession.mediaId,
+    showMediaId: existingSession.showMediaId,
+    imdbId: existingSession.imdbId,
+    tmdbId: existingSession.tmdbId,
+    tvdbId: existingSession.tvdbId,
     startedAt: existingSession.startedAt,
     stoppedAt: null,
     durationMs: null,
@@ -1804,7 +1885,6 @@ export async function reEvaluateRulesOnPauseState(
     thumbUrl: serverUser.thumbUrl,
     isServerAdmin: false,
     trustScore: serverUser.trustScore,
-    sessionCount: serverUser.sessionCount,
     joinedAt: null,
     lastActivityAt: serverUser.lastActivityAt,
     createdAt: serverUser.createdAt,
@@ -1845,7 +1925,9 @@ export async function reEvaluateRulesOnPauseState(
         sql`SELECT pg_advisory_xact_lock(hashtext(${existingSession.id} || '::' || ${rule.id}))`
       );
 
-      // Dedup check, prevents duplicate violation for same session+rule
+      // Dedup check, prevents duplicate violation for same session+rule.
+      // Dismissed rows block regardless of acknowledgement, same as the
+      // advisory-lock path above.
       const existing = await tx
         .select({ id: violations.id })
         .from(violations)
@@ -1853,7 +1935,7 @@ export async function reEvaluateRulesOnPauseState(
           and(
             eq(violations.ruleId, rule.id),
             eq(violations.sessionId, existingSession.id),
-            isNull(violations.acknowledgedAt)
+            or(isNull(violations.acknowledgedAt), isNotNull(violations.dismissedAt))
           )
         )
         .limit(1);
@@ -1895,6 +1977,7 @@ export async function reEvaluateRulesOnPauseState(
       const violation = insertedViolations[0];
       if (!violation) return null;
 
+      await recomputeIdentityAggregatesForServerUser(serverUser.id, tx);
       return violation;
     });
 

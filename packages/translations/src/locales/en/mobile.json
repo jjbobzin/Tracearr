@@ -156,8 +156,23 @@
   "serverSelector": {
     "servers": "Servers",
     "selectServers": "Select Servers",
-    "serversSelected": "{{selected}} of {{total}} servers selected"
+    "serversSelected": "{{selected}} of {{total}} servers selected",
+    "allServers": "All servers"
   },
   "reconnected": "Reconnected",
-  "actionsExecuted": "Actions Executed"
+  "actionsExecuted": "Actions Executed",
+  "serverScope": {
+    "single": "Showing {{name}} only"
+  },
+  "a11y": {
+    "selectServer": "Select server",
+    "alerts": "Alerts",
+    "alertsCount": "Alerts, {{count}} unread",
+    "settings": "Settings",
+    "trustScore": "Trust score {{score}}"
+  },
+  "map": {
+    "noData": "No location data available",
+    "unavailable": "Map unavailable"
+  }
 }

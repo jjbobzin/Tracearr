@@ -81,7 +81,7 @@ function RestoreProgress() {
 
 export function Maintenance() {
   const { t } = useTranslation('pages');
-  const { db, redis, wasReady, restore } = useMaintenanceMode();
+  const { db, redis, wasReady, restore, initStep } = useMaintenanceMode();
 
   return (
     <div className="bg-background flex min-h-screen flex-col items-center justify-center space-y-6 p-4">
@@ -111,7 +111,20 @@ export function Maintenance() {
               <StatusDot ok={redis} />
             </div>
           </div>
-          <Loader2 className="text-muted-foreground h-6 w-6 animate-spin" />
+          {initStep && (
+            <div className="max-w-md space-y-2 text-center">
+              <p className="text-foreground flex items-center justify-center gap-2 text-sm font-medium">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t(`maintenance.initStep.${initStep}`)}
+              </p>
+              {(initStep === 'migrations' || initStep === 'timescale') && (
+                <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-500">
+                  {t('maintenance.doNotRestart')}
+                </p>
+              )}
+            </div>
+          )}
+          {!initStep && <Loader2 className="text-muted-foreground h-6 w-6 animate-spin" />}
         </>
       )}
     </div>

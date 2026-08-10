@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Loader2, Clock, CheckCircle2, AlertCircle, Activity } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -76,48 +76,20 @@ function TaskItem({ task }: { task: RunningTask }) {
 }
 
 export function RunningTasksDropdown() {
-  const { socket } = useSocket();
-  const [tasks, setTasks] = useState<RunningTask[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const { isConnected } = useSocket();
 
-  // Fetch initial tasks
-  const fetchTasks = useCallback(async () => {
-    try {
-      const response = await api.tasks.getRunning();
-      setTasks(response.tasks);
-    } catch (error) {
-      console.error('Failed to fetch running tasks:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
+  // With the socket connected, job progress events invalidate this cache in
+  // SocketProvider; polling backstops queued jobs that have not emitted a
+  // progress event yet, so the connected interval stays reasonably tight.
+  const { data, isLoading } = useQuery({
+    queryKey: ['tasks', 'running'],
+    queryFn: () => api.tasks.getRunning(),
+    refetchInterval: isConnected ? 15_000 : 10_000,
+    refetchIntervalInBackground: false,
+    placeholderData: (prev) => prev,
+  });
 
-  // Initial fetch
-  useEffect(() => {
-    void fetchTasks();
-  }, [fetchTasks]);
-
-  // Subscribe to WebSocket updates
-  useEffect(() => {
-    if (!socket) return;
-
-    const handleTasksUpdated = (updatedTasks: RunningTask[]) => {
-      setTasks(updatedTasks);
-    };
-
-    socket.on('tasks:updated', handleTasksUpdated);
-    return () => {
-      socket.off('tasks:updated', handleTasksUpdated);
-    };
-  }, [socket]);
-
-  // Poll for updates every 10 seconds as fallback
-  useEffect(() => {
-    const interval = setInterval(() => {
-      void fetchTasks();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [fetchTasks]);
+  const tasks = data?.tasks ?? [];
 
   // Filter to show only active tasks (running, waiting, or pending)
   const activeTasks = tasks.filter(

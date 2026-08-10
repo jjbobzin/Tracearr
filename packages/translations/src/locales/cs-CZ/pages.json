@@ -16,7 +16,11 @@
   "apiDocs": {
     "apiKeyAutoLoaded": "Automaticky načtený klíč API",
     "backToSettings": "Zpět do nastavení",
-    "noApiKey": "Nebyl vygenerován žádný API klíč - vytvořte jej v nastavení pro testování koncových bodů"
+    "noApiKey": "Nebyl vygenerován žádný API klíč - vytvořte jej v nastavení pro testování koncových bodů",
+    "versionSwitcherLabel": "API documentation version",
+    "versionV1": "API v1",
+    "versionV2": "API v2",
+    "specLoadError": "Failed to load the API specification. Check your API key and try again."
   },
   "dashboard": {
     "activeUsers": "Aktivní uživatelé",
@@ -117,6 +121,56 @@
   },
   "library": {
     "description": "Nejlepší filmy a seriály na vašem serveru",
+    "emptyState": {
+      "backfillAvailable": {
+        "bodyGeneric": "Generate historical snapshots to see library trends over time.",
+        "bodyWithDays": "Your library has {{days}} days of history. Generate snapshots to see trends in charts.",
+        "syncRunningBody": "Historical data generation will start automatically once the sync completes.",
+        "syncRunningTitle": "Library sync in progress...",
+        "title": "Historical data available"
+      },
+      "backfillRunning": {
+        "fallbackBody": "Creating snapshots from library history. This may take a few minutes.",
+        "progress": "{{processed}} of {{total}} libraries",
+        "snapshotsSuffix": " ({{count}} snapshots)",
+        "title": "Generating historical data..."
+      },
+      "checkingStatus": "Checking library status...",
+      "generateHistory": "Generate History",
+      "multiServer": {
+        "body": "Sync the servers below to see combined library statistics.",
+        "needsBackfillIntro": "These servers are synced but have no historical data yet:",
+        "title": "Some libraries need attention"
+      },
+      "noMedia": {
+        "body": "This library is synced but doesn't have any movies or shows in it yet.",
+        "title": "No movies or shows yet"
+      },
+      "notSynced": {
+        "body": "Library statistics will appear here once the library has been synced. This typically happens automatically every hour.",
+        "title": "Library not synced yet"
+      },
+      "notSyncedShort": "Not synced yet",
+      "starting": "Starting...",
+      "syncInProgress": {
+        "body": "Library statistics will appear once the sync completes. This may take a few minutes depending on library size.",
+        "title": "Library sync in progress..."
+      },
+      "syncNow": "Sync Now",
+      "syncing": "Syncing...",
+      "toast": {
+        "backfillCompleteTitle": "Backfill complete",
+        "backfillErrorTitle": "Backfill failed",
+        "backfillFailedTitle": "Failed to start backfill",
+        "backfillStartedDesc": "Historical snapshots are being generated.",
+        "backfillStartedTitle": "Backfill started",
+        "genericRetry": "Please try again.",
+        "noServerSelected": "No server selected",
+        "syncFailedTitle": "Failed to start sync",
+        "syncStartedDesc": "This may take a few minutes depending on library size.",
+        "syncStartedTitle": "Library sync started"
+      }
+    },
     "noMoviePlays": "V tomto období nehraje žádný film",
     "noShowPlays": "Žádné seriály v tomto období",
     "overview": {
@@ -126,6 +180,7 @@
       "failedToLoadDesc": "Nelze načíst data knihovny. Zkuste to prosím znovu.",
       "lastUpdated": "Naposledy aktualizováno:",
       "libraryGrowth": "Růst knihovny",
+      "serversNeedSync": "These servers need to sync:",
       "shows": "seriály",
       "thisMonth": "tento měsíc",
       "thisPeriod": "toto období",
@@ -167,7 +222,21 @@
       "title": "Úložiště",
       "totalStorage": "Celkový počet úložišť",
       "unused": "nevyužito",
-      "zeroGrowth": "0 GB/mo"
+      "zeroGrowth": "0 GB/mo",
+      "duplicatesTitle": "Duplicates",
+      "duplicatesSubtitle": "Titles with more than one copy or file, across servers, libraries, and versions",
+      "growthPreChangeover": "based on pre-update history",
+      "loadingDuplicates": "Loading duplicates...",
+      "duplicatesFailed": "Failed to load duplicates",
+      "noDuplicatesTitle": "No duplicates found",
+      "noDuplicatesDesc": "No titles with more than one physical file detected.",
+      "colTitle": "Title",
+      "colMatchType": "Match Type",
+      "colCopies": "Copies",
+      "colRecoverable": "Recoverable Space",
+      "sameServer": "Same server",
+      "mirror": "Mirror",
+      "pageOf": "Page {{page}} of {{totalPages}}"
     },
     "title": "Knihovna",
     "topMovies": "Nejlepší filmy",
@@ -193,6 +262,12 @@
       "totalWatchTime": "Celkový čas sledování",
       "viewingHours": "Prohlížení hodin",
       "watched": "Zhlédnuto"
+    },
+    "versionsBackfill": {
+      "banner": "File version data is still being collected for this server. Run a library sync to finish.",
+      "action": "Sync now",
+      "syncFailed": "Sync failed to start on {{count}} server(s). Check your permissions and server status.",
+      "syncStarted": "Library sync started."
     }
   },
   "login": {
@@ -251,7 +326,13 @@
     },
     "restoreTitle": "Obnovení ze zálohy...",
     "startingDescription": "Server čeká na dostupnost služeb backendu. Tato stránka se automaticky obnoví, až bude vše připraveno.",
-    "startingTitle": "Tracearr se spustí..."
+    "startingTitle": "Tracearr se spustí...",
+    "initStep": {
+      "migrations": "Applying database migrations",
+      "timescale": "Preparing TimescaleDB (this can take a while after an upgrade)",
+      "services": "Starting services"
+    },
+    "doNotRestart": "Do not restart or stop the server while this runs. Interrupting it can leave the database half-upgraded."
   },
   "map": {
     "allActivity": "Všechny aktivity",
@@ -261,6 +342,301 @@
     "heatmap": "Teplotní mapa",
     "locations": "místa",
     "streams": "proudy"
+  },
+  "media": {
+    "detail": {
+      "breadcrumb": {
+        "ariaLabel": "Breadcrumb"
+      },
+      "copies": {
+        "columns": {
+          "server": "Server",
+          "library": "Library",
+          "quality": "Quality",
+          "episodes": "Episodes",
+          "size": "Size",
+          "added": "Added"
+        },
+        "loadError": "Couldn't load copies",
+        "title": "Copies",
+        "unknownLibrary": "Unknown library",
+        "versionLabel": "File {{index}}"
+      },
+      "hero": {
+        "actions": {
+          "fullHistory": "Full history",
+          "openOnServer": "Open on server"
+        },
+        "availability": {
+          "added": "added {{date}}",
+          "removed": "removed {{date}}"
+        },
+        "loadError": "Couldn't load this title",
+        "meta": {
+          "episodes_one": "{{count}} episode",
+          "episodes_other": "{{count}} episodes",
+          "seasons_one": "{{count}} season",
+          "seasons_other": "{{count}} seasons"
+        },
+        "removedEverywhere": {
+          "caption": "No longer available on any connected server"
+        }
+      },
+      "history": {
+        "columns": {
+          "content": "Content",
+          "date": "Date",
+          "duration": "Duration",
+          "server": "Server",
+          "user": "User"
+        },
+        "empty": "No plays recorded yet",
+        "loadError": "Couldn't load history",
+        "notWatched": "Not finished",
+        "title": "History",
+        "watched": "Watched"
+      },
+      "kpis": {
+        "ariaLabel": "Watch statistics",
+        "completion": {
+          "detail": "{{finished}} of {{total}} finished every episode",
+          "detailMovie": "{{finished}} of {{total}} watched to completion",
+          "label": "Avg completion"
+        },
+        "completionLoadError": "Couldn't load completion",
+        "loadError": "Couldn't load watch statistics",
+        "plays": {
+          "caption": "resume chains, short sessions excluded",
+          "label": "Plays, all time"
+        },
+        "viewers": {
+          "detail": "across all servers",
+          "label": "Viewers"
+        },
+        "watchTime": {
+          "detail": "+{{hours}}h in the last 30 days",
+          "label": "Watch time"
+        }
+      },
+      "notFound": {
+        "backLink": "Back to Media",
+        "message": "This title doesn't exist or you don't have access to it.",
+        "title": "Media not found"
+      },
+      "platforms": {
+        "columns": {
+          "platform": "Platform",
+          "plays": "Plays",
+          "watchTime": "Watch time"
+        },
+        "empty": "No platform data yet",
+        "loadError": "Couldn't load platform breakdown",
+        "title": "Platforms",
+        "unknown": "Unknown"
+      },
+      "seasons": {
+        "empty": "No season data yet",
+        "episodeCount_one": "{{count}} episode",
+        "episodeCount_other": "{{count}} episodes",
+        "episodeLabel": {
+          "partial": "{{code}}: partially watched",
+          "unwatched": "{{code}}: unwatched",
+          "watched": "{{code}}: watched"
+        },
+        "loadError": "Couldn't load season data",
+        "stripSummary": "{{season}}: {{percent}}% watched",
+        "title": "Seasons",
+        "watchedPct": "{{percent}}% watched"
+      },
+      "title": "Podrobnosti média",
+      "watchers": {
+        "columns": {
+          "completion": "Completion",
+          "episodes": "Episodes",
+          "lastWatched": "Last watched",
+          "plays": "Plays",
+          "user": "User"
+        },
+        "completionLabel": "{{percent}}% complete",
+        "empty": "No one has watched this yet.",
+        "lastWatchedAgo": "{{age}} ago",
+        "loadError": "Couldn't load watchers",
+        "title": "Watchers"
+      }
+    },
+    "genres": {
+      "title": "Žánry",
+      "subtitle": "Plays and watch time by genre, across every server in view.",
+      "chart": {
+        "title": "Plays by genre",
+        "valueLabel": "Plays",
+        "itemCount_one": "{{count}} title",
+        "itemCount_other": "{{count}} titles",
+        "ariaLabel": "Bar chart of plays by genre, sorted highest to lowest. The full breakdown is available in the table below."
+      },
+      "table": {
+        "title": "Genre breakdown",
+        "columns": {
+          "genre": "Genre",
+          "items": "Items",
+          "plays": "Plays",
+          "watchTime": "Watch time"
+        },
+        "browseMovies": "Browse {{genre}} movies",
+        "browseShows": "Browse {{genre}} shows"
+      },
+      "empty": {
+        "title": "No genres captured yet",
+        "description": "Genres come from your media servers' metadata sync. Check back after the next sync completes."
+      },
+      "loadError": "Couldn't load genres"
+    },
+    "grid": {
+      "clearJumpAction": "Clear",
+      "emptyAnchored": "Nothing at or after \"{{letter}}\" under these filters",
+      "emptyFilter": "No titles match these filters",
+      "emptySearch": "No titles match \"{{query}}\"",
+      "loadError": "Couldn't load the catalog",
+      "loaderError": "Couldn't load more titles",
+      "retry": "Retry",
+      "scrubber": {
+        "label": "Jump to letter",
+        "current": "Letter {{letter}}"
+      },
+      "showAll": "Show all",
+      "showingFrom": "Showing from {{letter}}",
+      "toolbar": {
+        "ariaLabel": "Filters and sort",
+        "count": "{{loaded}} of {{total}} titles · {{size}}",
+        "done": "Done",
+        "filtersLabel": "Filters",
+        "filtersSheetTitle": "Filters",
+        "genreAll": "Any genre",
+        "genreLabel": "Genre",
+        "moviesToggle": "Movies",
+        "removeFilter": "Remove {{label}} filter",
+        "resolutionAll": "Any resolution",
+        "hdrLabel": "Dynamic range",
+        "hdrAll": "Any",
+        "hdrOnly": "HDR only",
+        "hdrChip": "HDR",
+        "resolutionLabel": "Resolution",
+        "searchLabel": "Search titles",
+        "searchPlaceholder": "Search titles…",
+        "serverAll": "Any server",
+        "libraryLabel": "Library",
+        "libraryAll": "Any library",
+        "serverLabel": "Server",
+        "showsToggle": "Shows",
+        "sort": {
+          "added": "Recently added",
+          "plays": "Plays",
+          "title": "Title A–Z",
+          "viewers": "Viewers",
+          "watch_time": "Watch time",
+          "year": "Year"
+        },
+        "sortLabel": "Sort",
+        "typeLabel": "Media type",
+        "unwatchedByLens": "Unwatched by {{name}}",
+        "watched": {
+          "all": "All",
+          "partial": "Partially watched",
+          "unwatched": "Unwatched",
+          "watched": "Watched"
+        },
+        "watchedLabel": "Watched",
+        "yearFromLabel": "From year",
+        "yearToLabel": "To year",
+        "sizeGbMinLabel": "Min size (GB)",
+        "sizeGbMaxLabel": "Max size (GB)",
+        "sizeChipAtLeast": "≥ {{min}} GB",
+        "sizeChipAtMost": "≤ {{max}} GB",
+        "sizeChipRange": "{{min}}–{{max}} GB",
+        "countTotal_one": "{{count}} title · {{size}}",
+        "countTotal_other": "{{count}} titles · {{size}}"
+      }
+    },
+    "landing": {
+      "card": {
+        "addedAgo": "přidáno {{date}}",
+        "addedCompactAgo": "added {{age}} ago",
+        "newEpisodesChip": "{{count}} new",
+        "newEpisodes_one": "{{count}} nová epizoda",
+        "newEpisodes_other": "{{count}} nových epizod"
+      },
+      "deadWeight": {
+        "columns": {
+          "added": "Added",
+          "poster": "Poster",
+          "servers": "Servers",
+          "size": "Size",
+          "title": "Title"
+        },
+        "empty": "Nothing to reclaim - everything in your library has been watched",
+        "summary": "{{count}} never-watched titles · {{size}}",
+        "title": "Dead Weight",
+        "viewAll": "View all",
+        "viewAllTooltip": "Coming soon"
+      },
+      "lens": {
+        "allUsers": "Všichni uživatelé",
+        "label": "Zobrazit jako"
+      },
+      "loadError": "Couldn't load your media library",
+      "shelves": {
+        "captionMostPopular": {
+          "all": "all time",
+          "custom": "selected date range",
+          "day": "today",
+          "month": "last 30 days",
+          "week": "last 7 days",
+          "year": "last 12 months"
+        },
+        "captionRecentlyAdded": "deduped across servers",
+        "emptyMostPopular": "No plays in this period",
+        "emptyRecentlyAdded": "Nothing added in this period",
+        "mostPopularMovies": "Most Popular Movies",
+        "mostPopularShows": "Most Popular Shows",
+        "recentlyAddedMovies": "Recently Added Movies",
+        "recentlyAddedShows": "Recently Added Shows"
+      },
+      "title": "Média"
+    },
+    "movies": {
+      "title": "Filmy"
+    },
+    "posterCard": {
+      "addedLabel": "Přidáno {{date}}",
+      "onServers": "Na {{servers}}",
+      "playsCompact_one": "{{compact}} play",
+      "playsCompact_other": "{{compact}} plays",
+      "plays_one": "{{count}} přehrání",
+      "plays_other": "{{count}} přehrání",
+      "rankChip": "#{{rank}}",
+      "rankSuffix": ", pořadí {{rank}}",
+      "tileLabel": {
+        "added": "přidáno",
+        "plays": "přehrání",
+        "resolution": "resolution",
+        "viewers": "diváci"
+      },
+      "versionsChip": "{{count}}×",
+      "versions_one": "{{count}} version",
+      "versions_other": "{{count}} versions",
+      "viewers_one": "{{count}} divák",
+      "viewers_other": "{{count}} diváků",
+      "watchedState": {
+        "partial": "Částečně zhlédnuto",
+        "watched": "Zhlédnuto",
+        "watchedByOthers": "Watched by others",
+        "watchedByYou": "Watched by you"
+      },
+      "moreServers": "+{{count}} more"
+    },
+    "shows": {
+      "title": "Seriály"
+    }
   },
   "notFound": {
     "description": "Stránka, kterou hledáte, neexistuje nebo byla přesunuta.",
@@ -317,6 +693,7 @@
     "maxIps": "Maximální počet IP",
     "maxIpsDefault": "Maximální počet jedinečných IP adres povolených v časovém okně. Výchozí: 5 IP adres za 24 hodin",
     "maxSpeed": "Maximální rychlost ({{unit}})",
+    "recordsOnly": "Records violations only",
     "maxSpeedDefault": "Maximální reálná cestovní rychlost. Výchozí: {{value}} {{unit}} (rychlost letadla)",
     "maxStreams": "Max. streamů",
     "maxStreamsDefault": "Maximální počet současných proudů na uživatele. Výchozí: 3",

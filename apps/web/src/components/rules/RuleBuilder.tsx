@@ -10,7 +10,7 @@ import type {
   UpdateRuleV2Input,
   RulesFilterOptions,
 } from '@tracearr/shared';
-import { IDENTITY_AWARE_CONDITION_FIELDS } from '@tracearr/shared';
+import { IDENTITY_AWARE_CONDITION_FIELDS, INACTIVITY_COMPATIBLE_FIELDS } from '@tracearr/shared';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -25,6 +25,7 @@ import {
 import { ConditionGroup } from './ConditionGroup';
 import { ActionRow } from './ActionRow';
 import {
+  FIELD_DEFINITIONS,
   getDefaultOperatorForField,
   getDefaultValueForField,
   createDefaultAction,
@@ -165,16 +166,31 @@ export function RuleBuilder({
   const { data: identitiesPage } = useUsers(scopeMode === 'person' ? { pageSize: 100 } : {});
   const identityOptions = identitiesPage?.data ?? [];
 
-  // Cross-server enforcement is only meaningful for rules built entirely from
-  // identity-aware condition fields (see IDENTITY_AWARE_CONDITION_FIELDS).
+  // The backend rejects mixing inactive_days with session fields, so the
+  // field picker offers only the still-valid choices for the rule as built.
+  const allowedFields = useMemo<ReadonlySet<string> | undefined>(() => {
+    const compatible = INACTIVITY_COMPATIBLE_FIELDS as readonly string[];
+    const fields = conditions.groups.flatMap((g) => g.conditions.map((c) => c.field));
+    if (fields.includes('inactive_days')) return new Set(compatible);
+    if (fields.some((f) => !compatible.includes(f))) {
+      return new Set(Object.keys(FIELD_DEFINITIONS).filter((f) => f !== 'inactive_days'));
+    }
+    return undefined;
+  }, [conditions]);
+
+  // Cross-server enforcement is only meaningful for rules built from
+  // identity-aware condition fields (see IDENTITY_AWARE_CONDITION_FIELDS),
+  // and never for server-scoped rules: those detect on one server's sessions
+  // only, and the backend rejects the combination.
   const canEnforceAcrossServers = useMemo(
     () =>
+      scopeMode !== 'server' &&
       conditions.groups.some((group) =>
         group.conditions.some((c) =>
           (IDENTITY_AWARE_CONDITION_FIELDS as readonly string[]).includes(c.field)
         )
       ),
-    [conditions]
+    [conditions, scopeMode]
   );
 
   // Validation
@@ -459,6 +475,7 @@ export function RuleBuilder({
                 onRemove={() => removeConditionGroup(index)}
                 showRemove={conditions.groups.length > 1}
                 filterOptions={filterOptions}
+                allowedFields={allowedFields}
               />
             </div>
           ))}

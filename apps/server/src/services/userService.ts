@@ -11,11 +11,11 @@
  * - Sync operations handle auto-linking by email
  */
 
-import { eq, and, sql, inArray } from 'drizzle-orm';
+import { eq, and, sql, inArray, isNull } from 'drizzle-orm';
 import type { MediaUser } from './mediaServer/index.js';
 import type { UserRole } from '@tracearr/shared';
 import { db } from '../db/client.js';
-import { users, serverUsers, servers, sessions } from '../db/schema.js';
+import { users, serverUsers, servers, sessions, violations } from '../db/schema.js';
 import { NotFoundError } from '../utils/errors.js';
 
 // Type for user identity table row
@@ -38,7 +38,6 @@ export interface ServerUserWithDetails {
   thumbUrl: string | null;
   isServerAdmin: boolean;
   trustScore: number;
-  sessionCount: number;
   createdAt: Date;
   updatedAt: Date;
   // User identity info
@@ -78,7 +77,6 @@ export interface UserWithStats {
     username: string;
     thumbUrl: string | null;
     trustScore: number;
-    sessionCount: number;
   }>;
   stats: {
     totalSessions: number;
@@ -315,7 +313,6 @@ export async function getServerUserWithDetails(id: string): Promise<ServerUserWi
       thumbUrl: serverUsers.thumbUrl,
       isServerAdmin: serverUsers.isServerAdmin,
       trustScore: serverUsers.trustScore,
-      sessionCount: serverUsers.sessionCount,
       createdAt: serverUsers.createdAt,
       updatedAt: serverUsers.updatedAt,
       userName: users.name,
@@ -345,7 +342,6 @@ export async function getServerUserWithDetails(id: string): Promise<ServerUserWi
     thumbUrl: row.thumbUrl,
     isServerAdmin: row.isServerAdmin,
     trustScore: row.trustScore,
-    sessionCount: row.sessionCount,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     user: {
@@ -502,22 +498,10 @@ export async function updateServerUserTrustScore(
       throw new ServerUserNotFoundError(serverUserId);
     }
 
-    await recalculateAggregateTrustScore(serverUser.userId, tx);
+    await recomputeIdentityAggregates(serverUser.userId, tx);
 
     return serverUser;
   });
-}
-
-/**
- * Increment server user session count
- */
-export async function incrementServerUserSessionCount(serverUserId: string): Promise<void> {
-  await db
-    .update(serverUsers)
-    .set({
-      sessionCount: sql`${serverUsers.sessionCount} + 1`,
-    })
-    .where(eq(serverUsers.id, serverUserId));
 }
 
 // ============================================================================
@@ -765,7 +749,6 @@ export async function getUserWithStats(userId: string): Promise<UserWithStats | 
       username: serverUsers.username,
       thumbUrl: serverUsers.thumbUrl,
       trustScore: serverUsers.trustScore,
-      sessionCount: serverUsers.sessionCount,
     })
     .from(serverUsers)
     .innerJoin(servers, eq(serverUsers.serverId, servers.id))
@@ -819,45 +802,65 @@ export async function getUserWithStats(userId: string): Promise<UserWithStats | 
 }
 
 /**
- * Recalculate aggregate trust score for a user (the person's overall trust
- * across all their server accounts, weighted by each account's session count).
+ * Recompute a user's identity-level rollups from their server accounts:
+ * aggregate trust and total violation count.
  *
- * Called after every write to serverUsers.trustScore - there is no database
- * trigger backing this, so every call site that changes a server account's
- * trust score is responsible for calling this too (ideally with the same `tx`
- * it used for the write, so the two updates commit together). Corrects the
- * identity's rollup going forward; it does not backfill trust changes made
- * before this recompute existed.
+ * Identity trust is the WORST active account's score, not an average. Trust
+ * penalties land only on the account where the behavior happened
+ * (enforceAcrossServers extends kills, never scores), so with several
+ * accounts an average would dilute the one signal the system writes.
+ * Removed accounts only count when the identity has no active ones left.
  *
- * Pass the transaction handle already in use so this participates in the
- * same write instead of racing it.
+ * Called after every write to serverUsers.trustScore and every violation
+ * insert - there is no database trigger backing this, so every call site
+ * that changes either input is responsible for calling this too. Pass the
+ * transaction handle already in use so this participates in the same write
+ * instead of racing it.
  */
-export async function recalculateAggregateTrustScore(
+export async function recomputeIdentityAggregates(
   userId: string,
   executor: Tx = db
 ): Promise<void> {
-  // Calculate weighted average by session count
-  const result = await executor
+  const trustResult = await executor
     .select({
-      weightedSum: sql<number>`coalesce(sum(${serverUsers.trustScore}::numeric * ${serverUsers.sessionCount}), 0)`,
-      totalSessions: sql<number>`coalesce(sum(${serverUsers.sessionCount}), 0)`,
+      trust: sql<number | null>`coalesce(
+        min(${serverUsers.trustScore}) filter (where ${serverUsers.removedAt} is null),
+        min(${serverUsers.trustScore})
+      )`,
     })
     .from(serverUsers)
     .where(eq(serverUsers.userId, userId));
 
-  const { weightedSum, totalSessions } = result[0] ?? { weightedSum: 0, totalSessions: 0 };
-
-  // Calculate aggregate score (default to 100 if no sessions)
-  const aggregateScore =
-    totalSessions > 0 ? Math.round(Number(weightedSum) / Number(totalSessions)) : 100;
+  const violationResult = await executor
+    .select({ count: sql<number>`count(*)::int` })
+    .from(violations)
+    .innerJoin(serverUsers, eq(violations.serverUserId, serverUsers.id))
+    .where(and(eq(serverUsers.userId, userId), isNull(violations.dismissedAt)));
 
   await executor
     .update(users)
     .set({
-      aggregateTrustScore: aggregateScore,
+      aggregateTrustScore: trustResult[0]?.trust ?? 100,
+      totalViolations: violationResult[0]?.count ?? 0,
       updatedAt: new Date(),
     })
     .where(eq(users.id, userId));
+}
+
+/** Same recompute, addressed by the account id a violation write already has in hand. */
+export async function recomputeIdentityAggregatesForServerUser(
+  serverUserId: string,
+  executor: Tx = db
+): Promise<void> {
+  const rows = await executor
+    .select({ userId: serverUsers.userId })
+    .from(serverUsers)
+    .where(eq(serverUsers.id, serverUserId))
+    .limit(1);
+  const userId = rows[0]?.userId;
+  if (userId) {
+    await recomputeIdentityAggregates(userId, executor);
+  }
 }
 
 // ============================================================================
